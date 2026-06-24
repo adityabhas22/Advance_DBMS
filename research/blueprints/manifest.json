@@ -1,0 +1,1024 @@
+[
+  {
+    "week": 1,
+    "slug": "0001-dbms-architecture",
+    "title": "DBMS architecture: the life of a query",
+    "layer": "query",
+    "part": "Part I - Foundations",
+    "hook": "What actually happens, layer by layer, between typing a SELECT and getting rows back?",
+    "arc": [
+      "Problem: a SQL string is declarative and a database is a multi-user server; something has to turn one into the other reliably.",
+      "Naive view: the engine is one black box that reads files. This hides every interesting decision and cannot explain concurrency, caching, or recovery.",
+      "First principles: trace the survey's gate-agent query through the five components (client communications, process manager, relational query processor, transactional storage manager, shared catalog and memory).",
+      "Real design: the query processing pipeline, parser to rewriter to optimizer to executor to access methods to buffer pool to disk, then unwinding the stack to return tuples.",
+      "Tour two real engines: PostgreSQL keeps explicit tree stages and a tree-walking executor; SQLite compiles SQL to VDBE bytecode. Same front (tokenize, parse, AST), different execution.",
+      "Edge cases: admission control prevents thrashing under load; process-per-worker versus thread-per-worker is a real design fork; this lesson is the map every later week points back to."
+    ],
+    "simulator": {
+      "name": "Query stack tracer",
+      "what_it_does": "Animates one SELECT descending through the five components and the query pipeline, lighting up each layer and showing what it hands to the next, then unwinds the stack to deliver rows.",
+      "controls": [
+        "pick PostgreSQL or SQLite mode",
+        "step forward or back through pipeline stages",
+        "toggle a result-set size to see repeated FETCH iterations",
+        "hover a layer to see which course week owns it"
+      ],
+      "observe": "The learner sees the whole engine as one connected pipeline and learns which week owns each layer, so no later topic feels like an island."
+    },
+    "diagrams": [
+      "The five-component block diagram (survey Figure 1.1) with arrows for a single query's path down and back up.",
+      "A two-column pipeline comparison: PostgreSQL string to raw parse tree to query tree to plan tree to executor, versus SQLite string to AST to VDBE bytecode.",
+      "A layered slab diagram mapping each course week onto its layer (w1 query, w2-3 storage, w4-5 buffer, w6-7 index, w8-11 query, w12-13 txn, w14 recovery, w15-16 modern)."
+    ],
+    "mcq_themes": [
+      "Which of the five components does each task belong to (authorization, admission control, locking, connection state)",
+      "Which statement about process-per-worker versus thread-per-worker is false",
+      "Order the query pipeline stages correctly; which stage produces which artifact",
+      "Which is false about admission control and thrashing (memory pressure versus lock contention as causes)"
+    ],
+    "glossary_terms": [
+      "client communications manager",
+      "process manager",
+      "relational query processor",
+      "transactional storage manager",
+      "DBMS worker",
+      "admission control",
+      "query processing pipeline",
+      "catalog manager"
+    ],
+    "primary_source": {
+      "title": "Architecture of a Database System (Hellerstein, Stonebraker, Hamilton, 2007)",
+      "url": "https://dsf.berkeley.edu/papers/fntdb07-architecture.pdf",
+      "why": "The canonical end-to-end picture of how a SQL statement traverses the engine; Section 1 and Figure 1.1 are the spine of this lesson and the assigned paper for the week 1 viva."
+    },
+    "research_refs": [
+      "research/papers/architecture.md",
+      "research/topics/parsing.md",
+      "research/course-spine.md"
+    ],
+    "viva": true
+  },
+  {
+    "week": 2,
+    "slug": "0002-storage-engine-disk-pages",
+    "title": "Storage engine: disk layout, pages, and slotted records",
+    "layer": "storage",
+    "part": "Part II - Storage",
+    "hook": "If a disk only moves whole blocks and a row can be any size, how do you pack rows into a fixed page and still address them?",
+    "arc": [
+      "Problem: persistent storage is block-addressable and slow, the database is larger than RAM, and rows have variable length. You cannot operate on disk bytes in place.",
+      "Naive fix: append each row to a flat file. This breaks on deletes (holes you cannot reuse) and on addressing (you cannot point at a row that moved).",
+      "First principles: the page (block) is the unit of transfer; the three page concepts (hardware, OS, database) and the torn-page risk when the DB page exceeds the hardware page.",
+      "Real design: the slotted page. A slot array grows down from the header, tuple data grows up from the end, free space is the gap, and record id = (page id, slot) stays stable even when tuples move.",
+      "Record encoding: tuple header, NULL bitmap (no sentinel values), fixed versus variable-length fields, and alignment padding (MAXALIGN) that makes column order affect on-disk size.",
+      "Edge cases: PostgreSQL's 24-byte page header with pd_lower and pd_upper closing from both sides, the 4-byte line pointer with its four states, and why a 15-bit offset caps the heap page at 32 KB."
+    ],
+    "simulator": {
+      "name": "Slotted page byte editor",
+      "what_it_does": "Lets the learner insert, delete, and update variable-length rows on a single page and watch the slot array and tuple data close the gap, with a fragmentation counter and a compact button that slides tuples while keeping record ids stable.",
+      "controls": [
+        "insert a row of chosen byte length",
+        "delete a row by slot",
+        "press compact to defragment",
+        "toggle MAXALIGN padding on or off",
+        "reorder columns to see size change"
+      ],
+      "observe": "The learner sees why the slot indirection exists (tuples move, record ids do not) and why poor column order wastes pad bytes, making the slotted page feel inevitable."
+    },
+    "diagrams": [
+      "An annotated slotted page: header, slot array growing down, free space, tuple data growing up, with pd_lower and pd_upper labeled.",
+      "A single tuple's byte layout: header, NULL bitmap, fixed-length fields, variable-length fields with length prefixes, and alignment pad bytes highlighted.",
+      "The three page concepts stacked (hardware ~4 KB, OS ~4 KB, database 8 KB) showing how a torn page can straddle two hardware writes."
+    ],
+    "mcq_themes": [
+      "Which is false: in a slotted page the slot array and tuple data grow in the same direction",
+      "What does a record id / TID actually contain (page id and slot, not a byte offset)",
+      "How is a NULL stored (bitmap in the header, not a sentinel in the column bytes)",
+      "Why does column order change row size; which statement about alignment is false"
+    ],
+    "glossary_terms": [
+      "page (block)",
+      "hardware page",
+      "database page",
+      "torn page",
+      "slotted page",
+      "slot / line pointer",
+      "record id / TID",
+      "NULL bitmap",
+      "alignment / padding",
+      "tuple header"
+    ],
+    "primary_source": {
+      "title": "PostgreSQL documentation, Database Page Layout",
+      "url": "https://www.postgresql.org/docs/current/storage-page-layout.html",
+      "why": "Authoritative for the 8 KB page, the five-part page structure, the 24-byte header fields (pd_lsn, pd_lower, pd_upper), 4-byte line pointers, and the heap tuple header with its NULL bitmap and MAXALIGN rule."
+    },
+    "research_refs": [
+      "research/topics/storage.md",
+      "research/course-spine.md"
+    ],
+    "viva": false
+  },
+  {
+    "week": 3,
+    "slug": "0003-storage-engine-heap-files",
+    "title": "Heap files, free space, and deleting tuples",
+    "layer": "storage",
+    "part": "Part II - Storage",
+    "hook": "Where does a new row go without scanning every page, and what happens to the space when a row is deleted?",
+    "arc": [
+      "Problem: a table is many pages; inserting a row needs a page with room, and deleting a row must not leave the file full of dead weight.",
+      "Naive fix: walk the page list looking for free space (linear) and physically erase deleted rows immediately (blocks readers, conflicts with MVCC).",
+      "First principles: a heap file is an unordered collection of pages located by linked list or page directory; finding free space must be sublinear.",
+      "Real design: the free space map. PostgreSQL quantizes free space to one byte per page in a tree so 'find a page with N free bytes' is logarithmic, not a list walk.",
+      "Deletion as tombstone: a deleted row is marked dead (t_xmax, then a dead line pointer), not erased, because MVCC readers may still need it and immediate compaction is expensive.",
+      "Edge cases: VACUUM reclaims dead space in place (and only sometimes shrinks the file), updates statistics and the visibility map, and freezes old XIDs to prevent wraparound; variable-length values past ~2 KB go out of line via TOAST."
+    ],
+    "simulator": {
+      "name": "Heap insert router with FSM and VACUUM",
+      "what_it_does": "Shows a row of pages with free-space bars; the learner inserts rows and watches a linked-list walk touch many pages versus an FSM tree jump straight to a fitting page, then deletes rows to create bloat and runs VACUUM to reclaim it.",
+      "controls": [
+        "insert a row of chosen size",
+        "switch between linked-list and FSM routing",
+        "delete rows to create dead tuples",
+        "press VACUUM to reclaim and possibly free a trailing page",
+        "watch a live I/O counter"
+      ],
+      "observe": "The learner sees the linear versus logarithmic free-space search cost and that DELETE creates bloat that a separate maintenance pass must clean, not instant space recovery."
+    },
+    "diagrams": [
+      "A heap file as pages plus a separate _fsm fork tree, with the max-of-children aggregation up to a root.",
+      "A tuple lifecycle: live (xmax=0) to deleted (xmax set, tombstone) to dead line pointer to reclaimed by VACUUM.",
+      "A wide row triggering TOAST: in-line 18-byte pointer plus a separate TOAST table of ~2000-byte chunks."
+    ],
+    "mcq_themes": [
+      "Which is false: DELETE immediately frees disk space to the OS",
+      "Plain VACUUM versus VACUUM FULL (locks, in-place versus rewrite); which claim is false",
+      "What VACUUM does beyond reclaiming space (statistics, visibility map, XID freezing)",
+      "How a value too large for a page is stored (TOAST out-of-line, not row spanning pages)"
+    ],
+    "glossary_terms": [
+      "heap file",
+      "page directory",
+      "free space map (FSM)",
+      "tombstone",
+      "VACUUM",
+      "XID wraparound",
+      "TOAST",
+      "visibility map",
+      "free-space pointer"
+    ],
+    "primary_source": {
+      "title": "PostgreSQL documentation, Routine Vacuuming",
+      "url": "https://www.postgresql.org/docs/current/routine-vacuuming.html",
+      "why": "Authoritative for the four purposes of VACUUM, the ~2 billion transaction XID wraparound bound and freezing, and the difference between plain VACUUM and VACUUM FULL."
+    },
+    "research_refs": [
+      "research/topics/storage.md",
+      "research/topics/concurrency.md",
+      "research/course-spine.md"
+    ],
+    "viva": false
+  },
+  {
+    "week": 4,
+    "slug": "0004-buffer-pool-design",
+    "title": "Buffer pool design: frames, pins, dirty flags, replacement",
+    "layer": "buffer",
+    "part": "Part III - Buffer pool",
+    "hook": "How does the engine make a larger-than-RAM database look like it is all in memory, and decide what to throw out?",
+    "arc": [
+      "Problem: the CPU works only on memory, disk is five to six orders of magnitude slower, and the database does not fit in RAM. Something must cache pages and choose what to keep.",
+      "Naive fix: just mmap the file and let the OS page cache handle it. The OS flushes at the wrong times for transaction safety, hides which pages are resident, and cannot respect WAL ordering.",
+      "First principles: the buffer pool is an array of frames; the page table (in memory) maps page id to frame, distinct from the page directory (on disk) that maps page id to disk location.",
+      "Real design: per-frame metadata (pin count, dirty flag, reference bit) and the fetch / pin / unpin / evict cycle. Only unpinned frames are eviction candidates; dirty victims are written back first.",
+      "Replacement policy theory: Belady's MIN is the unreachable optimum; LRU approximates it but is costly; CLOCK approximates LRU with one reference bit and a sweeping hand.",
+      "Edge cases: pinning blocks eviction but not concurrent access; the pool is write-back not write-through; a full pool with all frames pinned throws out of memory; this layer connects forward to steal/no-force recovery."
+    ],
+    "simulator": {
+      "name": "Buffer pool fetch-pin-evict stepper",
+      "what_it_does": "Shows frames with pin counts, dirty flags, and reference bits while the learner issues page requests and pin/unpin operations, watching hits, misses, write-backs of dirty victims, and the CLOCK hand sweep.",
+      "controls": [
+        "request a page by id",
+        "pin or unpin a frame",
+        "modify a page to set its dirty flag",
+        "set the pool size in frames",
+        "step the CLOCK hand"
+      ],
+      "observe": "The learner sees that only unpinned frames can be evicted, that a dirty victim costs a write plus a read, and how CLOCK gives recently used pages a second chance."
+    },
+    "diagrams": [
+      "Side-by-side: the in-memory page table (page id to frame) versus the on-disk page directory (page id to disk location).",
+      "A frame with its metadata fields (pin count, dirty flag, reference bit) and the state transitions on fetch, pin, unpin, evict.",
+      "A CLOCK circular buffer with reference bits and a hand, showing a second-chance pass before eviction."
+    ],
+    "mcq_themes": [
+      "Which is false: pinning a page prevents other transactions from reading it",
+      "Page table versus page directory; which statement swaps their roles (the false one)",
+      "Write-back versus write-through; when is a dirty page actually written",
+      "Why not rely on mmap / OS page cache; which stated reason is false"
+    ],
+    "glossary_terms": [
+      "buffer pool",
+      "frame",
+      "page table",
+      "page directory",
+      "pin count",
+      "dirty flag",
+      "reference bit",
+      "write-back cache",
+      "eviction",
+      "Belady's MIN",
+      "LRU",
+      "CLOCK"
+    ],
+    "primary_source": {
+      "title": "CMU 15-445 Lecture 06, Buffer Pools (Fall 2024)",
+      "url": "https://15445.courses.cs.cmu.edu/fall2024/notes/06-bufferpool.pdf",
+      "why": "Primary source for the buffer pool definition, frames, the page table versus page directory distinction, pin counts and dirty flags, the fetch/evict cycle, and the LRU and CLOCK replacement policies."
+    },
+    "research_refs": [
+      "research/topics/buffer.md",
+      "research/topics/storage.md",
+      "research/course-spine.md"
+    ],
+    "viva": false
+  },
+  {
+    "week": 5,
+    "slug": "0005-buffer-pool-lru-k",
+    "title": "LRU-K, sequential flooding, and prefetching",
+    "layer": "buffer",
+    "part": "Part III - Buffer pool",
+    "hook": "Why does one big table scan wreck the cache for everyone else, and how do you stop it?",
+    "arc": [
+      "Problem: LRU and CLOCK decide eviction from the time of the last reference alone, which is too little information and is fooled by scans.",
+      "Naive fix: trust recency. A large sequential scan reads many pages once, gives them the freshest timestamps, and evicts the genuinely hot working set. This is sequential flooding.",
+      "First principles: for a one-pass scan, the most recently used page is the least likely to be reused, so MRU or a bounded ring beats LRU; recency is the wrong signal here.",
+      "Real design: LRU-K tracks the last K reference times and evicts by Backward K-distance, so a page seen once and never again is dropped fast even though it was just touched. LRU-2 is the common choice.",
+      "Refinements: the Correlated Reference Period collapses read-then-update bursts so they do not look like popularity; LRU-K is not LFU because it ages out old popularity.",
+      "Edge cases and real systems: PostgreSQL uses clock-sweep with a usage count capped at 5 plus ring buffers (256 KB for scans) to bound flooding; prefetching and scan sharing overlap I/O with computation. Milestone M1."
+    ],
+    "simulator": {
+      "name": "Replacement-policy race on one trace",
+      "what_it_does": "Runs OPT, LRU, CLOCK, and LRU-2 side by side on the same reference string (a hot working set plus an injectable sequential scan), animating frames and tallying hits and misses live.",
+      "controls": [
+        "set the pool size in frames",
+        "edit or generate the reference string",
+        "set scan length to inject flooding",
+        "toggle a ring buffer for the scan",
+        "step or run to completion"
+      ],
+      "observe": "The learner watches LRU and CLOCK collapse when a scan is injected while LRU-2 and a ring buffer keep the hot set, with OPT as the unreachable floor."
+    },
+    "diagrams": [
+      "A timeline of a reference string with a scan burst, showing LRU evicting hot pages while LRU-2 keeps them.",
+      "The Backward K-distance idea: two pages with the same last-access time but different K-th-most-recent references, and which one LRU-2 evicts.",
+      "PostgreSQL clock-sweep with usage counts (0 to 5) plus a separate 256 KB ring buffer confining a scan."
+    ],
+    "mcq_themes": [
+      "Which is false: LRU is the optimal replacement policy",
+      "LRU-K versus LFU; which statement conflates them (the false one)",
+      "For a one-pass scan, which policy is right and why (MRU/ring, not LRU)",
+      "Which is false: PostgreSQL uses plain LRU for its buffer pool"
+    ],
+    "glossary_terms": [
+      "LRU-K",
+      "Backward K-distance",
+      "Correlated Reference Period",
+      "sequential flooding",
+      "MRU",
+      "prefetch / read-ahead",
+      "scan sharing",
+      "clock-sweep",
+      "ring buffer",
+      "shared_buffers"
+    ],
+    "primary_source": {
+      "title": "O'Neil, O'Neil, Weikum, The LRU-K Page Replacement Algorithm for Database Disk Buffering (SIGMOD 1993)",
+      "url": "https://www.cs.cmu.edu/~natassa/courses/15-721/papers/p297-o_neil.pdf",
+      "why": "Source for the Backward K-distance definition, LRU-2 versus LRU-1, the Correlated Reference Period, the cache-swamping example, and why LRU-K is not LFU."
+    },
+    "research_refs": [
+      "research/topics/buffer.md",
+      "research/course-spine.md"
+    ],
+    "viva": false
+  },
+  {
+    "week": 6,
+    "slug": "0006-btree-search-insert",
+    "title": "B+tree invariants, search, insertion, and splits",
+    "layer": "index",
+    "part": "Part IV - Index structures",
+    "hook": "Why a wide balanced tree and not a binary tree, and how does it stay balanced as you insert?",
+    "arc": [
+      "Problem: an index must turn an O(N) heap scan into something sublinear on disk, where the cost that matters is page reads, not comparisons.",
+      "Naive fix: a balanced binary search tree gives O(log2 N) comparisons but one page read per node, wasting all but one bit of branching per I/O; a billion keys is ~30 reads.",
+      "First principles: widen each node so one page read makes a high-fanout decision. With fanout in the hundreds, three or four levels index hundreds of millions of rows.",
+      "Real design: B+tree invariants (all data in linked leaves, internal nodes only route, height-balanced, every non-root node at least half full) and the search descent following Ki < v <= Ki+1.",
+      "Insertion with splits: insert into the leaf if it fits; if full, split and copy up the separator (leaf) or push up the middle key (internal); splits propagate up only as far as overflow, and the tree grows in height only when the root splits.",
+      "Edge cases: the half-full rule bounds height; upper levels stay cached so marginal I/O is one or two leaf reads; PostgreSQL nbtree is Lehman-Yao with right-links and high keys for concurrent splits."
+    ],
+    "simulator": {
+      "name": "Animated B+tree inserter",
+      "what_it_does": "Lets the learner set a small order and insert keys one at a time, animating the descent, the leaf split with copy-up versus the internal split with push-up shown as visibly different, and the creation of a new root.",
+      "controls": [
+        "set the order m (3 or 4)",
+        "insert a key",
+        "step through a split",
+        "watch a height counter and an I/O counter",
+        "highlight the half-full boundary on each node"
+      ],
+      "observe": "The learner sees that height changes only on a root split, that copy-up and push-up differ, and that splits leave both halves about half full so most later inserts fit."
+    },
+    "diagrams": [
+      "A B+tree with internal separator nodes and linked leaves, annotated with the Ki < v <= Ki+1 routing rule.",
+      "A leaf split (copy-up of the separator) contrasted with an internal split (push-up of the middle key), side by side.",
+      "A fanout-versus-height table: binary tree height log2 N versus B+tree height log_m N for the same N, with marginal I/O after caching upper levels."
+    ],
+    "mcq_themes": [
+      "Which is false: a B+tree gives O(log2 N) lookups (the base is the fanout, not 2)",
+      "Which is false: on a leaf split the middle key moves up (it is copied up)",
+      "Which is false: every node including the root is at least half full (root is exempt)",
+      "Which is false: B+trees store records in internal nodes (B-tree versus B+tree distinction)"
+    ],
+    "glossary_terms": [
+      "fanout (order m)",
+      "height",
+      "B+tree",
+      "separator key",
+      "high key",
+      "right-link",
+      "half-full invariant",
+      "node split",
+      "Lehman-Yao",
+      "pivot tuple"
+    ],
+    "primary_source": {
+      "title": "CMU 15-445 Lecture 08, Tree Indexes (Fall 2023)",
+      "url": "https://15445.courses.cs.cmu.edu/fall2023/notes/08-trees.pdf",
+      "why": "Source for the B+tree as an M-way search tree, fanout as the central parameter, the half-full merge-on-delete rule, and the search and insert algorithms."
+    },
+    "research_refs": [
+      "research/topics/indexing.md",
+      "research/course-spine.md"
+    ],
+    "viva": false
+  },
+  {
+    "week": 7,
+    "slug": "0007-btree-delete-hash",
+    "title": "B+tree deletion, bulk loading, composite keys, and hash indexes",
+    "layer": "index",
+    "part": "Part IV - Index structures",
+    "hook": "How does a B+tree shrink on delete, and when is a hash index actually the better choice?",
+    "arc": [
+      "Problem: deletes can underflow a node, building one key at a time is slow, and not every workload needs ordered access.",
+      "Naive fix: ignore underflow (the tree degrades) or rebuild on every delete (expensive and concurrency hostile).",
+      "First principles: deletion removes from the leaf, and on underflow restores the half-full invariant by redistributing from a richer sibling or merging with one, propagating up exactly like splits; the tree shrinks in height when the root drops to one child.",
+      "Real design: bulk loading builds bottom up from sorted entries to a fillfactor with sequential I/O, producing a denser, shallower tree than repeated insertion; composite keys are lexicographic so only a left prefix is seekable.",
+      "The hash alternative: hash indexes give expected O(1) point lookups but no ranges, no order, no prefix; static hashing degrades, extendible hashing doubles a directory with global and local depth, linear hashing splits round-robin with no directory.",
+      "Edge cases: B+tree wins anything needing order, ranges, or partial-key matches (most workloads); PostgreSQL deletion is lazy two-stage, and its hash index is equality-only, single-column, and lossy."
+    ],
+    "simulator": {
+      "name": "B+tree delete versus extendible-hash grower",
+      "what_it_does": "Left pane animates B+tree deletion choosing redistribute versus merge with the underflow threshold drawn; right pane inserts keys into an extendible hash and watches global and local depth tick up and the directory double, with a range-query button that forces the hash to scan everything.",
+      "controls": [
+        "delete a key and watch redistribute or merge",
+        "insert a key into the hash index",
+        "run a range query BETWEEN x AND y on both",
+        "toggle bulk-load versus one-at-a-time build",
+        "watch I/O counters on both sides"
+      ],
+      "observe": "The learner sees underflow handling and tree-height shrink, and feels the point-versus-range trade-off directly: hash scans every bucket for a range while the B+tree descends once and walks linked leaves."
+    },
+    "diagrams": [
+      "A delete causing underflow, with the two repairs (redistribute from a sibling, merge and drop a separator) shown as branches.",
+      "Bulk loading bottom up: sorted entries packed into leaves to a fillfactor, then parent levels built from first keys.",
+      "An extendible hash directory with global depth and per-bucket local depth, showing a split that doubles the directory versus one that does not."
+    ],
+    "mcq_themes": [
+      "Which is false: a hash index is always faster than a B+tree because it is O(1)",
+      "Which is false: a composite index on (a, b) helps a query filtering only on b",
+      "Extendible hashing: when does the directory double (local depth equals global depth) and which claim is false",
+      "Which is false about PostgreSQL hash indexes (single-column, equality-only, no uniqueness, lossy)"
+    ],
+    "glossary_terms": [
+      "merge (coalesce)",
+      "redistribute (borrow)",
+      "bulk loading",
+      "fillfactor",
+      "composite key",
+      "clustered index",
+      "unclustered index",
+      "static hashing",
+      "extendible hashing",
+      "linear hashing",
+      "global depth / local depth"
+    ],
+    "primary_source": {
+      "title": "CMU 15-445 Lecture 07, Hash Tables (Fall 2023)",
+      "url": "https://15445.courses.cs.cmu.edu/fall2023/notes/07-hashtables.pdf",
+      "why": "Source for static, extendible (global and local depth, directory doubling), and linear hashing, and the contrast with the B+tree on range and prefix access."
+    },
+    "research_refs": [
+      "research/topics/indexing.md",
+      "research/course-spine.md"
+    ],
+    "viva": false
+  },
+  {
+    "week": 8,
+    "slug": "0008-query-parsing",
+    "title": "Query parsing: lexing, parsing, binding, and logical plans",
+    "layer": "query",
+    "part": "Part V - Query processing",
+    "hook": "How does a flat SQL string become a validated, typed, algebra-shaped tree the optimizer can reason about?",
+    "arc": [
+      "Problem: the engine cannot execute a string; it needs a structured object with resolved names, known types, and an algebra shape, or every later stage operates on a lie.",
+      "Naive fix: pattern-match keywords. This recovers no structure, cannot resolve ambiguous names, and cannot type-check expressions like salary * 1.15.",
+      "First principles: lex to tokens (a DFA, O(n)), then parse with a context-free grammar; recursive descent (LL, top-down) cannot handle left recursion, LALR (bottom-up shift-reduce) can.",
+      "Real design: parsing uses only syntactic rules and no catalog lookups (catalog lookups need a transaction); binding then resolves names, checks existence, infers types, resolves overloads, and checks authorization to produce the query tree.",
+      "Rewrite and translate: the rewriter expands views, folds constants, and normalizes predicates using only the query and catalog, never data; the query tree becomes a logical plan of relational-algebra operators.",
+      "The logical versus physical boundary: a logical plan says what (join, not hash-join; scan, not index-scan) and there is no one-to-one mapping to physical operators. PostgreSQL keeps named tree stages; SQLite collapses to VDBE bytecode. Milestone M2."
+    ],
+    "simulator": {
+      "name": "Lexer-parser-binder tracer",
+      "what_it_does": "The learner types SQL and watches it become colored token chips, then a parse (toggling an LL call-stack view against an LR shift-reduce stack), then an AST, then binding against a small toy catalog that resolves or red-flags names and annotates types.",
+      "controls": [
+        "type a SQL statement",
+        "toggle LL versus LR parser view",
+        "flip a column's declared type to change overload resolution",
+        "toggle a privilege to trigger an authorization error",
+        "step through binding"
+      ],
+      "observe": "The learner watches a flat string become a tree, sees why a left-recursive rule loops in the LL view but reduces in LR, and sees the exact stage where a syntactically valid but semantically invalid query is rejected."
+    },
+    "diagrams": [
+      "The PostgreSQL chain: string to (flex) tokens to (bison) raw parse tree to (analyze) query tree to (rewrite) query tree to plan tree.",
+      "A raw parse tree versus the bound query tree for one query, with names resolved to schema.table and types attached.",
+      "A logical plan (projection over selection over scan) expanded to show each operator's candidate physical operators, illustrating the no one-to-one mapping."
+    ],
+    "mcq_themes": [
+      "Which is false: the parser checks that referenced tables and columns exist (that is binding)",
+      "Which is false: recursive descent parsers handle left recursion directly",
+      "Which is false: a logical plan specifies the join algorithm and access method",
+      "Which is false: query rewrite reads table data to simplify the query (it uses only query and catalog)"
+    ],
+    "glossary_terms": [
+      "token",
+      "lexer / scanner",
+      "recursive descent (LL) parser",
+      "LALR(1) / LR parser",
+      "shift-reduce",
+      "raw parse tree / AST",
+      "binding / analysis",
+      "query tree",
+      "query rewrite",
+      "view expansion",
+      "logical plan",
+      "physical plan"
+    ],
+    "primary_source": {
+      "title": "PostgreSQL documentation, The Parser Stage",
+      "url": "https://www.postgresql.org/docs/current/parser-stage.html",
+      "why": "Primary source for flex and bison, the rule that parsing makes no catalog lookups, the raw parse tree versus the query tree, and the FuncCall to FuncExpr/Aggref transformation in binding."
+    },
+    "research_refs": [
+      "research/topics/parsing.md",
+      "research/papers/architecture.md",
+      "research/course-spine.md"
+    ],
+    "viva": false
+  },
+  {
+    "week": 9,
+    "slug": "0009-query-execution-volcano",
+    "title": "Query execution: the Volcano iterator model",
+    "layer": "query",
+    "part": "Part V - Query processing",
+    "hook": "How does a tree of operators produce tuples without materializing a temporary table at every step?",
+    "arc": [
+      "Problem: the executor must turn a physical plan into tuples; materializing each operator's full output rereads huge intermediates and hard-codes how operators read each other.",
+      "Naive fix: compute each operator into a temp table and feed it to the next. Correct but pays for intermediate results nobody asked for and prevents free composition.",
+      "First principles: the iterator model. Every operator implements open / next / close; execution is demand-driven and top-down, one tuple bubbling up per next() call. Parents pull, children never push.",
+      "Real design: the Volcano contribution is one uniform interface so any operator feeds any other (anonymous streams), with state records holding per-instance state and support functions importing all item-level work. SeqScan, Filter, Projection, and nested-loop join all nest without knowing each other.",
+      "Why pull is the right abstraction: composability, bounded memory for streaming operators, and pipelining scan to filter to projection without writing to disk. The cost is one virtual call per operator per tuple.",
+      "Edge cases: nested loop join cost M + m*N (naive) versus M + ceil(M/(B-2))*N (block) versus M + m*C (index); index scan loses to seqscan at low selectivity; PostgreSQL is a textbook pull executor with ExecInitNode / ExecProcNode / ExecEndNode."
+    ],
+    "simulator": {
+      "name": "Single-tuple iterator stepper",
+      "what_it_does": "Shows a small plan tree (SeqScan, Filter, Projection, then a nested-loop join) over two tiny tables; the learner clicks next at the root and watches one next() call propagate down and one tuple bubble up, with each operator's held state highlighted and a per-operator call counter.",
+      "controls": [
+        "click next at the root",
+        "step into a child operator",
+        "watch the per-operator next() counter",
+        "highlight which tuple each operator currently holds",
+        "reset and replay"
+      ],
+      "observe": "The learner sees pull direction concretely (the parent drives), sees Filter and Projection holding just one tuple, and feels why one thread can run the whole graph with no queues between operators."
+    },
+    "diagrams": [
+      "An operator tree with open/next/close arrows, showing control flowing down and tuples flowing up the same call stack.",
+      "The iterator superclass (init, get_next, close, inputs array) with SeqScan, Filter, Project, and Join as subclasses.",
+      "A nested-loop join cost breakdown comparing naive, block, and index variants on the same M, m, N, B."
+    ],
+    "mcq_themes": [
+      "Which is false: the Volcano model pushes tuples from producers up to consumers (it pulls)",
+      "Which is false: an index scan is always faster than a sequential scan",
+      "Which is false: block nested loop rereads the inner table once per outer tuple (it is per block)",
+      "Why one uniform interface matters; which claim about state records or anonymous streams is false"
+    ],
+    "glossary_terms": [
+      "iterator (Volcano) model",
+      "open-next-close protocol",
+      "pull-based execution",
+      "state record",
+      "support function",
+      "stream / anonymous input",
+      "SeqScan",
+      "Filter",
+      "Projection",
+      "naive nested loop join",
+      "block nested loop join",
+      "index nested loop join"
+    ],
+    "primary_source": {
+      "title": "Volcano: An Extensible and Parallel Query Evaluation System (Graefe, 1994)",
+      "url": "https://doi.org/10.1109/69.273032",
+      "why": "The origin of the open-next-close iterator interface, demand-driven dataflow, anonymous streams, and the algorithm-shell-plus-support-function split; the assigned paper for the week 9 viva."
+    },
+    "research_refs": [
+      "research/papers/volcano.md",
+      "research/topics/execution.md",
+      "research/course-spine.md"
+    ],
+    "viva": true
+  },
+  {
+    "week": 10,
+    "slug": "0010-query-execution-joins",
+    "title": "Joins, external sort, and aggregation",
+    "layer": "query",
+    "part": "Part V - Query processing",
+    "hook": "A join is a filtered Cartesian product; how do you avoid the |R| times |S| comparisons?",
+    "arc": [
+      "Problem: a literal join of two million-row tables is 10^12 comparisons; the whole job of join algorithms is to dodge the product using sortedness, a hash table, or an index.",
+      "Naive fix: nested loop rereads the inner table per outer tuple. The block variant rereads per outer block, which is why more buffers cut its cost, but it is still poor for large equi-joins.",
+      "First principles: sort-merge join sorts both inputs then walks two cursors in lockstep (M+N merge), reusing any existing sortedness for free; hash join builds a table on the smaller input then probes with the larger (M+N in memory).",
+      "Real design: when the build side exceeds memory, grace/partitioned hash join hashes both inputs into matching disk partitions then joins partition by partition at cost 3*(M+N); hybrid hash keeps one partition resident. External merge sort generates runs then merges B-1 at a time, passes = 1 + ceil(log_{B-1}(ceil(N/B))).",
+      "Aggregation two ways: sort-based (sort on the group key, break on change, output sorted) versus hash-based (one entry per distinct group, spills when groups exceed memory, output unordered).",
+      "Edge cases and pipeline breakers: hash join is equi-join only on the full key; build on the smaller side; sort and the hash build side must consume all input before emitting; PostgreSQL exposes all three joins and spills via work_mem; SQLite does nested loop only."
+    ],
+    "simulator": {
+      "name": "Join algorithm cost playground",
+      "what_it_does": "The learner sets M, m, N, n, buffer frames B, per-I/O time, and selectivity, then picks among naive NL, block NL, index NL, sort-merge, and grace hash; the tool computes the exact I/O cost and wall time and draws a bar chart comparing all five.",
+      "controls": [
+        "set table sizes M, m, N, n",
+        "set buffer frames B",
+        "set join selectivity",
+        "pick the join algorithm",
+        "flip the build side over the memory limit to trigger grace partitioning"
+      ],
+      "observe": "The learner watches more buffers cut block NL and sort passes, selectivity make index NL win, and an oversized build side flip in-memory hash join to grace, seeing why 0.45 s hash beats 1.4 h naive NL."
+    },
+    "diagrams": [
+      "The three join families side by side: nested loop, sort-merge (two cursors), and hash (build then probe).",
+      "Grace hash join phases: partition both inputs by h1 to disk, then build-and-probe per partition pair, with recursive repartition by h2.",
+      "External merge sort as run generation (ceil(N/B) runs) followed by multi-way merge passes, with the passes formula emerging."
+    ],
+    "mcq_themes": [
+      "Which is false: hash join can do any join condition (it is equi-join only)",
+      "Which is false: you build the hash table on the larger relation",
+      "Which is false: external merge sort is always one pass",
+      "Which is false: sort-based aggregation output is unordered (that is hash aggregation)"
+    ],
+    "glossary_terms": [
+      "sort-merge join",
+      "hash join",
+      "build phase / probe phase",
+      "grace (partitioned) hash join",
+      "hybrid hash join",
+      "external merge sort",
+      "run generation",
+      "multi-way merge",
+      "hash aggregation",
+      "sort-based aggregation",
+      "pipeline breaker",
+      "work_mem"
+    ],
+    "primary_source": {
+      "title": "CMU 15-445 Lecture 12, Join Algorithms (Spring 2025)",
+      "url": "https://15445.courses.cs.cmu.edu/spring2025/notes/12-joins.pdf",
+      "why": "Source for the exact I/O cost formulas (naive, block, index NL; sort-merge; grace hash 3*(M+N)) and the worked timing example that ranks the algorithms."
+    },
+    "research_refs": [
+      "research/topics/execution.md",
+      "research/papers/volcano.md",
+      "research/course-spine.md"
+    ],
+    "viva": true
+  },
+  {
+    "week": 11,
+    "slug": "0011-query-optimization",
+    "title": "Query optimization: cost, selectivity, and join ordering",
+    "layer": "query",
+    "part": "Part V - Query processing",
+    "hook": "Given thousands of equivalent plans that differ in cost by orders of magnitude, how does the engine pick a good one?",
+    "arc": [
+      "Problem: SQL says what, not how, and each independent choice (access path, join method, join order) multiplies, so the plan space is exponential and the plans differ enormously in cost.",
+      "Naive fix: a rule-based optimizer with a fixed priority list (always prefer an index) is blind to data and picks an index even when the predicate matches most of the table.",
+      "First principles: a cost model blends I/O and CPU into one comparable number (COST = PAGE FETCHES + W * RSI CALLS); only relative ordering matters, and selectivity drives how many rows each operator produces.",
+      "Selectivity estimation: System R default constants (1/10, 1/3, 1/4), the uniformity and independence assumptions that fail on skew and correlation, and histograms (equi-depth plus a most-common-values list) that attack the uniformity failure.",
+      "Join ordering: the Selinger dynamic program over subsets, restricted to left-deep trees, pushing Cartesian products late, and keeping the cheapest plan per interesting order so a later merge join can skip its sort.",
+      "Heuristic rewrites and edge cases: predicate pushdown, projection pushdown, and join elimination are applied unconditionally; PostgreSQL is cost-based DP with GEQO above geqo_threshold (12); SQLite uses a polynomial graph planner; clustered (TCARD) versus non-clustered (NCARD) scan cost is the whole point of clustering."
+    ],
+    "simulator": {
+      "name": "Selectivity and join-order DP visualizer",
+      "what_it_does": "One pane is a selectivity and histogram playground where the learner skews a column distribution and watches equi-width go wrong while equi-depth stays close; the other pane animates the System R DP filling its table level by level (singletons, pairs, triples), striking out Cartesian-product orders and showing how interesting orders flip the final plan.",
+      "controls": [
+        "drag column distribution bars between uniform and skewed",
+        "type a predicate (x = 7, x < 50, x BETWEEN 10 AND 20)",
+        "edit table cardinalities and the join graph",
+        "toggle keep-interesting-orders on or off",
+        "toggle correlate two columns to expose the independence error"
+      ],
+      "observe": "The learner sees equi-depth beat equi-width on skew, the independence assumption underestimate correlated ANDs, and the chosen left-deep order depend on cardinalities and the join graph, not FROM-clause order."
+    },
+    "diagrams": [
+      "The single-relation cost table: clustered (NINDX + TCARD)*F versus non-clustered (NINDX + NCARD)*F versus full scan TCARD/P, plotted against selectivity with a crossover point.",
+      "An equi-width versus equi-depth histogram over a skewed column, with the dense bucket misestimated by equi-width.",
+      "The Selinger DP lattice: subsets of {A,B,C,D} from singletons up, with pruned Cartesian-product orders struck out and one best plan kept per interesting order."
+    ],
+    "mcq_themes": [
+      "Which is false: the optimizer finds the optimal plan (it finds a good one under estimates)",
+      "Which is false: an index scan is always faster than a full scan, so the optimizer always picks the index",
+      "Which is false: under independence, ANDed selectivities are added (they multiply)",
+      "Which is false: System R searches bushy trees (it restricts to left-deep); which claim about interesting orders is false"
+    ],
+    "glossary_terms": [
+      "plan space",
+      "access path",
+      "selectivity factor (F)",
+      "cost model",
+      "uniformity assumption",
+      "independence assumption",
+      "equi-depth histogram",
+      "most-common-values (MCV) list",
+      "left-deep join tree",
+      "dynamic programming join search",
+      "interesting order",
+      "predicate pushdown",
+      "GEQO"
+    ],
+    "primary_source": {
+      "title": "Selinger et al., Access Path Selection in a Relational Database Management System (SIGMOD 1979)",
+      "url": "https://people.eecs.berkeley.edu/~brewer/cs262/3-selinger79.pdf",
+      "why": "The System R optimizer: the COST = PAGE FETCHES + W * RSI CALLS model, the Table 1 selectivity constants, the dynamic-programming join search, the left-deep restriction, and interesting orders."
+    },
+    "research_refs": [
+      "research/topics/optimization.md",
+      "research/papers/architecture.md",
+      "research/course-spine.md"
+    ],
+    "viva": false
+  },
+  {
+    "week": 12,
+    "slug": "0012-transactions-isolation",
+    "title": "Transactions, ACID, anomalies, and isolation levels",
+    "layer": "txn",
+    "part": "Part VI - Transactions",
+    "hook": "If interleaving transactions is what gives throughput, which interleavings are wrong and how do we forbid exactly those?",
+    "arc": [
+      "Problem: a transaction is one logical step built from many physical ones, threatened by failures and by concurrency; ACID names the four guarantees that close those threats.",
+      "Naive fix: run transactions one at a time. You get isolation free but throughput collapses because a transaction blocked on disk idles the whole CPU.",
+      "First principles: interleave for throughput, but catalog the wrong answers. Dirty write, dirty read, non-repeatable read, phantom, lost update, and write skew are each a result no serial schedule could produce.",
+      "Real design: serializability is the target; conflict serializability is the testable proxy via the precedence graph (acyclic iff conflict-serializable). Recoverability is a separate axis (recoverable, cascadeless, strict).",
+      "Two-phase locking: a growing phase then a shrinking phase, with the lock point; 2PL guarantees conflict serializability but plain 2PL still allows dirty reads, so strict and rigorous variants hold locks to commit.",
+      "Edge cases: snapshot isolation forbids dirty/non-repeatable reads and lost update via First-Committer-Wins but still permits write skew, so it is incomparable with Repeatable Read and weaker than Serializable; the ANSI levels are defined by phenomena, not by locking. PostgreSQL implements three of four levels."
+    ],
+    "simulator": {
+      "name": "Interleaving sandbox with a live precedence graph",
+      "what_it_does": "The learner drags operations from two or three transactions onto a shared timeline; the tool continuously draws the precedence graph, colors it green (acyclic, with an equivalent serial order) or red (a cycle, with the conflicting edges highlighted), and classifies the schedule as recoverable, cascadeless, or strict.",
+      "controls": [
+        "drag operations (r1[x], w2[y], c1, a2) onto the timeline",
+        "reorder operations",
+        "pick an anomaly scenario to reproduce",
+        "toggle which transaction commits or aborts first",
+        "read the live schedule classification"
+      ],
+      "observe": "The learner feels why a cycle means no serial order exists, watches write skew appear as a two-node cycle, and sees serializability and recoverability as independent axes."
+    },
+    "diagrams": [
+      "A precedence graph going acyclic to cyclic as one operation is moved, with the equivalent serial order shown when acyclic.",
+      "The 2PL lock profile: a growing phase rising to the lock point then a shrinking phase, contrasted with strict 2PL holding write locks to commit.",
+      "The isolation-level grid (ANSI plus snapshot isolation as its own row) showing which phenomenon each level forbids, with SI breaking on write skew."
+    ],
+    "mcq_themes": [
+      "Which is false: ANSI isolation levels are defined by which locking they use (they are defined by phenomena)",
+      "Which is false: snapshot isolation is the same as Serializable (it permits write skew)",
+      "Which is false: Serializable means transactions actually run one at a time",
+      "Which is false: a phantom is just a non-repeatable read; which 2PL claim is false"
+    ],
+    "glossary_terms": [
+      "ACID",
+      "serializable schedule",
+      "conflict-serializable schedule",
+      "precedence graph",
+      "recoverable schedule",
+      "cascadeless schedule",
+      "strict schedule",
+      "dirty write",
+      "phantom",
+      "lost update",
+      "write skew",
+      "two-phase locking (2PL)",
+      "lock point",
+      "snapshot isolation (SI)",
+      "First-Committer-Wins"
+    ],
+    "primary_source": {
+      "title": "Berenson et al., A Critique of ANSI SQL Isolation Levels (SIGMOD 1995)",
+      "url": "https://www.cs.cmu.edu/~15721-f24/papers/Critique_of_ANSI_Isolation_Levels.pdf",
+      "why": "Source for P0 dirty write, the phenomenon-based definitions, snapshot isolation with First-Committer-Wins, write skew (A5B), and the argument that SI is incomparable with Repeatable Read."
+    },
+    "research_refs": [
+      "research/topics/transactions.md",
+      "research/topics/concurrency.md",
+      "research/course-spine.md"
+    ],
+    "viva": false
+  },
+  {
+    "week": 13,
+    "slug": "0013-concurrency-mvcc",
+    "title": "Concurrency: strict 2PL, deadlock, and MVCC",
+    "layer": "txn",
+    "part": "Part VI - Transactions",
+    "hook": "How do you serialize writers without making readers wait, and what do you do when two transactions wait on each other forever?",
+    "arc": [
+      "Problem: lock-based 2PL forces readers and writers to block each other, and locking can deadlock; high-concurrency systems want serializability without that contention.",
+      "Naive fix: hold locks for everything until commit (rigorous 2PL). Correct and cascadeless, but readers block writers and writers block readers, and deadlocks still form.",
+      "First principles: the lock manager (a hash table of granted groups and wait queues, protected by latches), the S/X compatibility matrix, and multi-granularity locking with intention locks (IS, IX, SIX) so coarse and fine locks coexist.",
+      "Deadlock handling: detection builds a waits-for graph and aborts a victim on a cycle (O(V+E)); prevention uses timestamps (wait-die: older waits, younger dies; wound-wait: older preempts, younger waits), with reused timestamps for liveness; timeouts are the cheap, false-positive-prone fallback.",
+      "MVCC: each write creates a new version, readers see the version their snapshot can see, so reading never blocks writing. The four design decisions are protocol, version storage, garbage collection, and index pointers; the new cost is space plus background GC.",
+      "Edge cases: PostgreSQL is append-only MVCC on the heap (xmin/xmax, UPDATE is delete-plus-insert), uses deadlock detection not prevention, and needs VACUUM; SQLite serializes writers outright, with WAL mode giving snapshot-style read concurrency but still one writer."
+    ],
+    "simulator": {
+      "name": "MVCC version chain and snapshot viewer",
+      "what_it_does": "The learner issues BEGIN, UPDATE, DELETE, and COMMIT across two transactions on a few rows; the tool renders each row as a chain of tuple boxes showing xmin and xmax and a side panel showing each transaction's snapshot, graying out invisible versions and highlighting the one each transaction reads, then a VACUUM button reclaims dead versions.",
+      "controls": [
+        "step transactions through BEGIN/UPDATE/DELETE/COMMIT",
+        "select a transaction to view its snapshot",
+        "watch an in-progress update not block the other transaction's read",
+        "press VACUUM to reclaim dead versions",
+        "hold an old reader open to see GC stall"
+      ],
+      "observe": "The learner sees that an in-progress write creates a new version rather than blocking a reader, and that a long-running reader holds back garbage collection (a space cost, not a blocking cost)."
+    },
+    "diagrams": [
+      "A lock table entry (granted group plus wait queue) with the S/X compatibility matrix and intention locks shown for multi-granularity.",
+      "A waits-for graph forming a cycle, with wait-die and wound-wait shown as alternative resolutions that prevent the cycle up front.",
+      "A row's version chain with xmin/xmax stamps and two transaction snapshots selecting different visible versions."
+    ],
+    "mcq_themes": [
+      "Which is false: 2PL guarantees serializability so it also avoids cascading aborts",
+      "Which is false: in wait-die the older transaction aborts (older waits, younger dies)",
+      "Which is false: MVCC means no locks at all (writers still serialize)",
+      "Which is false: PostgreSQL prevents deadlocks (it detects them); which UPDATE-in-place claim is false"
+    ],
+    "glossary_terms": [
+      "strict 2PL",
+      "rigorous 2PL",
+      "lock manager",
+      "latch",
+      "intention lock (IS, IX, SIX)",
+      "multi-granularity locking",
+      "waits-for graph",
+      "deadlock detection",
+      "wait-die",
+      "wound-wait",
+      "MVCC",
+      "version chain",
+      "xmin / xmax",
+      "snapshot",
+      "Serializable Snapshot Isolation (SSI)"
+    ],
+    "primary_source": {
+      "title": "PostgreSQL documentation, Concurrency Control Introduction (MVCC)",
+      "url": "https://www.postgresql.org/docs/current/mvcc-intro.html",
+      "why": "States the readers-do-not-block-writers MVCC property that defines the multi-version approach, grounding the contrast with lock-based 2PL."
+    },
+    "research_refs": [
+      "research/topics/concurrency.md",
+      "research/topics/transactions.md",
+      "research/topics/storage.md",
+      "research/course-spine.md"
+    ],
+    "viva": false
+  },
+  {
+    "week": 14,
+    "slug": "0014-logging-recovery-aries",
+    "title": "Logging and recovery: WAL and ARIES",
+    "layer": "recovery",
+    "part": "Part VII - Recovery",
+    "hook": "If the machine can crash at any instant, how do committed writes survive and uncommitted ones disappear?",
+    "arc": [
+      "Problem: the buffer pool may write an uncommitted page to disk (steal) and may not flush a committed page at commit (no-force), so a crash can leave disk in any mixed state.",
+      "Naive fix: shadow paging (write new versions elsewhere, keep the old) avoids the problem but costs space and perturbs checkpoints; in-place update with a log is the WAL alternative.",
+      "First principles: write-ahead logging. Before a dirty page reaches disk, its log record (at least the undo portion) must be on stable storage; commit forces the log to the commit record. The page_LSN correlates a page's exact state with the log.",
+      "Real design: ARIES three principles, WAL, repeating history during redo, and logging undo via redo-only Compensation Log Records that carry UndoNxtLSN so rollback is bounded and idempotent.",
+      "The three restart passes: Analysis rebuilds the transaction table and dirty page table and finds losers and RedoLSN; Redo repeats history forward (conditional on page_LSN) for all transactions including losers; Undo rolls back losers in reverse, writing CLRs.",
+      "Edge cases: steal forces undo capability, no-force forces redo capability (the direct link to weeks 4-5); redo is conditional, undo is unconditional; logical undo is possible because the CLR records what undo did."
+    ],
+    "simulator": {
+      "name": "ARIES log replayer",
+      "what_it_does": "The learner builds a log of updates and commits across transactions, triggers a crash at a chosen point, then runs Analysis, Redo, and Undo passes step by step, watching the transaction table, dirty page table, page_LSN values, and CLR writes evolve.",
+      "controls": [
+        "append update and commit records for transactions",
+        "set a steal or no-force buffer event",
+        "trigger a crash at a chosen log position",
+        "step through Analysis, Redo, Undo",
+        "watch page_LSN gate each conditional redo"
+      ],
+      "observe": "The learner sees repeating history reconstruct the exact crash-time state before undo, why redo is conditional on page_LSN but undo is unconditional, and how UndoNxtLSN skips already-undone work so rollback is bounded."
+    },
+    "diagrams": [
+      "The WAL ordering rule: a log record reaching stable storage before its dirty data page, with the page_LSN linking page state to the log.",
+      "A transaction's log chain with PrevLSN, and a CLR carrying UndoNxtLSN pointing past the record it compensated.",
+      "The three restart passes on one timeline: Analysis forward from checkpoint, Redo forward from RedoLSN, Undo backward over losers."
+    ],
+    "mcq_themes": [
+      "Which is false: write-ahead logging writes the data page before the log",
+      "Why do steal and no-force respectively force undo and redo; which mapping is false",
+      "Which is false: redo is unconditional (redo is conditional on page_LSN, undo is unconditional)",
+      "Which is false: a CLR can itself be undone (CLRs are redo-only); which repeating-history claim is false"
+    ],
+    "glossary_terms": [
+      "WAL (write-ahead logging)",
+      "LSN",
+      "page_LSN",
+      "steal",
+      "no-force",
+      "CLR (Compensation Log Record)",
+      "UndoNxtLSN",
+      "repeating history",
+      "loser transaction",
+      "Transaction Table",
+      "Dirty Pages Table",
+      "RecLSN",
+      "RedoLSN",
+      "fuzzy checkpoint"
+    ],
+    "primary_source": {
+      "title": "ARIES: A Transaction Recovery Method (Mohan et al., ACM TODS 1992)",
+      "url": "https://dl.acm.org/doi/10.1145/128765.128770",
+      "why": "The canonical reference for WAL, the page_LSN invariant, steal/no-force, repeating history, Compensation Log Records, and the three-pass restart; the assigned paper for the week 14 viva."
+    },
+    "research_refs": [
+      "research/papers/aries.md",
+      "research/topics/buffer.md",
+      "research/course-spine.md"
+    ],
+    "viva": true
+  },
+  {
+    "week": 15,
+    "slug": "0015-modern-architectures-lsm",
+    "title": "Modern architectures: LSM trees, columnar storage, DuckDB",
+    "layer": "modern",
+    "part": "Part VIII - Modern and distributed",
+    "hook": "When writes dominate, or scans touch a few columns of a billion rows, why does the comfortable B+tree-on-a-buffer-pool design lose?",
+    "arc": [
+      "Problem: an update-in-place B+tree turns small inserts into random reads then random writes (write amplification), and a row-store drags every column through cache to read two.",
+      "Naive fix: keep tuning the B+tree and buffer pool. It cannot turn random writes into sequential ones, and a row layout cannot make a column scan cheap.",
+      "First principles: the log-structured merge tree. Buffer writes in a memtable plus a WAL, flush immutable sorted SSTables, and merge them with background compaction so many small random writes become few large sequential ones.",
+      "Real design and trade-offs: reads merge the memtable with SSTables (cut by per-SSTable Bloom filters with no false negatives); leveled compaction minimizes space and read amplification at higher write amplification (>10 in RocksDB), tiered does the reverse; the RUM conjecture says pick two.",
+      "Columnar and vectorized: a column-store reads only the columns a query touches, compresses far better, and is processed a vector at a time; DuckDB is an embedded columnar push-based vectorized engine (2048-value vectors) with late materialization and bulk MVCC.",
+      "Edge cases and grounding: Bigtable defined this write path (commit log plus memtable plus immutable SSTables plus minor/merging/major compaction with tombstones); row-stores still win OLTP and B+trees still win read-heavy point lookups."
+    ],
+    "simulator": {
+      "name": "LSM write and compaction visualizer",
+      "what_it_does": "The learner sets memtable capacity, compaction policy (tiered versus leveled), and the level size multiplier, then streams in writes and watches the memtable fill, flush to an immutable SSTable, and compaction merge runs, with live counters for write, read, and space amplification and a Bloom-filter toggle.",
+      "controls": [
+        "stream in writes at a chosen rate",
+        "switch tiered versus leveled compaction",
+        "set the level size multiplier",
+        "toggle a per-SSTable Bloom filter and drag bits-per-key",
+        "issue a negative lookup to count files probed"
+      ],
+      "observe": "The learner watches the three amplifications move in opposite directions as the policy changes (the RUM trade-off) and sees a Bloom filter skip SSTables on a negative lookup, making the B-tree-versus-LSM choice concrete."
+    },
+    "diagrams": [
+      "The LSM write path: WAL plus memtable, flush to an immutable SSTable, then leveled versus tiered compaction shown side by side.",
+      "A Bloom filter (m bits, k hashes) answering definitely-not versus maybe, with the (0.6185)^(m/n) false-positive curve.",
+      "Row (NSM) versus column (DSM) layout for a wide table, with a two-column scan reading only two segments under DSM."
+    ],
+    "mcq_themes": [
+      "Which is false: LSM trees are strictly faster than B-trees",
+      "Which is false: Bloom filters can give false negatives",
+      "Which is false: leveled compaction has lower write amplification than tiered (it is the reverse)",
+      "Which is false: vectorized execution means compiling the query to machine code"
+    ],
+    "glossary_terms": [
+      "LSM tree",
+      "memtable",
+      "SSTable",
+      "tombstone",
+      "compaction",
+      "leveled compaction",
+      "tiered compaction",
+      "write amplification",
+      "read amplification",
+      "space amplification",
+      "RUM conjecture",
+      "Bloom filter",
+      "column-store (DSM)",
+      "vectorized execution",
+      "late materialization"
+    ],
+    "primary_source": {
+      "title": "Bigtable: A Distributed Storage System for Structured Data (Chang et al., OSDI 2006)",
+      "url": "https://research.google.com/archive/bigtable-osdi06.pdf",
+      "why": "The canonical production LSM write path (commit log plus memtable plus immutable SSTables, minor/merging/major compaction, tombstones); the assigned paper for the week 15 viva."
+    },
+    "research_refs": [
+      "research/topics/modern.md",
+      "research/papers/bigtable.md",
+      "research/papers/volcano.md",
+      "research/course-spine.md"
+    ],
+    "viva": true
+  },
+  {
+    "week": 16,
+    "slug": "0016-distributed-databases",
+    "title": "Distributed databases: partitioning, replication, 2PC, CAP",
+    "layer": "modern",
+    "part": "Part VIII - Modern and distributed",
+    "hook": "Once data outgrows one machine and the network can drop messages, what does a transaction give up?",
+    "arc": [
+      "Problem: one node has finite disk, memory, and a single failure domain; spreading data across machines introduces a network that drops and delays messages arbitrarily.",
+      "Naive fix: commit locally on each node. Some nodes could commit while others abort, breaking atomicity, and a single leader is a single point of failure.",
+      "First principles: horizontal partitioning by hash (even spread, no ranges) or range (ordered scans, but monotonic-key hotspots), the same index trade-off from weeks 6-7 at cluster scale; replication by leader/follower or quorum (W + R > N).",
+      "Real design: two-phase commit coordinates an all-or-nothing decision (prepare/vote then commit/abort), but a coordinator crash after participants prepare leaves them in-doubt holding locks, the blocking problem; consensus (Raft, equivalent to Multi-Paxos) replicates the decision log so a minority can fail without blocking.",
+      "The CAP theorem and PACELC: during a partition you choose consistency (linearizability, not ACID consistency) or availability; PACELC adds that even with a healthy network you trade latency against consistency.",
+      "Edge cases and grounding: Bigtable shows the LSM write path inside a distributed, range-partitioned, Chubby-coordinated system (three-level tablet location, master fencing dead servers); synchronous replication trades latency for no data loss; PostgreSQL partitions within one server only."
+    ],
+    "simulator": {
+      "name": "CAP/PACELC partition sandbox with 2PC",
+      "what_it_does": "A small cluster of replica nodes with a leader and a client; the learner can cut the network, toggle synchronous versus asynchronous replication, set quorum W and R, issue reads and writes on either side of a partition, and switch on a 2PC mode that can kill the coordinator mid-protocol and then replace it with a Raft group.",
+      "controls": [
+        "inject or heal a network partition",
+        "toggle synchronous versus asynchronous replication",
+        "set quorum W and R",
+        "kill the coordinator mid-2PC",
+        "replace the coordinator with a Raft group"
+      ],
+      "observe": "The learner sees a CP setting refuse the minority side while an AP setting serves stale data, sees the latency cost of synchronous replication with no partition, and watches prepared participants block in-doubt until a Raft-replicated coordinator removes the block."
+    },
+    "diagrams": [
+      "Hash versus range partitioning of a key space across shards, with a range query fanning out under hashing but hitting a contiguous set under ranging.",
+      "Two-phase commit timeline showing prepared participants stuck in-doubt when the coordinator crashes, and the same protocol with a Raft-replicated coordinator log.",
+      "The CAP triangle with the during-partition C-versus-A choice, plus the PACELC else-branch latency-versus-consistency trade-off."
+    ],
+    "mcq_themes": [
+      "Which is false: the C in CAP is the same as the C in ACID",
+      "Which is false: two-phase commit guarantees the transaction never blocks",
+      "Which is false: hash partitioning supports efficient range queries",
+      "Which is false: Raft and Paxos give different consistency results; which quorum or synchronous-replication claim is false"
+    ],
+    "glossary_terms": [
+      "horizontal partitioning (sharding)",
+      "hash partitioning",
+      "range partitioning",
+      "leader/follower replication",
+      "synchronous vs asynchronous replication",
+      "quorum (W, R, N)",
+      "two-phase commit (2PC)",
+      "in-doubt state",
+      "three-phase commit (3PC)",
+      "CAP theorem",
+      "linearizability",
+      "PACELC",
+      "consensus",
+      "Raft"
+    ],
+    "primary_source": {
+      "title": "Bigtable: A Distributed Storage System for Structured Data (Chang et al., OSDI 2006)",
+      "url": "https://research.google.com/archive/bigtable-osdi06.pdf",
+      "why": "Grounds the distributed half: range-partitioned tablets, the three-level location hierarchy, Chubby-based master election and tablet-server fencing, and replication living below the data plane in GFS and Paxos."
+    },
+    "research_refs": [
+      "research/topics/modern.md",
+      "research/papers/bigtable.md",
+      "research/papers/architecture.md",
+      "research/course-spine.md"
+    ],
+    "viva": true
+  }
+]
