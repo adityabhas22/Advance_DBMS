@@ -1,0 +1,265 @@
+<!DOCTYPE html>
+<!--
+  ============================================================
+  LESSON TEMPLATE + COMPONENT SHOWCASE
+  ============================================================
+  This file is the contract every lesson follows. It shows the
+  full lesson skeleton and demonstrates every shared component
+  with copy-paste-ready markup. Read it before authoring a lesson.
+
+  Rules for authors:
+  - Link assets/course.css and assets/components.js with RELATIVE
+    paths from lessons/  ->  ../assets/...
+  - Set <body class="layer-XXX"> to theme the lesson by subsystem:
+    storage | buffer | index | query | txn | recovery | modern
+  - Reuse these components. Do not invent new CSS unless a lesson
+    truly needs something novel; if so, keep it in a <style> block
+    scoped to that lesson.
+  - Prose style: no em/en dashes, no emojis in headings, sentence
+    case headings, no rule-of-three padding. Lead with intuition.
+  - Every lesson MUST contain: objectives, >=1 interactive sim,
+    real SVG diagram(s), first-principles "why" callouts,
+    >=4 MCQs with explanations, a primary-source box, an
+    ask-your-teacher box, and prev/next nav.
+  ============================================================
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lesson NN — Title · Field Guide to the Database Engine</title>
+<link rel="stylesheet" href="../assets/course.css">
+<script defer src="../assets/components.js"></script>
+</head>
+<body class="layer-storage">
+<main class="page">
+
+  <!-- ===== MASTHEAD ===== -->
+  <header class="masthead col">
+    <div class="crumbs">
+      <a href="../index.html">Field Guide</a> <span>/</span>
+      <span>Part II · Storage</span> <span>/</span>
+      <span>Week 02</span>
+    </div>
+    <span class="week-badge">Storage engine</span>
+    <h1>Lesson title goes here</h1>
+    <p class="lede">One or two sentences that frame the single question this lesson answers,
+    written so a curious reader wants the answer.</p>
+  </header>
+
+  <div class="col">
+
+  <!-- ===== OBJECTIVES ===== -->
+  <div class="objectives">
+    <h4>By the end you can</h4>
+    <ul>
+      <li>State the problem this component solves and why the naive approach fails.</li>
+      <li>Walk the mechanism step by step.</li>
+      <li>Answer MCQ-style questions on the tricky edges.</li>
+    </ul>
+  </div>
+
+  <!-- ===== WHERE THIS SITS (connective tissue) ===== -->
+  <p>Open every lesson by locating it in the whole engine: what layer above calls it,
+  what layer below it leans on. Link back and forward, for example to the
+  <a href="0001-dbms-architecture.html">architecture overview</a>.</p>
+
+  <!-- ===== CALLOUTS (six flavors) ===== -->
+  <div class="callout intuition">
+    <div class="callout-title">Intuition</div>
+    <p>The plain-language mental model, before any jargon.</p>
+  </div>
+
+  <div class="callout why">
+    <div class="callout-title">Why it works this way</div>
+    <p>Derive the design from first principles: here is the constraint, here is the naive
+    fix, here is why it breaks, here is the real design.</p>
+  </div>
+
+  <div class="callout keyidea">
+    <div class="callout-title">Keep this one thing</div>
+    <p>The single sentence to remember if you forget everything else.</p>
+  </div>
+
+  <div class="callout gotcha">
+    <div class="callout-title">Exam trap</div>
+    <p>A common misconception or the "which statement is false" trick the MCQ will use.</p>
+  </div>
+
+  <div class="callout realworld">
+    <div class="callout-title">In real systems</div>
+    <p>How PostgreSQL or SQLite actually does this, with a citation
+    [<a href="https://www.postgresql.org/docs/current/storage-page-layout.html">PG docs</a>].</p>
+  </div>
+
+  <!-- ===== FIGURE WITH INLINE SVG ===== -->
+  <figure class="diagram">
+    <svg viewBox="0 0 520 120" role="img" aria-label="Example diagram">
+      <rect x="10" y="30" width="120" height="60" rx="6" fill="var(--storage-bg)" stroke="var(--storage)"/>
+      <text x="70" y="65" text-anchor="middle" class="svg-label">layer above</text>
+      <line x1="130" y1="60" x2="200" y2="60" stroke="var(--ink-soft)" marker-end="url(#arrow)"/>
+      <rect x="200" y="30" width="120" height="60" rx="6" fill="#fffdf8" stroke="var(--ink-soft)"/>
+      <text x="260" y="65" text-anchor="middle" class="svg-mono">this layer</text>
+      <defs>
+        <marker id="arrow" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto">
+          <path d="M0,0 L7,3 L0,6 Z" fill="var(--ink-soft)"/>
+        </marker>
+      </defs>
+    </svg>
+    <figcaption><b>Figure 1.</b> Caption explains what to notice, not just what it is.</figcaption>
+  </figure>
+
+  <!-- ===== INTERACTIVE SIMULATOR (the heart of each lesson) =====
+       Pattern: a .sim panel with a stage (SVG/canvas/DOM), a
+       controls bar, and a readout. Drive step-through demos with
+       DBMS.stepper. Keep all logic self-contained vanilla JS. -->
+  <figure class="sim" id="demo-sim">
+    <div class="sim-head">
+      <span class="sim-title">Simulator</span>
+      <span class="sim-sub">press Step to insert a record</span>
+    </div>
+    <div class="sim-body">
+      <div class="sim-stage"><svg id="demo-svg" viewBox="0 0 480 90" width="100%"></svg></div>
+      <div class="sim-controls" id="demo-controls"></div>
+      <div class="sim-readout" id="demo-readout"></div>
+    </div>
+  </figure>
+  <figcaption class="muted" style="margin-top:-1rem">Caption the sim too: tell the reader what experiment to run.</figcaption>
+
+  <script>
+  // Self-contained simulator. Demonstrates DBMS.el / DBMS.svg / DBMS.stepper.
+  (function () {
+    const svg = document.getElementById("demo-svg");
+    const readout = document.getElementById("demo-readout");
+    const CAP = 8;                       // slots in our toy page
+    const rand = DBMS.rng(42);           // deterministic replay
+    const sizes = Array.from({length: CAP}, () => 18 + Math.floor(rand() * 26));
+
+    function render(n) {                  // draw first n records
+      svg.innerHTML = "";
+      let x = 10;
+      for (let k = 0; k < CAP; k++) {
+        const w = sizes[k] * 1.4;
+        const filled = k < n;
+        svg.appendChild(DBMS.svg("rect", {
+          x: x, y: 30, width: w, height: 34, rx: 4,
+          fill: filled ? "var(--storage-bg)" : "#fffefb",
+          stroke: filled ? "var(--storage)" : "var(--rule)",
+          "stroke-dasharray": filled ? "0" : "3 3"
+        }));
+        if (filled) svg.appendChild(DBMS.svg("text", { x: x + w/2, y: 52, "text-anchor": "middle", class: "svg-mono" }, "r" + k));
+        x += w + 6;
+      }
+      const used = sizes.slice(0, n).reduce((a,b)=>a+b, 0);
+      readout.textContent = "records: " + n + "/" + CAP + "   bytes used: " + used;
+    }
+
+    DBMS.stepper({
+      controls: document.getElementById("demo-controls"),
+      steps: CAP,
+      onRender: render,
+      labels: { step: "Insert", reset: "Empty page" },
+      autoMs: 650
+    });
+  })();
+  </script>
+
+  <!-- ===== ALGORITHM STEPS ===== -->
+  <h3>The algorithm</h3>
+  <ol class="steps">
+    <li>First step, stated as an action.</li>
+    <li>Second step, with the invariant it preserves.</li>
+    <li>Third step, and what happens on the boundary case.</li>
+  </ol>
+
+  <!-- ===== CODE ===== -->
+  <pre><code><span class="tok-com"># pseudocode, grounded in how the real system does it</span>
+<span class="tok-kw">def</span> <span class="tok-fn">insert</span>(page, record):
+    <span class="tok-kw">if</span> free_space(page) &lt; len(record) + SLOT_SIZE:
+        <span class="tok-kw">return</span> <span class="tok-num">NEED_NEW_PAGE</span>
+    slot = page.alloc_slot()
+    page.write(record)            <span class="tok-com"># data grows from the end</span>
+    <span class="tok-kw">return</span> slot</code></pre>
+
+  <!-- ===== DEEP DIVE (optional, collapsed by default) ===== -->
+  <details class="deepdive">
+    <summary>Deeper: the byte-level layout</summary>
+    <div><p>Hide the heavier detail here so the main thread stays readable.</p></div>
+  </details>
+
+  <!-- ===== TABLE ===== -->
+  <table>
+    <caption>Compare the options side by side.</caption>
+    <thead><tr><th>Approach</th><th>Cost</th><th>When it wins</th></tr></thead>
+    <tbody>
+      <tr><td>Naive</td><td>O(n)</td><td>tiny data</td></tr>
+      <tr><td>This design</td><td>O(log n)</td><td>everything else</td></tr>
+    </tbody>
+  </table>
+
+  <!-- ===== RETRIEVAL PRACTICE: MCQs =====
+       data-answer is the 0-based index of the correct option.
+       Keep all options close to the same length so layout gives
+       nothing away. Always include an explanation. -->
+  <h2>Check yourself</h2>
+
+  <div class="mcq" data-answer="1">
+    <p class="mcq-q">Which statement about this mechanism is correct?</p>
+    <button class="mcq-opt">A plausible but wrong option of similar length.</button>
+    <button class="mcq-opt">The correct option, written at the same length.</button>
+    <button class="mcq-opt">Another plausible distractor of similar length.</button>
+    <button class="mcq-opt">A fourth distractor matched in length too.</button>
+    <p class="mcq-explain">Explain why the right answer is right and name the trap in the others.</p>
+  </div>
+
+  <div class="mcq" data-answer="2">
+    <p class="mcq-q">Which of these is false?</p>
+    <button class="mcq-opt">A true statement about the topic.</button>
+    <button class="mcq-opt">Another true statement about the topic.</button>
+    <button class="mcq-opt">The false statement, the answer here.</button>
+    <button class="mcq-opt">A fourth true statement about the topic.</button>
+    <p class="mcq-explain">Spell out exactly why the chosen option is false.</p>
+  </div>
+
+  <!-- ===== FLASHCARD (active recall) ===== -->
+  <div class="flashcard">
+    <div class="fc-front">Prompt: state the invariant this component guarantees.</div>
+    <div class="fc-back">Answer: the property, in one tight sentence.</div>
+  </div>
+
+  <!-- ===== VIVA PROMPT (for paper weeks) ===== -->
+  <div class="callout viva">
+    <div class="callout-title">Viva prompt</div>
+    <p>An examiner-style question on the assigned paper, with a model answer in a deepdive below it.</p>
+  </div>
+
+  <!-- ===== PRIMARY SOURCE ===== -->
+  <div class="source-box">
+    <div class="src-tag">Primary source</div>
+    <div class="src-title">Read this next: title of the best resource on this topic</div>
+    <p class="muted">One line on why this is the highest-trust source and which section to focus on.</p>
+  </div>
+
+  <!-- ===== ASK YOUR TEACHER ===== -->
+  <div class="ask-teacher">
+    <div class="at-tag">Ask your teacher</div>
+    <p>Anything unclear here? Ask me to go deeper, draw it differently, or quiz you harder.
+    I am your teacher for this course, not just a document.</p>
+  </div>
+
+  <!-- ===== NAV ===== -->
+  <nav class="lesson-nav">
+    <a class="prev" href="0001-dbms-architecture.html">
+      <span class="nav-dir">Previous</span>
+      <span class="nav-title">Week 01 · DBMS architecture</span>
+    </a>
+    <a class="next" href="0003-storage-engine-2.html">
+      <span class="nav-dir">Next</span>
+      <span class="nav-title">Week 03 · Heap files and free space</span>
+    </a>
+  </nav>
+
+  </div><!-- /.col -->
+</main>
+</body>
+</html>
