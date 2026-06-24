@@ -1,0 +1,878 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lesson 14 · Logging and recovery: WAL and ARIES · Field Guide to the Database Engine</title>
+<link rel="stylesheet" href="../assets/course.css">
+<script defer src="../assets/components.js"></script>
+</head>
+<body class="layer-recovery">
+<main class="page">
+
+  <!-- ===== MASTHEAD ===== -->
+  <header class="masthead col">
+    <div class="crumbs">
+      <a href="../index.html">Field Guide</a> <span>/</span>
+      <span>Part VII · Recovery</span> <span>/</span>
+      <span>Week 14</span>
+    </div>
+    <span class="week-badge">Recovery</span>
+    <h1>Logging and recovery: WAL and ARIES</h1>
+    <p class="lede">The machine can lose power between any two instructions. Yet a committed transfer must
+    survive and a half-finished one must vanish. This lesson shows how a single append-only log, plus three
+    careful restart passes, turns a disk in any state back into a correct database.</p>
+  </header>
+
+  <div class="col">
+
+  <!-- ===== OBJECTIVES ===== -->
+  <div class="objectives">
+    <h4>By the end you can</h4>
+    <ul>
+      <li>Explain why steal and no-force buffer policies make undo and redo both necessary, and state the WAL rule that makes them safe.</li>
+      <li>Read a log of update, commit, and compensation records and say what each LSN means.</li>
+      <li>Walk the three ARIES restart passes (Analysis, Redo, Undo) and say what each one produces.</li>
+      <li>Explain why redo is conditional on page_LSN but undo is unconditional, and why a CLR is never undone.</li>
+      <li>Answer the exam traps: WAL ordering, the steal/no-force to undo/redo mapping, and repeating history.</li>
+    </ul>
+  </div>
+
+  <!-- ===== WHERE THIS SITS ===== -->
+  <p>We are on the second journey of the course, the write path. Last week
+  (<a href="0013-concurrency-mvcc.html">strict 2PL, deadlock, and MVCC</a>) the transaction earned the right
+  to modify a page: it took an exclusive lock or wrote a new version, and the page now sits dirty in the
+  buffer pool. This week answers the question that journey never had to ask on a pure read: what happens when
+  the lights go out before that dirty page reaches disk, or after it reaches disk but before the transaction
+  commits. The layer above hands us a page about to change. The layer below
+  (<a href="0004-buffer-pool-design.html">the buffer pool</a>) is allowed to write that page to disk whenever
+  it likes, even before commit, and is allowed to keep it in memory long after commit. Those two freedoms are
+  the whole problem. We hand down a rule the buffer pool must obey (write the log first) and a log it can
+  replay to fix any mess a crash leaves behind. Next week
+  (<a href="0015-modern-architectures-lsm.html">LSM trees and columnar storage</a>) reuses this exact write-ahead
+  log idea in a new shape: the memtable plus WAL of a log-structured store.</p>
+
+  <p>Keep the running transaction in view:</p>
+  <pre><code><span class="tok-kw">BEGIN</span>;
+<span class="tok-kw">UPDATE</span> account <span class="tok-kw">SET</span> balance = balance - <span class="tok-num">100</span> <span class="tok-kw">WHERE</span> id = <span class="tok-num">42</span>;
+<span class="tok-kw">COMMIT</span>;</code></pre>
+
+  <div class="callout intuition">
+    <div class="callout-title">Intuition</div>
+    <p>You are editing a long document and the power is unreliable. Editing the file in place is dangerous:
+    a crash mid-save leaves it corrupt. So before you touch the file, you jot every intended change into a
+    notebook, in order, and you never let the file get ahead of the notebook. After a crash you reopen the
+    notebook and replay it. Anything you marked done that the file is missing, you redo. Anything you started
+    but never marked committed, you cross out. The notebook is the log. The discipline of writing it first is
+    write-ahead logging.</p>
+  </div>
+
+  <!-- ===== THE PROBLEM ===== -->
+  <h2>Why a crash can leave disk in any state</h2>
+
+  <p>A transaction is one logical step built from many physical page writes. Two buffer-pool freedoms from
+  weeks 4 and 5 decide how bad a crash can be.</p>
+
+  <p><b>Steal.</b> The buffer pool may evict a page dirtied by an uncommitted transaction, writing it to disk
+  to free the frame. No-steal would forbid this, but then a long transaction could pin the whole pool. So real
+  systems steal. The consequence: at crash time, disk may hold changes from a transaction that never
+  committed. Recovery must be able to <em>undo</em> them.</p>
+
+  <p><b>No-force.</b> At commit, the buffer pool is not required to flush that transaction's dirty pages to
+  disk. Force would make every commit a random write storm. So real systems use no-force. The consequence: at
+  crash time, disk may be missing changes from a transaction that did commit. Recovery must be able to
+  <em>redo</em> them.</p>
+
+  <p>Steal plus no-force is the fast combination, and it is the one ARIES targets
+  [<a href="https://dl.acm.org/doi/10.1145/128765.128770">Mohan et al. 1992, Section 4</a>]. The price is that
+  both undo and redo become necessary. The naive alternative, shadow paging, sidesteps the problem by writing
+  each new page version to a fresh location and keeping the old one as the recovery copy. It avoids undo and
+  redo, but it scatters pages, wastes space, and perturbs every checkpoint and image copy
+  [<a href="https://dl.acm.org/doi/10.1145/128765.128770">Mohan et al. 1992, Section 1.1</a>]. In-place update
+  with a log is the design that won.</p>
+
+  <div class="callout why">
+    <div class="callout-title">Why a log and not the data file</div>
+    <p>The data file is large, random-access, and updated in place, so you cannot make a write to it atomic at
+    the granularity a transaction needs. The log is append-only and sequential, so forcing it to stable storage
+    is cheap and a single record either landed or did not. By making the log the source of truth and the data
+    file a lazily-updated cache of it, you move the atomicity problem to the one place where it is easy: appending
+    one record to the end of a sequential file.</p>
+  </div>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 560 210" role="img" aria-label="Write-ahead logging ordering rule">
+      <defs>
+        <marker id="aw-arrow" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto">
+          <path d="M0,0 L7,3 L0,6 Z" fill="var(--ink-soft)"/>
+        </marker>
+        <marker id="aw-no" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto">
+          <path d="M0,0 L7,3 L0,6 Z" fill="#b03b6b"/>
+        </marker>
+      </defs>
+      <rect x="20" y="20" width="150" height="64" rx="6" fill="var(--recovery-bg)" stroke="var(--recovery)"/>
+      <text x="95" y="46" text-anchor="middle" class="svg-label">buffer pool</text>
+      <text x="95" y="66" text-anchor="middle" class="svg-mono">dirty page P, LSN 30</text>
+
+      <rect x="390" y="20" width="150" height="64" rx="6" fill="#fffdf8" stroke="var(--ink-soft)"/>
+      <text x="465" y="46" text-anchor="middle" class="svg-label">data file on disk</text>
+      <text x="465" y="66" text-anchor="middle" class="svg-mono">page P</text>
+
+      <rect x="390" y="126" width="150" height="64" rx="6" fill="#fffdf8" stroke="var(--ink-soft)"/>
+      <text x="465" y="152" text-anchor="middle" class="svg-label">log on stable storage</text>
+      <text x="465" y="172" text-anchor="middle" class="svg-mono">... LSN 30 forced</text>
+
+      <line x1="170" y1="158" x2="388" y2="158" stroke="var(--recovery)" marker-end="url(#aw-arrow)"/>
+      <text x="278" y="148" text-anchor="middle" class="svg-label">1. force log up to page_LSN</text>
+
+      <line x1="170" y1="52" x2="388" y2="52" stroke="var(--ink-soft)" marker-end="url(#aw-arrow)"/>
+      <text x="278" y="40" text-anchor="middle" class="svg-label">2. only then write page</text>
+      <text x="278" y="92" text-anchor="middle" class="svg-label sm" fill="#b03b6b">never write the page first</text>
+    </svg>
+    <figcaption><b>Figure 1.</b> The WAL ordering rule. A dirty page may not pass its own log record on the way
+    to disk. The buffer manager forces the log up to the page's page_LSN before stealing the page. Notice the
+    log write is the gate, not an afterthought.</figcaption>
+  </figure>
+
+  <!-- ===== WAL AND LSN ===== -->
+  <h2>Write-ahead logging and the page_LSN invariant</h2>
+
+  <p>Every log record gets a log sequence number, the LSN, a monotonically increasing identifier. Each page
+  on disk carries a field called the page_LSN, defined as the LSN of the log record that describes the most
+  recent update applied to that page
+  [<a href="https://dl.acm.org/doi/10.1145/128765.128770">Mohan et al. 1992, Section 4.2</a>]. That one field
+  is what lets recovery line up a page with the log. If a page's page_LSN is 30, then every logged change up to
+  and including LSN 30 is already baked into the page, and nothing after it is. This is the bookkeeping that
+  makes redo safe: you never reapply an effect that is already present.</p>
+
+  <p>The WAL protocol has two parts
+  [<a href="https://dl.acm.org/doi/10.1145/128765.128770">Mohan et al. 1992, Section 1.1</a>]:</p>
+  <ol class="steps">
+    <li>Before a changed page is written to the durable data file, the log records describing its changes (at
+    least the undo portions) must already be on stable storage. The buffer manager enforces this, forcing the
+    log up to the page's page_LSN before it steals the page.</li>
+    <li>A transaction is not committed until its commit record, and all of its log up to that LSN, are forced
+    to stable storage. Commit is exactly the moment the log says so.</li>
+  </ol>
+
+  <div class="callout keyidea">
+    <div class="callout-title">Keep this one thing</div>
+    <p>The log is the truth. The data file is a stale cache of the log. Two rules keep them honest: the log
+    record reaches disk before the page it describes (so undo is always possible), and the commit record reaches
+    disk at commit (so durability is real). Everything in ARIES exists to exploit those two rules.</p>
+  </div>
+
+  <p>Each transaction's records are chained backward by a PrevLSN field, so you can walk one transaction's
+  history from its latest record to its first. Compensation records, written during undo, carry an extra field,
+  UndoNxtLSN, which we reach below.</p>
+
+  <!-- ===== ARIES PRINCIPLES ===== -->
+  <h2>The three principles of ARIES</h2>
+
+  <p>ARIES (Algorithm for Recovery and Isolation Exploiting Semantics) rests on three ideas
+  [<a href="https://dl.acm.org/doi/10.1145/128765.128770">Mohan et al. 1992, abstract and Section 3</a>].</p>
+
+  <ol class="steps">
+    <li><b>Write-ahead logging.</b> The log record reaches stable storage before the data page, and the commit
+    record reaches it at commit. Already covered.</li>
+    <li><b>Repeating history during redo.</b> On restart, before undoing anything, ARIES replays every logged
+    update whose effect did not reach disk, for <em>all</em> transactions including the losers. This rebuilds
+    the exact database state as of the crash, and only then are losers rolled back. This is the move that
+    distinguishes ARIES from every method before it.</li>
+    <li><b>Logging changes during undo.</b> When ARIES undoes an update, it writes that undo as a Compensation
+    Log Record (CLR). CLRs are redo-only: they are never themselves undone. A CLR carries UndoNxtLSN, pointing
+    at the next record of that transaction still to be undone, so rollback is bounded and can resume after a
+    crash without redoing undo work.</li>
+  </ol>
+
+  <div class="callout why">
+    <div class="callout-title">Why repeat history, even for losers</div>
+    <p>It looks wasteful: ARIES redoes a doomed transaction's updates during redo, then immediately undoes them.
+    The point is precision. Earlier methods tried to be clever and skip a loser's redo, which forced them into
+    bugs: undoing an update that was never on the page, or undoing then redoing a committed change already on
+    disk. By first restoring the exact crash-time state (every logged effect present), the undo pass faces a
+    known, consistent world. Every loser update is provably present, so undo never has to ask whether it is.
+    The cost is a few redundant page touches; the gain is correctness with fine-grained locking and operation
+    logging [<a href="https://dl.acm.org/doi/10.1145/128765.128770">Mohan et al. 1992, Section 2</a>].</p>
+  </div>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 560 150" role="img" aria-label="Transaction log chain with a CLR">
+      <defs>
+        <marker id="ac-prev" markerWidth="9" markerHeight="9" refX="6" refY="3" orient="auto">
+          <path d="M0,0 L7,3 L0,6 Z" fill="var(--ink-soft)"/>
+        </marker>
+        <marker id="ac-undo" markerWidth="9" markerHeight="9" refX="6" refY="3" orient="auto">
+          <path d="M0,0 L7,3 L0,6 Z" fill="var(--recovery)"/>
+        </marker>
+      </defs>
+      <!-- records -->
+      <g font-family="var(--mono)">
+        <rect x="20"  y="50" width="90" height="46" rx="5" fill="var(--recovery-bg)" stroke="var(--recovery)"/>
+        <text x="65"  y="70" text-anchor="middle" class="svg-mono">LSN 10</text>
+        <text x="65"  y="86" text-anchor="middle" class="svg-label sm">update P</text>
+
+        <rect x="150" y="50" width="90" height="46" rx="5" fill="var(--recovery-bg)" stroke="var(--recovery)"/>
+        <text x="195" y="70" text-anchor="middle" class="svg-mono">LSN 20</text>
+        <text x="195" y="86" text-anchor="middle" class="svg-label sm">update Q</text>
+
+        <rect x="280" y="50" width="90" height="46" rx="5" fill="var(--recovery-bg)" stroke="var(--recovery)"/>
+        <text x="325" y="70" text-anchor="middle" class="svg-mono">LSN 30</text>
+        <text x="325" y="86" text-anchor="middle" class="svg-label sm">update R</text>
+
+        <rect x="430" y="50" width="110" height="46" rx="5" fill="#efe6f8" stroke="#6b3bb0"/>
+        <text x="485" y="70" text-anchor="middle" class="svg-mono">LSN 40 CLR</text>
+        <text x="485" y="86" text-anchor="middle" class="svg-label sm">undo of 30</text>
+      </g>
+      <!-- PrevLSN back arrows -->
+      <line x1="150" y1="40" x2="112" y2="40" stroke="var(--ink-soft)" marker-end="url(#ac-prev)"/>
+      <line x1="280" y1="40" x2="242" y2="40" stroke="var(--ink-soft)" marker-end="url(#ac-prev)"/>
+      <line x1="430" y1="40" x2="372" y2="40" stroke="var(--ink-soft)" marker-end="url(#ac-prev)"/>
+      <text x="250" y="28" text-anchor="middle" class="svg-label sm">PrevLSN chain (backward)</text>
+      <!-- UndoNxtLSN -->
+      <path d="M460,108 Q330,135 200,108" fill="none" stroke="var(--recovery)" stroke-width="1.5" marker-end="url(#ac-undo)"/>
+      <text x="320" y="138" text-anchor="middle" class="svg-label sm" fill="var(--recovery)">UndoNxtLSN: skip 30, resume undo at 20</text>
+    </svg>
+    <figcaption><b>Figure 2.</b> A transaction's records chain backward by PrevLSN. The CLR at LSN 40 records the
+    undo of LSN 30 and sets UndoNxtLSN to 20, so undo jumps straight past the record it just compensated. If a
+    crash hits after LSN 40, recovery resumes undo at 20 and never re-undoes 30.</figcaption>
+  </figure>
+
+  <!-- ===== DATA STRUCTURES ===== -->
+  <h2>The two tables recovery rebuilds</h2>
+
+  <p>ARIES keeps two in-memory tables during normal running, writes them into checkpoint records, and rebuilds
+  them at restart [<a href="https://dl.acm.org/doi/10.1145/128765.128770">Mohan et al. 1992, Sections 4.3, 4.4</a>].</p>
+
+  <table>
+    <caption>The state recovery tracks. Both are reconstructed by the Analysis pass.</caption>
+    <thead><tr><th>Table</th><th>Per-entry fields</th><th>What it answers</th></tr></thead>
+    <tbody>
+      <tr><td>Transaction Table</td><td>TransID, State, LastLSN, UndoNxtLSN</td><td>Which transactions were live, and where to start undoing each.</td></tr>
+      <tr><td>Dirty Pages Table</td><td>PageID, RecLSN</td><td>Which pages might have changes not yet on disk, and from what log point.</td></tr>
+    </tbody>
+  </table>
+
+  <p>RecLSN is the subtle one. When a clean page is first dirtied in the buffer, its RecLSN is set to the
+  current end-of-log LSN, the LSN of the next record to be written. RecLSN marks the earliest log point whose
+  updates to that page might not be on disk yet. The minimum RecLSN over the whole Dirty Pages Table is
+  RedoLSN, the point where the redo pass must begin: any change logged before that is guaranteed already on
+  disk.</p>
+
+  <div class="callout gotcha">
+    <div class="callout-title">Exam trap</div>
+    <p>RecLSN is set when the page is first dirtied, not when it is written to disk, and it is the end-of-log LSN
+    at that instant (the next record to be written), not the LSN of the update that dirtied it. Mixing these up
+    makes you compute RedoLSN wrong and start redo too late, missing changes the crash actually lost.</p>
+  </div>
+
+  <!-- ===== SIMULATOR ===== -->
+  <h2>Simulator: the ARIES log replayer</h2>
+
+  <p>Below is a small but real ARIES engine. The left panel is a log you can build: append updates and commits
+  for two transactions, then crash at a chosen position. The right panels show the on-disk page_LSN values, the
+  Transaction Table, and the Dirty Pages Table. Run Analysis, then Redo, then Undo, one step at a time, and
+  watch the engine reconstruct the crash-time state and then roll back the losers, writing CLRs as it goes.</p>
+
+  <figure class="sim" id="ar-sim">
+    <div class="sim-head">
+      <span class="sim-title">ARIES log replayer</span>
+      <span class="sim-sub">build a log, crash, then replay Analysis / Redo / Undo</span>
+    </div>
+    <div class="sim-body">
+      <div class="sim-controls" id="ar-build"></div>
+      <div class="sim-stage">
+        <div id="ar-grid" style="display:grid;grid-template-columns:1.15fr 1fr;gap:14px;align-items:start">
+          <div>
+            <div class="svg-label" style="margin-bottom:4px">Log (stable storage). The crash point is the red line.</div>
+            <div id="ar-log" style="font-family:var(--mono,monospace);font-size:12px;line-height:1.5"></div>
+          </div>
+          <div>
+            <div class="svg-label" style="margin-bottom:4px">On-disk page_LSN</div>
+            <div id="ar-pages" style="font-family:var(--mono,monospace);font-size:12px;line-height:1.6;margin-bottom:10px"></div>
+            <div class="svg-label" style="margin-bottom:4px">Transaction Table</div>
+            <div id="ar-txn" style="font-family:var(--mono,monospace);font-size:12px;line-height:1.6;margin-bottom:10px"></div>
+            <div class="svg-label" style="margin-bottom:4px">Dirty Pages Table</div>
+            <div id="ar-dpt" style="font-family:var(--mono,monospace);font-size:12px;line-height:1.6"></div>
+          </div>
+        </div>
+      </div>
+      <div class="sim-controls" id="ar-controls"></div>
+      <div class="sim-readout" id="ar-readout"></div>
+    </div>
+  </figure>
+  <figcaption class="muted" style="margin-top:-1rem">The default log commits T1 but leaves a second writer of page
+  P uncommitted at the crash. T1 is a winner, the second writer is a loser, and both touched P. Watch Redo bring
+  back both changes to P, then Undo reverse only the loser's and write a CLR.</figcaption>
+
+  <script>
+  // ARIES log replayer. Self-contained. Lesson prefix: ar-
+  (function () {
+    "use strict";
+    var elLog   = document.getElementById("ar-log");
+    var elPages = document.getElementById("ar-pages");
+    var elTxn   = document.getElementById("ar-txn");
+    var elDpt   = document.getElementById("ar-dpt");
+    var elRead  = document.getElementById("ar-readout");
+
+    // The log: list of records. Each record has lsn, type, txn, page, prev.
+    // We build a default scenario, but the learner can append more.
+    var log = [];          // committed-to-stable-storage records
+    var nextLsn = 10;
+    var crashAt = null;    // index into log where the crash falls (records after are lost)
+    var prevByTxn = {};    // last lsn written per txn (for PrevLSN)
+
+    function append(type, txn, page) {
+      var rec = { lsn: nextLsn, type: type, txn: txn, page: page || null, prev: prevByTxn[txn] || 0 };
+      log.push(rec);
+      prevByTxn[txn] = nextLsn;
+      nextLsn += 10;
+      crashAt = null;       // a new record invalidates any pending replay
+      resetReplay();
+      render();
+      return rec;
+    }
+
+    function seed() {
+      log = []; nextLsn = 10; prevByTxn = {}; crashAt = null;
+      append("update", "T1", "P");   // 10
+      append("update", "T2", "Q");   // 20
+      append("commit", "T1", null);  // 30
+      append("update", "T2", "Q");   // 40
+      append("update", "T1b", "P");  // 50  (a fresh txn touching P, will be a loser)
+      crashAt = log.length;          // crash after the last record by default
+      resetReplay();
+      render();
+    }
+
+    // ----- replay state -----
+    var phase = "idle";   // idle | analysis | redo | undo | done
+    var disk = {};        // page -> page_LSN actually on disk at crash time
+    var txnTab = {};      // txn -> {state, lastLsn, undoNext}
+    var dpt = {};         // page -> recLsn
+    var redoLsn = null;
+    var losers = [];      // txn ids
+    var cursor = 0;       // index used by a pass
+    var clrs = [];        // CLRs written during undo (appended to a virtual tail)
+    var undoNote = "";
+
+    function resetReplay() {
+      phase = "idle"; disk = {}; txnTab = {}; dpt = {}; redoLsn = null;
+      losers = []; cursor = 0; clrs = []; undoNote = "";
+    }
+
+    // Simulate what reached disk before the crash. We model a simple steal+no-force world:
+    // a page's on-disk page_LSN is the LSN of the LAST update to it that we "stole" out.
+    // For the demo we assume the FIRST update to each page was flushed (stolen) but later ones were not,
+    // which is the interesting mixed case. Commit records never go on the data file.
+    function computeDiskAtCrash() {
+      disk = {};
+      var seenPage = {};
+      var live = log.slice(0, crashAt);
+      for (var i = 0; i < live.length; i++) {
+        var r = live[i];
+        if (r.type !== "update") continue;
+        if (!seenPage[r.page]) {        // first touch of this page got stolen to disk
+          disk[r.page] = r.lsn;
+          seenPage[r.page] = true;
+        }
+        // later touches stay in the (now lost) buffer: disk page_LSN does not advance
+      }
+    }
+
+    // ----- the three passes, each as one "step" advancing a cursor -----
+    function stepAnalysis() {
+      if (phase !== "analysis") {
+        phase = "analysis"; cursor = 0; txnTab = {}; dpt = {};
+        computeDiskAtCrash();
+        elRead.textContent = "Analysis: scanning the log forward, rebuilding the two tables.";
+        render(); return;
+      }
+      var live = log.slice(0, crashAt);
+      if (cursor >= live.length) {
+        // finalize: losers are txns with no commit; redoLsn = min RecLSN
+        losers = Object.keys(txnTab).filter(function (t) { return txnTab[t].state !== "commit"; });
+        var mins = Object.keys(dpt).map(function (p) { return dpt[p]; });
+        redoLsn = mins.length ? Math.min.apply(null, mins) : null;
+        losers.forEach(function (t) { txnTab[t].undoNext = txnTab[t].lastLsn; });
+        elRead.textContent = "Analysis done. Losers: " + (losers.join(", ") || "none") +
+          ". RedoLSN = min RecLSN = " + (redoLsn == null ? "-" : redoLsn) + ".";
+        phase = "redo"; cursor = 0; render(); return;
+      }
+      var r = live[cursor];
+      if (r.type === "update") {
+        txnTab[r.txn] = txnTab[r.txn] || { state: "U", lastLsn: 0, undoNext: 0 };
+        txnTab[r.txn].lastLsn = r.lsn;
+        if (txnTab[r.txn].state !== "commit") txnTab[r.txn].state = "U";
+        if (!(r.page in dpt)) dpt[r.page] = r.lsn;   // RecLSN = first-dirty end-of-log point (this record's lsn here)
+      } else if (r.type === "commit") {
+        txnTab[r.txn] = txnTab[r.txn] || { state: "U", lastLsn: 0, undoNext: 0 };
+        txnTab[r.txn].state = "commit";
+        txnTab[r.txn].lastLsn = r.lsn;
+      }
+      cursor++;
+      render();
+    }
+
+    function stepRedo() {
+      if (redoLsn == null) { elRead.textContent = "Nothing dirty: redo has no work. Move to Undo."; phase = "undo"; cursor = 0; render(); return; }
+      var live = log.slice(0, crashAt).filter(function (r) { return r.type === "update" && r.lsn >= redoLsn; });
+      if (cursor >= live.length) {
+        elRead.textContent = "Redo done. The exact crash-time state is rebuilt, losers included. Now Undo.";
+        phase = "undo"; cursor = 0;
+        // set undoNext for losers from lastLsn
+        losers.forEach(function (t) { txnTab[t].undoNext = txnTab[t].lastLsn; });
+        render(); return;
+      }
+      var r = live[cursor];
+      var onDisk = disk[r.page] || 0;
+      if (onDisk < r.lsn) {              // conditional redo
+        disk[r.page] = r.lsn;           // reapply, advance page_LSN
+        elRead.textContent = "Redo LSN " + r.lsn + " on " + r.page + ": page_LSN " + onDisk + " < " + r.lsn + ", so REAPPLY. (history repeats for losers too)";
+      } else {
+        elRead.textContent = "Redo LSN " + r.lsn + " on " + r.page + ": page_LSN " + onDisk + " >= " + r.lsn + ", already on disk, SKIP.";
+      }
+      cursor++;
+      render();
+    }
+
+    function stepUndo() {
+      // find loser with the largest undoNext still > 0
+      var pick = null;
+      losers.forEach(function (t) {
+        if (txnTab[t].undoNext && txnTab[t].undoNext > 0) {
+          if (!pick || txnTab[t].undoNext > txnTab[pick].undoNext) pick = t;
+        }
+      });
+      if (!pick) {
+        phase = "done";
+        elRead.textContent = "Undo done. Committed work survives; uncommitted work is reversed. Database is consistent.";
+        render(); return;
+      }
+      var target = txnTab[pick].undoNext;
+      var rec = log.filter(function (r) { return r.lsn === target; })[0];
+      if (rec && rec.type === "update") {
+        var clrLsn = nextLsn; nextLsn += 10;
+        clrs.push({ lsn: clrLsn, txn: pick, page: rec.page, compensated: rec.lsn, undoNxt: rec.prev });
+        disk[rec.page] = clrLsn;          // CLR is the most recent change, sets page_LSN
+        txnTab[pick].undoNext = rec.prev; // jump past compensated record
+        elRead.textContent = "Undo " + pick + " LSN " + rec.lsn + " on " + rec.page +
+          ": write CLR " + clrLsn + ", UndoNxtLSN = " + rec.prev + ". Undo is UNCONDITIONAL.";
+      } else {
+        txnTab[pick].undoNext = rec ? rec.prev : 0;
+      }
+      render();
+    }
+
+    function stepReplay() {
+      if (crashAt == null) crashAt = log.length;
+      if (phase === "idle") { stepAnalysis(); return; }
+      if (phase === "analysis") { stepAnalysis(); return; }
+      if (phase === "redo") { stepRedo(); return; }
+      if (phase === "undo") { stepUndo(); return; }
+      // done: nothing
+      render();
+    }
+
+    // ----- rendering -----
+    function render() {
+      // log
+      elLog.innerHTML = "";
+      var cut = (crashAt == null) ? log.length : crashAt;
+      log.forEach(function (r, i) {
+        var lost = i >= cut;
+        var label = "LSN " + r.lsn + "  " + r.type.toUpperCase() +
+          (r.txn ? " " + r.txn : "") + (r.page ? " (" + r.page + ")" : "") +
+          (r.prev ? "  prev=" + r.prev : "");
+        var d = document.createElement("div");
+        d.textContent = label;
+        d.style.color = lost ? "#b03b6b" : "var(--ink)";
+        d.style.opacity = lost ? "0.55" : "1";
+        elLog.appendChild(d);
+      });
+      // crash line
+      if (crashAt != null && crashAt <= log.length) {
+        var line = document.createElement("div");
+        line.textContent = "------- CRASH -------";
+        line.style.color = "#b03b6b"; line.style.fontWeight = "600";
+        // insert after crashAt records
+        var kids = elLog.children;
+        if (crashAt < kids.length) elLog.insertBefore(line, kids[crashAt]);
+        else elLog.appendChild(line);
+      }
+      // CLRs written during undo
+      clrs.forEach(function (c) {
+        var d = document.createElement("div");
+        d.textContent = "LSN " + c.lsn + "  CLR " + c.txn + " (" + c.page + ") undo of " + c.compensated + "  undoNxt=" + c.undoNxt;
+        d.style.color = "#6b3bb0";
+        elLog.appendChild(d);
+      });
+
+      // disk page_LSN
+      elPages.innerHTML = "";
+      var pageIds = {};
+      log.forEach(function (r) { if (r.page) pageIds[r.page] = true; });
+      Object.keys(pageIds).sort().forEach(function (p) {
+        var d = document.createElement("div");
+        d.textContent = p + ": page_LSN = " + (disk[p] || 0);
+        elPages.appendChild(d);
+      });
+      if (!Object.keys(pageIds).length) elPages.textContent = "(no pages yet)";
+
+      // txn table
+      elTxn.innerHTML = "";
+      var tkeys = Object.keys(txnTab);
+      if (!tkeys.length) elTxn.textContent = "(empty until Analysis runs)";
+      tkeys.forEach(function (t) {
+        var e = txnTab[t];
+        var d = document.createElement("div");
+        var loser = losers.indexOf(t) >= 0;
+        d.textContent = t + ": state=" + e.state + " lastLSN=" + e.lastLsn +
+          (e.undoNext ? " undoNxt=" + e.undoNext : "") + (loser ? "  [loser]" : "");
+        d.style.color = loser ? "#b03b6b" : "var(--ink)";
+        elTxn.appendChild(d);
+      });
+
+      // dirty pages table
+      elDpt.innerHTML = "";
+      var dkeys = Object.keys(dpt);
+      if (!dkeys.length) elDpt.textContent = "(empty until Analysis runs)";
+      dkeys.sort().forEach(function (p) {
+        var d = document.createElement("div");
+        d.textContent = p + ": RecLSN = " + dpt[p];
+        elDpt.appendChild(d);
+      });
+      if (redoLsn != null) {
+        var rd = document.createElement("div");
+        rd.textContent = "RedoLSN = " + redoLsn;
+        rd.style.color = "var(--recovery)"; rd.style.fontWeight = "600";
+        elDpt.appendChild(rd);
+      }
+    }
+
+    // ----- build controls -----
+    function btn(label, cls, fn) {
+      var b = document.createElement("button");
+      b.textContent = label; if (cls) b.className = cls;
+      b.addEventListener("click", fn);
+      return b;
+    }
+    var build = document.getElementById("ar-build");
+    build.append(
+      btn("update T1(P)", "ghost", function () { append("update", "T1", "P"); }),
+      btn("update T2(Q)", "ghost", function () { append("update", "T2", "Q"); }),
+      btn("commit T1",    "ghost", function () { append("commit", "T1", null); }),
+      btn("commit T2",    "ghost", function () { append("commit", "T2", null); }),
+      btn("Crash here",            function () { crashAt = log.length; resetReplay(); render();
+        elRead.textContent = "Crash set after LSN " + (log.length ? log[log.length-1].lsn : "-") + ". Press Step to run Analysis."; })
+    );
+
+    var controls = document.getElementById("ar-controls");
+    controls.append(
+      btn("Step replay", "", stepReplay),
+      btn("Reset scenario", "ghost", seed)
+    );
+
+    seed();
+    elRead.textContent = "A default log is loaded. Press Step replay to run Analysis, then Redo, then Undo.";
+  })();
+  </script>
+
+  <!-- ===== THE THREE PASSES ===== -->
+  <h2>The three restart passes</h2>
+
+  <p>On restart, ARIES makes exactly three passes over the log
+  [<a href="https://dl.acm.org/doi/10.1145/128765.128770">Mohan et al. 1992, Section 6</a>].</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 560 170" role="img" aria-label="The three ARIES passes on one log timeline">
+      <defs>
+        <marker id="ap-f" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto">
+          <path d="M0,0 L7,3 L0,6 Z" fill="var(--recovery)"/>
+        </marker>
+        <marker id="ap-b" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto">
+          <path d="M0,0 L7,3 L0,6 Z" fill="#b03b6b"/>
+        </marker>
+      </defs>
+      <!-- timeline -->
+      <line x1="40" y1="40" x2="520" y2="40" stroke="var(--rule)" stroke-width="2"/>
+      <text x="60"  y="30" text-anchor="middle" class="svg-label sm">checkpoint</text>
+      <text x="250" y="30" text-anchor="middle" class="svg-label sm">RedoLSN</text>
+      <text x="510" y="30" text-anchor="middle" class="svg-label sm">end of log (crash)</text>
+      <circle cx="60" cy="40" r="4" fill="var(--recovery)"/>
+      <circle cx="250" cy="40" r="4" fill="var(--recovery)"/>
+      <circle cx="510" cy="40" r="4" fill="#b03b6b"/>
+
+      <!-- analysis -->
+      <line x1="60" y1="72" x2="510" y2="72" stroke="var(--recovery)" stroke-dasharray="4 3" marker-end="url(#ap-f)"/>
+      <text x="40" y="76" text-anchor="end" class="svg-label sm">Analysis</text>
+      <text x="285" y="66" text-anchor="middle" class="svg-label sm">rebuild tables, find losers, compute RedoLSN</text>
+
+      <!-- redo -->
+      <line x1="250" y1="104" x2="510" y2="104" stroke="var(--recovery)" marker-end="url(#ap-f)"/>
+      <text x="40" y="108" text-anchor="end" class="svg-label sm">Redo</text>
+      <text x="380" y="98" text-anchor="middle" class="svg-label sm">repeat history (conditional on page_LSN)</text>
+
+      <!-- undo -->
+      <line x1="510" y1="136" x2="60" y2="136" stroke="#b03b6b" marker-end="url(#ap-b)"/>
+      <text x="40" y="140" text-anchor="end" class="svg-label sm">Undo</text>
+      <text x="285" y="158" text-anchor="middle" class="svg-label sm">roll back losers backward, write CLRs (unconditional)</text>
+    </svg>
+    <figcaption><b>Figure 3.</b> Analysis scans forward from the last checkpoint. Redo scans forward from
+    RedoLSN. Undo scans backward over losers. Redo and Analysis go the same direction; only Undo reverses.</figcaption>
+  </figure>
+
+  <h3>1. Analysis</h3>
+  <p>Scan forward from the most recent checkpoint to the end of the log. Rebuild the Transaction Table and
+  Dirty Pages Table. Identify the losers, the transactions that had neither committed nor reached the in-doubt
+  (prepared) state of two-phase commit. Compute RedoLSN as the minimum RecLSN across the Dirty Pages Table.
+  Analysis produces the worklist for the next two passes.</p>
+
+  <h3>2. Redo</h3>
+  <p>Scan forward from RedoLSN, repeating history. For each redoable record whose page is in the Dirty Pages
+  Table, fetch the page and compare. Redo is <em>conditional</em>: reapply the change only if the page's
+  page_LSN is less than the record's LSN, then set page_LSN to the record's LSN. If page_LSN already covers
+  the record, the change is on disk and is skipped. Nothing is logged during redo, because redo only repeats
+  history that is already logged. After redo, the database is exactly as it was the instant before the crash,
+  losers and all.</p>
+
+  <h3>3. Undo</h3>
+  <p>Roll back every loser in reverse chronological order, in one sweep, by repeatedly taking the largest
+  not-yet-undone LSN across the losers. For each loser update, apply the inverse and write a CLR. Undo is
+  <em>unconditional</em>: it does not consult page_LSN, because repeating history already guaranteed every
+  loser update is present. When the sweep meets a CLR, it jumps to that CLR's UndoNxtLSN, skipping work already
+  undone. When no loser has any record left to undo, recovery is complete.</p>
+
+  <div class="callout why">
+    <div class="callout-title">Why redo is conditional but undo is unconditional</div>
+    <p>Redo runs against a disk in an unknown state: some changes reached it, some did not, and page_LSN is the
+    only way to tell which. So redo must check before acting. Undo runs after redo has restored a fully known
+    state, so it does not have to check: every loser change is provably present, and undo simply reverses each.
+    The asymmetry is not arbitrary; it falls directly out of repeating history
+    [<a href="https://dl.acm.org/doi/10.1145/128765.128770">Mohan et al. 1992, Sections 6.2, 6.3</a>].</p>
+  </div>
+
+  <pre><code><span class="tok-com"># ARIES restart, in three passes (pseudocode)</span>
+<span class="tok-kw">def</span> <span class="tok-fn">restart</span>(log, checkpoint):
+    txn_tab, dpt = <span class="tok-fn">analysis</span>(log, checkpoint)      <span class="tok-com"># rebuild tables, find losers</span>
+    redo_lsn = <span class="tok-fn">min</span>(e.rec_lsn <span class="tok-kw">for</span> e <span class="tok-kw">in</span> dpt)     <span class="tok-com"># earliest possibly-lost change</span>
+
+    <span class="tok-kw">for</span> rec <span class="tok-kw">in</span> log.<span class="tok-fn">forward_from</span>(redo_lsn):     <span class="tok-com"># REDO: repeat history</span>
+        page = <span class="tok-fn">fetch</span>(rec.page)
+        <span class="tok-kw">if</span> page.page_lsn &lt; rec.lsn:               <span class="tok-com"># conditional</span>
+            <span class="tok-fn">apply</span>(rec, page); page.page_lsn = rec.lsn
+
+    <span class="tok-kw">for</span> rec <span class="tok-kw">in</span> log.<span class="tok-fn">backward_over</span>(losers):       <span class="tok-com"># UNDO: roll back losers</span>
+        <span class="tok-kw">if</span> rec.is_clr: <span class="tok-kw">continue</span>                   <span class="tok-com"># CLRs are never undone</span>
+        clr = <span class="tok-fn">write_clr</span>(rec, undo_nxt=rec.prev_lsn)
+        <span class="tok-fn">apply_inverse</span>(rec)                       <span class="tok-com"># unconditional</span></code></pre>
+
+  <div class="callout realworld">
+    <div class="callout-title">In real systems</div>
+    <p>PostgreSQL uses physiological WAL records with LSNs stamped into every page (<code>pd_lsn</code> in the
+    page header), and its checkpointer plus background writer enforce the WAL ordering before a dirty buffer is
+    written [<a href="https://www.postgresql.org/docs/current/wal-intro.html">PostgreSQL, Reliability and WAL</a>].
+    PostgreSQL does not write per-action CLRs the way ARIES does, because its MVCC design makes most rollbacks a
+    matter of marking tuple versions dead rather than physically reversing pages; abort just stamps the
+    transaction aborted and lets VACUUM reclaim the versions (week 13). SQLite offers a rollback journal (copy
+    the old page out before changing it, the no-steal-style undo log) and a WAL mode (append new page images to
+    a side file, the redo-style approach)
+    [<a href="https://www.sqlite.org/wal.html">SQLite, Write-Ahead Logging</a>]. The two modes are a clean view
+    of the undo-versus-redo split this lesson is built on.</p>
+  </div>
+
+  <!-- ===== FLASHCARD ===== -->
+  <div class="flashcard">
+    <div class="fc-front">Prompt: in one sentence, what invariant does the page_LSN field guarantee?</div>
+    <div class="fc-back">Answer: a page reflects exactly the logged changes up to and including its page_LSN and
+    none after it, so redo can tell at a glance whether a logged change is already on the page.</div>
+  </div>
+
+  <div class="flashcard">
+    <div class="fc-front">Prompt: steal forces which capability, and no-force forces which?</div>
+    <div class="fc-back">Answer: steal forces undo (uncommitted changes may already be on disk), no-force forces
+    redo (committed changes may not yet be on disk).</div>
+  </div>
+
+  <!-- ===== VIVA ===== -->
+  <h2>Paper viva: ARIES (Mohan et al., 1992)</h2>
+  <p>This is a paper week. The examiner will press on the parts of ARIES that are easy to half-remember. Answer
+  out loud before opening each model answer.</p>
+
+  <div class="callout viva">
+    <div class="callout-title">Viva prompt 1</div>
+    <p>State the write-ahead logging protocol precisely, and explain why the steal and no-force buffer policies
+    are exactly what make undo and redo necessary at restart.</p>
+  </div>
+  <details class="deepdive">
+    <summary>Model answer</summary>
+    <div>
+      <p>WAL has two clauses. First, before a dirty page is written to the durable database, the log records
+      describing its changes, at least the undo portions, must already be on stable storage; the buffer manager
+      enforces this, sometimes forcing the log up to the page's page_LSN before stealing the page. Second, a
+      transaction is not committed until its commit record and all earlier log up to that LSN are forced to
+      stable storage [<a href="https://dl.acm.org/doi/10.1145/128765.128770">Mohan et al. 1992, Section 1.1</a>].
+      Steal lets an uncommitted transaction's dirty page reach disk before commit, so a crash can leave
+      uncommitted changes on disk, which is why undo capability is required. No-force lets a committed
+      transaction's dirty pages stay in the buffer, so a crash can leave committed changes missing from disk,
+      which is why redo capability is required. The first WAL clause makes undo possible (the old value is
+      logged before the page moves); the second makes durability real (commit is the moment the log says so).</p>
+    </div>
+  </details>
+
+  <div class="callout viva">
+    <div class="callout-title">Viva prompt 2</div>
+    <p>What is repeating history, and why does ARIES redo even the losers' updates rather than skipping them?
+    What concrete bugs in earlier methods does this avoid?</p>
+  </div>
+  <details class="deepdive">
+    <summary>Model answer</summary>
+    <div>
+      <p>Repeating history means the redo pass reapplies every logged update whose effect did not reach disk,
+      for all transactions including the losers, before any undo runs. This reestablishes the exact database
+      state as of the failure [<a href="https://dl.acm.org/doi/10.1145/128765.128770">Mohan et al. 1992,
+      Section 3</a>]. Redoing the losers looks wasteful, since they are about to be undone, but it guarantees a
+      precise, fully known state at the start of undo. Earlier WAL methods that tried to skip loser redo fell
+      into the bugs ARIES lists in Section 2: undoing an update that was never actually present on the page,
+      undoing the same logged action more than once, or undoing a committed update that had already reached
+      disk and then redoing it. By making every loser update provably present before undo, ARIES makes undo
+      unconditional and sound, and it is what allows fine-granularity locking together with operation logging,
+      where you must never redo a present effect or undo an absent one.</p>
+    </div>
+  </details>
+
+  <div class="callout viva">
+    <div class="callout-title">Viva prompt 3</div>
+    <p>What is a Compensation Log Record, why is it redo-only, and how does its UndoNxtLSN keep the amount of
+    logging bounded under repeated or nested rollbacks?</p>
+  </div>
+  <details class="deepdive">
+    <summary>Model answer</summary>
+    <div>
+      <p>A CLR is the log record written when ARIES undoes an update; it describes the undo that was performed
+      [<a href="https://dl.acm.org/doi/10.1145/128765.128770">Mohan et al. 1992, Section 3</a>]. It is redo-only
+      because it is never itself undone: once undo work is logged it is permanent, and rollback proceeds forward
+      through the remaining records to undo. Each CLR carries UndoNxtLSN, pointing to the predecessor of the
+      record it just compensated, that is, the next record of that transaction still to be undone. So the
+      UndoNxtLSN of the most recently written CLR records exactly how far rollback has progressed. If a system
+      failure or a nested rollback interrupts undo, recovery resumes at that UndoNxtLSN and skips every record
+      already compensated, so no record is undone twice and no extra CLRs are generated for already-undone work.
+      That is what bounds logging during rollback, in contrast to IMS, which could undo the same non-CLR record
+      multiple times, generating unbounded log. Because the CLR records what the undo actually did, the undo
+      action also need not be the physical inverse of the original on the same page, which is what enables
+      logical undo and the high concurrency of record-level operations.</p>
+    </div>
+  </details>
+
+  <!-- ===== MCQs ===== -->
+  <h2>Check yourself</h2>
+
+  <div class="mcq" data-answer="2">
+    <p class="mcq-q">Which statement about write-ahead logging is false?</p>
+    <button class="mcq-opt">The commit record must reach stable storage before the commit is acknowledged.</button>
+    <button class="mcq-opt">The undo portion of a change must be logged before its page can be stolen.</button>
+    <button class="mcq-opt">The data page is written to disk before its describing log record is forced.</button>
+    <button class="mcq-opt">The buffer manager may force the log up to a page's page_LSN before evicting it.</button>
+    <p class="mcq-explain">WAL means the log goes first. The describing log record (at least its undo portion)
+    must be on stable storage before the dirty page it describes is written to the data file, so option C states
+    the rule backwards and is the false one. The other three are the genuine clauses: commit forces the log,
+    stealing a page forces the log up to its page_LSN, and undo information is logged before the page moves.</p>
+  </div>
+
+  <div class="mcq" data-answer="2">
+    <p class="mcq-q">Which mapping from buffer policy to recovery capability is correct?</p>
+    <button class="mcq-opt">Steal forces redo because committed pages may be absent from the disk file.</button>
+    <button class="mcq-opt">No-force forces undo because uncommitted pages may have reached the disk file.</button>
+    <button class="mcq-opt">Steal forces undo, and no-force forces redo, and ARIES needs both at restart.</button>
+    <button class="mcq-opt">No-steal plus force is what ARIES uses, so neither undo nor redo is ever needed.</button>
+    <p class="mcq-explain">Steal allows an uncommitted dirty page to reach disk, so its changes must be reversible:
+    undo. No-force allows a committed transaction's pages to stay in memory, so their changes must be replayable:
+    redo. ARIES targets steal plus no-force precisely because it is the fast combination, and it pays for that
+    speed with both undo and redo. Options A and B swap the two; option D describes the slow combination that
+    ARIES does not require.</p>
+  </div>
+
+  <div class="mcq" data-answer="1">
+    <p class="mcq-q">During the redo pass, when does ARIES actually reapply a logged update to a page?</p>
+    <button class="mcq-opt">Always, since redo must repeat the entire history of every logged update unconditionally.</button>
+    <button class="mcq-opt">Only when the page's page_LSN is strictly less than the log record's own LSN.</button>
+    <button class="mcq-opt">Only when the page belongs to a transaction that ultimately committed before the crash.</button>
+    <button class="mcq-opt">Only when the log record's LSN is strictly less than that page's stored page_LSN.</button>
+    <button class="mcq-opt">Never for losers, since the undo pass will reverse their changes a moment later.</button>
+    <p class="mcq-explain">Redo is conditional on page_LSN. If page_LSN is below the record's LSN, the change has
+    not yet reached this page, so reapply it and advance page_LSN. If page_LSN already covers the record, the
+    change is on disk and is skipped. Option A drops the condition; option D reverses the comparison; options C
+    and E miss that history is repeated for all transactions, losers included, before any undo.</p>
+  </div>
+
+  <div class="mcq" data-answer="3">
+    <p class="mcq-q">Which statement about Compensation Log Records is false?</p>
+    <button class="mcq-opt">A CLR records the undo of a previous update and is written during the undo pass.</button>
+    <button class="mcq-opt">A CLR's UndoNxtLSN points to the next record of its transaction still to be undone.</button>
+    <button class="mcq-opt">Because CLRs are logged, rollback stays bounded even across repeated failures.</button>
+    <button class="mcq-opt">A CLR can itself be undone if the recovering transaction later has to roll back further.</button>
+    <p class="mcq-explain">CLRs are redo-only and are never undone. Once an undo is logged as a CLR it is
+    permanent; rollback continues forward through the remaining records by following UndoNxtLSN. That is exactly
+    what bounds logging under nested or repeated rollbacks. The other three statements are all true descriptions
+    of how CLRs work.</p>
+  </div>
+
+  <div class="mcq" data-answer="0">
+    <p class="mcq-q">How is RedoLSN, the starting point of the redo pass, computed?</p>
+    <button class="mcq-opt">As the minimum RecLSN over all entries in the Dirty Pages Table after Analysis.</button>
+    <button class="mcq-opt">As the maximum page_LSN over all pages that were dirty at the time of the crash.</button>
+    <button class="mcq-opt">As the LSN of the most recent checkpoint record that ARIES scanned during restart.</button>
+    <button class="mcq-opt">As the LSN of the earliest commit record belonging to any winner transaction.</button>
+    <p class="mcq-explain">RecLSN for a page is the end-of-log LSN at the moment that page was first dirtied, the
+    earliest log point whose updates to it might not be on disk. The minimum RecLSN across the whole Dirty Pages
+    Table is therefore the earliest point at which redo could matter, so redo begins there. Starting at the
+    checkpoint LSN would redo too much; starting later would miss lost changes.</p>
+  </div>
+
+  <div class="mcq" data-answer="3">
+    <p class="mcq-q">Why is undo unconditional while redo is conditional?</p>
+    <button class="mcq-opt">Undo checks page_LSN too, but uses a greater-than test instead of a less-than test.</button>
+    <button class="mcq-opt">Undo runs before redo, so the disk state is unknown and every record must be reversed.</button>
+    <button class="mcq-opt">Undo never touches pages on disk, so there is no page_LSN available for it to consult.</button>
+    <button class="mcq-opt">Undo runs after redo has restored the exact state, so every loser change is known present.</button>
+    <p class="mcq-explain">Repeating history during redo rebuilds the precise crash-time state, so by the time undo
+    runs, every loser update is provably present on its page. Undo can therefore reverse each one without
+    checking. Redo, by contrast, faces a disk in an unknown mixed state and must consult page_LSN to avoid
+    reapplying a change already there. Option B reverses the pass order; A and C misdescribe what undo does.</p>
+  </div>
+
+  <!-- ===== PRIMARY SOURCE ===== -->
+  <div class="source-box">
+    <div class="src-tag">Primary source</div>
+    <div class="src-title">Read this next:
+      <a href="https://dl.acm.org/doi/10.1145/128765.128770">ARIES: A Transaction Recovery Method (Mohan, Haderle, Lindsay, Pirahesh, Schwarz, ACM TODS 1992)</a></div>
+    <p class="muted">The canonical reference for WAL, the page_LSN invariant, steal and no-force, repeating
+    history, Compensation Log Records, and the three-pass restart. Focus on Section 1.1 (WAL and the LSN),
+    Section 3 (the three principles and CLRs), and Section 6 (the Analysis, Redo, and Undo passes). This is the
+    assigned paper for the week 14 viva.</p>
+  </div>
+
+  <!-- ===== ASK YOUR TEACHER ===== -->
+  <div class="ask-teacher">
+    <div class="at-tag">Ask your teacher</div>
+    <p>Want to see a crash land in the middle of the undo pass and watch UndoNxtLSN make recovery idempotent?
+    Or trace how a fuzzy checkpoint shortens Analysis without quiescing the system? Ask me to extend the
+    simulator, draw the timeline differently, or quiz you harder on the page_LSN comparisons.</p>
+  </div>
+
+  <!-- ===== NAV ===== -->
+  <nav class="lesson-nav">
+    <a class="prev" href="0013-concurrency-mvcc.html">
+      <span class="nav-dir">Previous</span>
+      <span class="nav-title">Week 13 · Concurrency: strict 2PL, deadlock, and MVCC</span>
+    </a>
+    <a class="next" href="0015-modern-architectures-lsm.html">
+      <span class="nav-dir">Next</span>
+      <span class="nav-title">Week 15 · Modern architectures: LSM trees, columnar storage, DuckDB</span>
+    </a>
+  </nav>
+
+  </div><!-- /.col -->
+</main>
+</body>
+</html>

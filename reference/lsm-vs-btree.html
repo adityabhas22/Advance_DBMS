@@ -1,0 +1,402 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LSM tree vs B-tree · Reference · Field Guide to the Database Engine</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body class="layer-modern">
+<main class="page">
+
+  <!-- ===== MASTHEAD ===== -->
+  <header class="masthead col">
+    <div class="crumbs">
+      <a href="../index.html">Field Guide</a> <span>/</span>
+      <span>Reference</span> <span>/</span>
+      <span>Storage engine trade-offs</span>
+    </div>
+    <span class="week-badge">Cheat sheet</span>
+    <h1>LSM tree vs B-tree</h1>
+    <p class="lede">A B+tree updates in place and optimizes reads. An LSM tree buffers writes in
+    memory, flushes immutable sorted files, and merges them in the background, trading read and space
+    amplification for cheap sequential writes. Neither is strictly faster: the right answer is
+    workload-dependent.</p>
+  </header>
+
+  <div class="col">
+
+  <!-- ===== ONE-LINE MODEL ===== -->
+  <div class="callout keyidea">
+    <div class="callout-title">The one thing to remember</div>
+    <p>B+tree: one logarithmic random write per insert, one logarithmic random read per lookup,
+    balanced and update-in-place. LSM: writes are sequential and cheap, but you pay on reads (probe
+    several sorted runs) and on space (dead data lingers until compaction). This is the
+    read-update-memory (RUM) conjecture in practice: optimize at most two of read, write, and space
+    amplification.</p>
+  </div>
+
+  <!-- ===== SIDE BY SIDE ===== -->
+  <h2>Side by side</h2>
+
+  <table>
+    <caption>Update-in-place B+tree versus log-structured merge tree, axis by axis</caption>
+    <thead>
+      <tr><th>Axis</th><th>B+tree (update-in-place)</th><th>LSM tree (RocksDB, LevelDB, Bigtable)</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>Write path</strong></td>
+        <td>Find leaf (often a random read, since the needed leaf is rarely cached), modify page in
+        place, write page back, plus a WAL record and eventual checkpoint. Small random writes;
+        splits propagate upward.</td>
+        <td>Append to WAL, insert into in-memory sorted memtable (skip list). When full, freeze the
+        memtable and flush it whole as a new immutable SSTable. All sequential. No in-place mutation
+        ever.</td>
+      </tr>
+      <tr>
+        <td><strong>Read path</strong></td>
+        <td>One root-to-leaf traversal, about log<sub>b</sub>(n) page reads, mostly cache hits in
+        upper levels. One sorted structure, so a lookup is deterministic and read-optimized.</td>
+        <td>Check memtable, then SSTables newest to oldest (the newest copy wins). May touch O(number
+        of sorted runs) files. Per-SSTable sparse block index plus a Bloom filter cut this down.</td>
+      </tr>
+      <tr>
+        <td><strong>Update / delete</strong></td>
+        <td>Overwrite the value in place; delete removes the entry and may merge underfull leaves.</td>
+        <td>Write a new entry in a newer SSTable; delete writes a tombstone. Old versions and
+        tombstones are dropped only during compaction.</td>
+      </tr>
+      <tr>
+        <td><strong>Write amplification</strong></td>
+        <td>Low-to-moderate: one page rewrite per insert plus WAL, but every small change pays a full
+        page write (and triggers SSD garbage collection).</td>
+        <td>High: a byte is rewritten once per level it descends. RocksDB leveled compaction is
+        "often larger than 10". Tiered is much lower.</td>
+      </tr>
+      <tr>
+        <td><strong>Read amplification</strong></td>
+        <td>Low: about one logarithmic-depth traversal of a single tree.</td>
+        <td>Higher: a lookup may probe multiple files across multiple levels. Bloom filters reduce it
+        toward one real file read for point lookups.</td>
+      </tr>
+      <tr>
+        <td><strong>Space amplification</strong></td>
+        <td>Low for live data, but partly full leaves and (in MVCC heaps) dead row versions cost
+        space; PostgreSQL pays this as VACUUM.</td>
+        <td>Dead (superseded) data sits in older SSTables until compaction reclaims it. Leveled keeps
+        it bounded; tiered lets it grow and spikes transiently during merges.</td>
+      </tr>
+      <tr>
+        <td><strong>I/O pattern</strong></td>
+        <td>Random reads then random writes. Catastrophic on spinning disks, costs endurance on
+        flash.</td>
+        <td>Sequential appends and large sequential merges. Turns small random writes into big
+        sequential ones, the whole point.</td>
+      </tr>
+      <tr>
+        <td><strong>Concurrency / durability</strong></td>
+        <td>Page latches; WAL protects pages (undo/redo). Locking on shared pages.</td>
+        <td>Immutable files need no read synchronization; only the memtable is mutable (copy-on-write).
+        WAL protects only the volatile memtable.</td>
+      </tr>
+      <tr>
+        <td><strong>When it wins</strong></td>
+        <td>Read-heavy and point-lookup workloads, range scans, mixed OLTP, predictable low-latency
+        reads.</td>
+        <td>Write-heavy ingest, high insert/update rates, time-series and logging, flash endurance
+        sensitivity.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="callout gotcha">
+    <div class="callout-title">Exam traps</div>
+    <p><strong>"LSM is strictly faster than B-tree."</strong> False. LSM optimizes writes at the cost
+    of read and space amplification, and compaction burns background I/O and CPU. B+trees win
+    read-heavy and point-lookup workloads.</p>
+    <p><strong>"Leveled compaction has lower write amplification than tiered."</strong> False, it is
+    the reverse. Leveled minimizes space and read amplification at higher write amplification (&gt;10
+    in RocksDB); tiered minimizes write amplification at higher read and space amplification.</p>
+  </div>
+
+  <!-- ===== AMPLIFICATION DEFINITIONS ===== -->
+  <h2>The three amplifications</h2>
+
+  <table>
+    <thead>
+      <tr><th>Term</th><th>Definition</th><th>Driven by</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>Write amplification</strong></td>
+        <td>Bytes physically written / bytes logically inserted.</td>
+        <td>Number of times compaction rewrites a byte. Grows with the number of levels.</td>
+      </tr>
+      <tr>
+        <td><strong>Read amplification</strong></td>
+        <td>Files or pages read to answer one lookup.</td>
+        <td>Number of sorted runs probed. Cut by Bloom filters and per-SSTable indexes.</td>
+      </tr>
+      <tr>
+        <td><strong>Space amplification</strong></td>
+        <td>Bytes stored on disk / bytes of live data.</td>
+        <td>Dead and superseded data awaiting compaction; transient copies during a merge.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="callout why">
+    <div class="callout-title">Why you cannot win all three</div>
+    <p>The RUM conjecture says pick at most two of read, update (write), and memory (space)
+    amplification. RocksDB states it directly: leveled "minimizes space amplification at the cost of
+    read and write amplification"; universal (tiered) "minimizes write amplification at the cost of
+    read and space amplification". The compaction policies are just points on this curve.</p>
+  </div>
+
+  <!-- ===== LEVELED VS TIERED SVG ===== -->
+  <h2>Leveled versus tiered compaction</h2>
+
+  <figure class="diagram bleed">
+    <svg viewBox="0 0 720 360" role="img" aria-label="Leveled compaction keeps one sorted run per level; tiered accumulates several runs per level before merging up.">
+      <!-- divider -->
+      <line x1="360" y1="18" x2="360" y2="342" stroke="var(--rule)" stroke-width="1.5" stroke-dasharray="4 4"/>
+
+      <!-- ===== LEFT: LEVELED ===== -->
+      <text x="20" y="34" class="svg-label" style="font-weight:700;fill:var(--modern)">LEVELED</text>
+      <text x="20" y="50" class="svg-label sm">one sorted run per non-zero level, non-overlapping key ranges</text>
+
+      <!-- L0: overlapping flushes -->
+      <text x="20" y="80" class="svg-label sm">L0</text>
+      <rect x="48" y="68" width="58" height="20" rx="3" fill="var(--modern-bg)" stroke="var(--modern)"/>
+      <rect x="112" y="68" width="58" height="20" rx="3" fill="var(--modern-bg)" stroke="var(--modern)"/>
+      <rect x="176" y="68" width="58" height="20" rx="3" fill="var(--modern-bg)" stroke="var(--modern)"/>
+      <text x="244" y="82" class="svg-label sm svg-faint">may overlap</text>
+
+      <!-- L1 single run -->
+      <text x="20" y="124" class="svg-label sm">L1</text>
+      <rect x="48" y="112" width="60" height="20" rx="3" fill="#fffdf8" stroke="var(--modern)"/>
+      <rect x="110" y="112" width="60" height="20" rx="3" fill="#fffdf8" stroke="var(--modern)"/>
+      <rect x="172" y="112" width="60" height="20" rx="3" fill="#fffdf8" stroke="var(--modern)"/>
+      <rect x="234" y="112" width="60" height="20" rx="3" fill="#fffdf8" stroke="var(--modern)"/>
+      <text x="300" y="126" class="svg-label sm svg-faint">1 run, ~10x</text>
+
+      <!-- L2 single run, bigger -->
+      <text x="20" y="168" class="svg-label sm">L2</text>
+      <rect x="48" y="156" width="44" height="20" rx="3" fill="#fffdf8" stroke="var(--modern)"/>
+      <rect x="94" y="156" width="44" height="20" rx="3" fill="#fffdf8" stroke="var(--modern)"/>
+      <rect x="140" y="156" width="44" height="20" rx="3" fill="#fffdf8" stroke="var(--modern)"/>
+      <rect x="186" y="156" width="44" height="20" rx="3" fill="#fffdf8" stroke="var(--modern)"/>
+      <rect x="232" y="156" width="44" height="20" rx="3" fill="#fffdf8" stroke="var(--modern)"/>
+      <rect x="278" y="156" width="44" height="20" rx="3" fill="#fffdf8" stroke="var(--modern)"/>
+      <text x="328" y="170" class="svg-label sm svg-faint">~100x</text>
+
+      <!-- arrow down -->
+      <line x1="120" y1="92" x2="120" y2="108" stroke="var(--modern)" stroke-width="1.5" marker-end="url(#ar)"/>
+      <line x1="150" y1="136" x2="150" y2="152" stroke="var(--modern)" stroke-width="1.5" marker-end="url(#ar)"/>
+
+      <text x="20" y="214" class="svg-label sm" style="fill:var(--good)">+ read checks at most one file per level</text>
+      <text x="20" y="232" class="svg-label sm" style="fill:var(--good)">+ dead data bounded (low space amp)</text>
+      <text x="20" y="250" class="svg-label sm" style="fill:var(--bad)">&minus; byte rewritten once per level (write amp &gt;10)</text>
+      <text x="20" y="276" class="svg-label sm svg-faint">target = base x multiplier (default 10):</text>
+      <text x="20" y="294" class="svg-mono" style="font-size:11px">16KB &rarr; 160KB &rarr; 1.6MB &rarr; 16MB</text>
+      <text x="20" y="324" class="svg-label sm">Favors read-heavy workloads.</text>
+
+      <!-- ===== RIGHT: TIERED ===== -->
+      <text x="384" y="34" class="svg-label" style="font-weight:700;fill:var(--storage)">TIERED (size-tiered / universal)</text>
+      <text x="384" y="50" class="svg-label sm">several similar-sized runs per tier, merged up when enough pile up</text>
+
+      <!-- tier 0: many small runs -->
+      <text x="384" y="80" class="svg-label sm">T0</text>
+      <rect x="412" y="68" width="34" height="20" rx="3" fill="var(--storage-bg)" stroke="var(--storage)"/>
+      <rect x="450" y="68" width="34" height="20" rx="3" fill="var(--storage-bg)" stroke="var(--storage)"/>
+      <rect x="488" y="68" width="34" height="20" rx="3" fill="var(--storage-bg)" stroke="var(--storage)"/>
+      <rect x="526" y="68" width="34" height="20" rx="3" fill="var(--storage-bg)" stroke="var(--storage)"/>
+      <text x="568" y="82" class="svg-label sm svg-faint">4 runs</text>
+
+      <!-- tier 1: a few medium runs -->
+      <text x="384" y="124" class="svg-label sm">T1</text>
+      <rect x="412" y="112" width="62" height="20" rx="3" fill="#fffdf8" stroke="var(--storage)"/>
+      <rect x="478" y="112" width="62" height="20" rx="3" fill="#fffdf8" stroke="var(--storage)"/>
+      <text x="548" y="126" class="svg-label sm svg-faint">2 runs</text>
+
+      <!-- tier 2: one big run -->
+      <text x="384" y="168" class="svg-label sm">T2</text>
+      <rect x="412" y="156" width="150" height="20" rx="3" fill="#fffdf8" stroke="var(--storage)"/>
+      <text x="568" y="170" class="svg-label sm svg-faint">1 run</text>
+
+      <!-- merge arrows -->
+      <line x1="486" y1="92" x2="486" y2="108" stroke="var(--storage)" stroke-width="1.5" marker-end="url(#ar2)"/>
+      <line x1="487" y1="136" x2="487" y2="152" stroke="var(--storage)" stroke-width="1.5" marker-end="url(#ar2)"/>
+
+      <text x="384" y="214" class="svg-label sm" style="fill:var(--good)">+ few rewrites per byte (low write amp)</text>
+      <text x="384" y="232" class="svg-label sm" style="fill:var(--bad)">&minus; read may check many runs (high read amp)</text>
+      <text x="384" y="250" class="svg-label sm" style="fill:var(--bad)">&minus; two copies of a big run during a merge (space amp)</text>
+      <text x="384" y="324" class="svg-label sm">Favors write-heavy workloads.</text>
+
+      <defs>
+        <marker id="ar" markerWidth="7" markerHeight="7" refX="3.5" refY="3" orient="auto">
+          <path d="M0,0 L7,3 L0,6 Z" fill="var(--modern)"/>
+        </marker>
+        <marker id="ar2" markerWidth="7" markerHeight="7" refX="3.5" refY="3" orient="auto">
+          <path d="M0,0 L7,3 L0,6 Z" fill="var(--storage)"/>
+        </marker>
+      </defs>
+    </svg>
+    <figcaption><b>Leveled</b> keeps each non-zero level as one sorted run with non-overlapping
+    SSTable ranges, so a read checks at most one file per level (low read and space amplification) but
+    rewrites a byte once per level (write amplification &gt;10). <b>Tiered</b> lets several similar
+    sized runs accumulate per tier and merges them up when enough collect, so few rewrites (low write
+    amplification) but a read may scan many runs and a merge transiently doubles a run's space. L0 is
+    special in leveled: files come straight from memtable flushes and may overlap. RocksDB also has a
+    tiered+leveled hybrid with less write amp than leveled and less space amp than tiered.</figcaption>
+  </figure>
+
+  <table>
+    <caption>Compaction policy at a glance</caption>
+    <thead>
+      <tr><th>Policy</th><th>Write amp</th><th>Read amp</th><th>Space amp</th><th>Best for</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><strong>Leveled</strong></td><td>high (&gt;10)</td><td>low</td><td>low</td><td>read-heavy</td></tr>
+      <tr><td><strong>Tiered (universal)</strong></td><td>low</td><td>high</td><td>high</td><td>write-heavy</td></tr>
+      <tr><td><strong>Tiered + leveled (hybrid)</strong></td><td>medium</td><td>medium</td><td>medium</td><td>balanced</td></tr>
+    </tbody>
+  </table>
+
+  <!-- ===== BLOOM FILTER ===== -->
+  <h2>Bloom filter: making LSM reads cheap</h2>
+
+  <p>A Bloom filter is a probabilistic set-membership structure that answers "is key X possibly in
+  this SSTable?" with either <strong>definitely not</strong> or <strong>maybe</strong>. It has no
+  false negatives, only false positives. That asymmetry is exactly what an LSM read needs: a
+  "definitely not" skips an entire SSTable with zero I/O, and a false positive only costs one wasted
+  lookup that returns nothing.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 700 170" role="img" aria-label="A key is hashed by k functions; the bits are set on insert and tested on lookup.">
+      <text x="16" y="26" class="svg-label" style="font-weight:700">test key "X"</text>
+      <rect x="16" y="38" width="80" height="30" rx="4" fill="var(--modern-bg)" stroke="var(--modern)"/>
+      <text x="56" y="58" text-anchor="middle" class="svg-mono">X</text>
+
+      <!-- hash funcs -->
+      <text x="150" y="34" class="svg-label sm">h1</text>
+      <text x="150" y="56" class="svg-label sm">h2</text>
+      <text x="150" y="78" class="svg-label sm">h3</text>
+      <line x1="96" y1="53" x2="146" y2="30" stroke="var(--ink-faint)"/>
+      <line x1="96" y1="53" x2="146" y2="52" stroke="var(--ink-faint)"/>
+      <line x1="96" y1="53" x2="146" y2="74" stroke="var(--ink-faint)"/>
+
+      <!-- bit array -->
+      <text x="200" y="26" class="svg-label sm svg-faint">m-bit array</text>
+      <g font-family="var(--mono)" font-size="12">
+        <rect x="200" y="38" width="30" height="30" fill="#fffdf8" stroke="var(--rule)"/><text x="215" y="58" text-anchor="middle" class="svg-mono">0</text>
+        <rect x="230" y="38" width="30" height="30" fill="var(--good-bg)" stroke="var(--good)"/><text x="245" y="58" text-anchor="middle" class="svg-mono">1</text>
+        <rect x="260" y="38" width="30" height="30" fill="#fffdf8" stroke="var(--rule)"/><text x="275" y="58" text-anchor="middle" class="svg-mono">0</text>
+        <rect x="290" y="38" width="30" height="30" fill="var(--good-bg)" stroke="var(--good)"/><text x="305" y="58" text-anchor="middle" class="svg-mono">1</text>
+        <rect x="320" y="38" width="30" height="30" fill="#fffdf8" stroke="var(--rule)"/><text x="335" y="58" text-anchor="middle" class="svg-mono">0</text>
+        <rect x="350" y="38" width="30" height="30" fill="var(--good-bg)" stroke="var(--good)"/><text x="365" y="58" text-anchor="middle" class="svg-mono">1</text>
+        <rect x="380" y="38" width="30" height="30" fill="#fffdf8" stroke="var(--rule)"/><text x="395" y="58" text-anchor="middle" class="svg-mono">0</text>
+      </g>
+
+      <text x="430" y="50" class="svg-label sm" style="fill:var(--good)">all k bits set</text>
+      <text x="430" y="66" class="svg-label sm svg-faint">&rarr; maybe present, read the SSTable</text>
+
+      <text x="200" y="108" class="svg-label sm" style="fill:var(--bad)">any bit 0</text>
+      <text x="270" y="108" class="svg-label sm svg-faint">&rarr; definitely absent, skip the file with zero I/O</text>
+
+      <text x="16" y="140" class="svg-label sm">false-positive rate at optimal k = (m/n) ln 2 is about (0.6185)^(m/n).</text>
+      <text x="16" y="158" class="svg-label sm">RocksDB default ~10 bits/key (m/n = 10) gives ~1% false positives.</text>
+    </svg>
+    <figcaption>A bit array of m bits and k hash functions. Insert sets the k bits; a test that finds
+    any of the k bits clear proves the key is absent. More bits per key lowers the false-positive
+    rate. Standard Bloom filters are <b>not deletable</b>: clearing a bit could clear one shared with
+    another key, which would create false negatives. In Bigtable the filter is per locality group; in
+    RocksDB it is per SSTable.</figcaption>
+  </figure>
+
+  <div class="callout gotcha">
+    <div class="callout-title">Bloom filter traps</div>
+    <p><strong>"Bloom filters can give false negatives."</strong> False. A "definitely not" is always
+    correct; only false positives occur. That is exactly why they are safe for skipping SSTables.</p>
+    <p><strong>"You can delete a key by clearing its bits."</strong> False. Clearing a shared bit
+    introduces false negatives. Deletion needs a counting Bloom filter, not the standard one.</p>
+  </div>
+
+  <!-- ===== WHERE SYSTEMS SIT ===== -->
+  <h2>Where the real systems sit</h2>
+
+  <table>
+    <caption>LSM-family engines and a B-tree baseline</caption>
+    <thead>
+      <tr><th>System</th><th>Family</th><th>What grounds it</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>LevelDB</strong></td>
+        <td>LSM, leveled</td>
+        <td>The compact reference embedded LSM: memtable plus WAL plus immutable SSTables plus leveled
+        compaction. The lineage RocksDB forked from.</td>
+      </tr>
+      <tr>
+        <td><strong>RocksDB</strong></td>
+        <td>LSM, pluggable</td>
+        <td>The reference production LSM: memtable, WAL, immutable SSTables, pluggable compaction
+        (leveled, universal/tiered, FIFO), per-SSTable Bloom filters, block cache. The storage engine
+        embedded inside many distributed databases.</td>
+      </tr>
+      <tr>
+        <td><strong>Bigtable</strong></td>
+        <td>LSM, distributed</td>
+        <td>The canonical production LSM and the bridge to the distributed world. Writes go to a
+        per-server commit log plus a memtable; the memtable flushes to an immutable SSTable; reads
+        merge the memtable with SSTables. Minor / merging / major compaction reclaim space and remove
+        tombstones. The paper states the design is "analogous to the way the Log-Structured Merge Tree
+        stores updates". Tablets are dynamic range partitions on the row key across tablet servers.</td>
+      </tr>
+      <tr>
+        <td><strong>PostgreSQL, SQLite</strong></td>
+        <td>B-tree baseline</td>
+        <td>Update-in-place row-stores over a B+tree. PostgreSQL keeps old MVCC versions in the heap
+        (paying VACUUM) rather than in stacked SSTables; it chose read-optimized update-in-place over
+        the LSM write-optimized path. SQLite is a B-tree store whose WAL mode echoes the LSM
+        append-on-commit idea.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="callout realworld">
+    <div class="callout-title">Bigtable compaction trio (the original-source vocabulary)</div>
+    <p><strong>Minor compaction</strong> flushes a frozen memtable to a new SSTable on GFS, shrinking
+    memory and recovery cost. <strong>Merging compaction</strong> folds a few SSTables plus the
+    memtable into one new SSTable to bound how many files a read must merge. <strong>Major
+    compaction</strong> rewrites all SSTables into exactly one, dropping every deletion entry and
+    deleted value, so sensitive data physically disappears in bounded time. Deletes are tombstones
+    that suppress older live values until a major compaction removes them.</p>
+  </div>
+
+  <div class="callout intuition">
+    <div class="callout-title">Picking one in an interview</div>
+    <p>If the workload is write-heavy, append-mostly, or on flash you care about endurance, reach for
+    an LSM and tune compaction toward tiered. If it is read-heavy with point lookups and range scans
+    and you want predictable low read latency, reach for a B+tree (or an LSM with leveled compaction
+    and fat Bloom filters). Then name the cost you are accepting: read and space amplification for the
+    LSM, write amplification and random I/O for the B-tree.</p>
+  </div>
+
+  <!-- ===== FOOTER ===== -->
+  <nav class="lesson-nav">
+    <a class="prev" href="../lessons/0015-modern-architectures-lsm.html">
+      <span class="nav-dir">Lesson</span>
+      <span class="nav-title">Week 15 · Modern architectures: LSM trees, columnar storage, DuckDB</span>
+    </a>
+    <a class="next" href="../lessons/0016-distributed-databases.html">
+      <span class="nav-dir">Related lesson</span>
+      <span class="nav-title">Week 16 · Distributed databases: partitioning, replication, 2PC, CAP</span>
+    </a>
+  </nav>
+
+  </div><!-- /.col -->
+</main>
+</body>
+</html>

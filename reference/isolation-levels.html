@@ -1,0 +1,229 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Isolation levels and anomalies · Reference · Field Guide to the Database Engine</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body class="layer-txn">
+<main class="page">
+
+  <!-- ===== MASTHEAD ===== -->
+  <header class="masthead col">
+    <div class="crumbs">
+      <a href="../index.html">Field Guide</a> <span>/</span>
+      <span>Reference</span> <span>/</span>
+      <span>Transactions</span>
+    </div>
+    <span class="week-badge">Transactions</span>
+    <h1>Isolation levels and anomalies</h1>
+    <p class="lede">A printable cheat sheet: the canonical level-by-anomaly matrix, the schedule that defines
+    each anomaly, and the two facts that explain the table (levels are defined by phenomena, not by locks, and
+    snapshot isolation does not fit on the ANSI ladder).</p>
+  </header>
+
+  <div class="col">
+
+  <!-- ===== THE MATRIX ===== -->
+  <h2>The canonical matrix</h2>
+  <p>Rows are isolation levels from weakest to strongest. Columns are anomalies. A cell says whether that level
+  <em>allows</em> the anomaly or <em>prevents</em> it. The ANSI columns are dirty read, non-repeatable read, and
+  phantom; the extra columns add write skew, the anomaly that places snapshot isolation off the ANSI ladder.
+  Dirty write (P0) is omitted as a column because every level forbids it.</p>
+
+  <figure class="diagram" style="padding:0;border:none;box-shadow:none;">
+  <table>
+    <caption>Allowed (A) versus prevented (P) per level. ANSI levels first, then snapshot isolation as a separate row.</caption>
+    <thead>
+      <tr>
+        <th>Isolation level</th>
+        <th>Dirty read<br><small>P1</small></th>
+        <th>Non-repeatable read<br><small>P2</small></th>
+        <th>Phantom<br><small>P3</small></th>
+        <th>Write skew<br><small>A5B</small></th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>Read uncommitted</strong></td>
+        <td><span class="pill miss">allowed</span></td>
+        <td><span class="pill miss">allowed</span></td>
+        <td><span class="pill miss">allowed</span></td>
+        <td><span class="pill miss">allowed</span></td>
+      </tr>
+      <tr>
+        <td><strong>Read committed</strong></td>
+        <td><span class="pill hit">prevented</span></td>
+        <td><span class="pill miss">allowed</span></td>
+        <td><span class="pill miss">allowed</span></td>
+        <td><span class="pill miss">allowed</span></td>
+      </tr>
+      <tr>
+        <td><strong>Repeatable read</strong></td>
+        <td><span class="pill hit">prevented</span></td>
+        <td><span class="pill hit">prevented</span></td>
+        <td><span class="pill miss">allowed</span><br><small>ANSI floor</small></td>
+        <td><span class="pill miss">allowed</span></td>
+      </tr>
+      <tr>
+        <td><strong>Serializable</strong></td>
+        <td><span class="pill hit">prevented</span></td>
+        <td><span class="pill hit">prevented</span></td>
+        <td><span class="pill hit">prevented</span></td>
+        <td><span class="pill hit">prevented</span></td>
+      </tr>
+      <tr>
+        <td><strong>Snapshot isolation</strong><br><small>not on the ANSI ladder</small></td>
+        <td><span class="pill hit">prevented</span></td>
+        <td><span class="pill hit">prevented</span></td>
+        <td><span class="pill hit">prevented</span></td>
+        <td><span class="pill miss">allowed</span><br><small>the SI hole</small></td>
+      </tr>
+    </tbody>
+  </table>
+  <figcaption><b>Reading the rows.</b> Each step down the ANSI ladder forbids one more phenomenon: read committed
+  kills P1, repeatable read adds P2, serializable adds P3 and everything else. <b>Snapshot isolation is not a row
+  between two ANSI levels.</b> It forbids the phantom that repeatable read still permits, yet it permits write skew
+  that no serializable schedule allows, so it is <em>incomparable</em> with repeatable read, not above or below it.</figcaption>
+  </figure>
+
+  <div class="callout gotcha">
+    <p class="callout-title">PostgreSQL does not match this table verbatim</p>
+    <p>PostgreSQL implements three distinct levels behind the four names. Read uncommitted behaves exactly like
+    read committed, so dirty reads never occur at any level. Its repeatable read is snapshot isolation, so it
+    prevents phantoms despite the ANSI floor allowing them. Its serializable is serializable snapshot isolation
+    (SSI), which catches write skew by aborting a transaction with <code>could not serialize access due to
+    read/write dependencies</code>.</p>
+  </div>
+
+  <!-- ===== ANOMALY DEFINITIONS ===== -->
+  <h2>Anomaly definitions with a schedule</h2>
+  <p>Notation follows the critique paper: <code>w1[x]</code> is transaction 1 writing item x, <code>r2[x]</code>
+  is transaction 2 reading x, <code>c1</code> is commit, <code>a1</code> is abort. The subscript names the
+  transaction. Every anomaly is an interleaved result that no serial order could produce.</p>
+
+  <h3>Dirty write (P0)</h3>
+  <p>Two transactions write the same item with one write interleaved between the other's, so a clean rollback to
+  a consistent state becomes impossible. Forbidden at <em>every</em> level, which is why it is not a matrix column.</p>
+  <pre><code>w1[x] ... w2[x] ... (both commit)   first writer cannot undo cleanly</code></pre>
+
+  <h3>Dirty read (P1)</h3>
+  <p>T2 reads a value T1 wrote but has not committed. If T1 later aborts, T2 read a value that never officially existed.</p>
+  <pre><code>w1[x]  r2[x]  a1        T2 saw x that T1 then rolled back</code></pre>
+
+  <h3>Non-repeatable read, also fuzzy read (P2)</h3>
+  <p>T1 reads x, T2 modifies and commits x, T1 reads x again inside the same transaction and gets a different
+  committed value. The changed thing is the <em>value of a row T1 already saw</em>.</p>
+  <pre><code>r1[x]  w2[x]  c2  r1[x]       second r1[x] differs from first</code></pre>
+
+  <h3>Phantom (P3)</h3>
+  <p>T1 evaluates a predicate P (for example, all employees in department 5), T2 inserts or deletes a row matching
+  P and commits, and T1's second evaluation of P returns a different set of rows. The changed thing is <em>which
+  rows exist</em>, not the value of a known row, so preventing it needs predicate, range, or gap locking, not row locks.</p>
+  <pre><code>r1[P]  w2[y in P]  c2  r1[P]   second r1[P] returns a different row set</code></pre>
+
+  <h3>Lost update</h3>
+  <p>Two read-modify-write cycles where one overwrite silently discards the other's committed update. Both read
+  x = 10, both compute x + 1, both write 11; one increment vanishes. Can happen with no dirty read.</p>
+  <pre><code>r1[x]  r2[x]  w1[x]  w2[x]     T1's update is overwritten and lost</code></pre>
+
+  <h3>Write skew (A5B)</h3>
+  <p>Two transactions read an overlapping set, each checks a constraint that currently holds, then each writes a
+  <em>different</em> item. Each write keeps the constraint true given what that transaction read, but together
+  they break it. No write-write conflict exists to catch, yet the precedence graph has a cycle. This is the
+  anomaly snapshot isolation permits.</p>
+  <pre><code>r1[x,y]  r2[x,y]  w1[x]  w2[y]  c1 c2   constraint over {x,y} now violated</code></pre>
+  <div class="callout intuition">
+    <p class="callout-title">The on-call example</p>
+    <p>Rule: at least one doctor must stay on call. Two doctors both read "two on call, fine," each removes
+    themselves, and now zero are on call. Each transaction was locally correct; together they are not.</p>
+  </div>
+
+  <!-- ===== PRECEDENCE GRAPH SVG ===== -->
+  <h2>Why write skew escapes snapshot isolation</h2>
+  <p>Snapshot isolation resolves write-write conflicts by First-Committer-Wins, which only fires when two
+  transactions write the <em>same</em> item. Write skew writes different items, so nothing fires, yet the
+  read-write dependencies still form a cycle in the serialization graph. A cycle means no serial order exists.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 460 160" xmlns="http://www.w3.org/2000/svg" role="img"
+         aria-label="Precedence graph with a two-node cycle between T1 and T2.">
+      <defs>
+        <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+          <path d="M0,0 L10,5 L0,10 z" fill="var(--txn)"/>
+        </marker>
+      </defs>
+      <circle cx="120" cy="80" r="34" fill="var(--txn-bg)" stroke="var(--txn)" stroke-width="2"/>
+      <circle cx="340" cy="80" r="34" fill="var(--txn-bg)" stroke="var(--txn)" stroke-width="2"/>
+      <text x="120" y="86" text-anchor="middle" class="svg-mono" font-size="16">T1</text>
+      <text x="340" y="86" text-anchor="middle" class="svg-mono" font-size="16">T2</text>
+      <path d="M152,66 Q230,30 308,66" fill="none" stroke="var(--txn)" stroke-width="2" marker-end="url(#arrow)"/>
+      <path d="M308,94 Q230,130 152,94" fill="none" stroke="var(--txn)" stroke-width="2" marker-end="url(#arrow)"/>
+      <text x="230" y="28" text-anchor="middle" class="svg-label sm">rw on y (T1 read, T2 wrote)</text>
+      <text x="230" y="150" text-anchor="middle" class="svg-label sm">rw on x (T2 read, T1 wrote)</text>
+    </svg>
+    <figcaption>The two read-write anti-dependency edges close a cycle, so the schedule is not conflict
+    serializable. Serializable snapshot isolation (SSI) detects exactly this dangerous structure (a transaction
+    with both an incoming and an outgoing rw edge) and aborts a participant.</figcaption>
+  </figure>
+
+  <!-- ===== 2PL vs MVCC ===== -->
+  <h2>2PL versus MVCC, one line each</h2>
+  <table>
+    <thead><tr><th>Approach</th><th>One-liner</th></tr></thead>
+    <tbody>
+      <tr>
+        <td><strong>2PL</strong></td>
+        <td>Force serializability by <em>blocking</em>: acquire all locks (growing phase) before releasing any
+        (shrinking phase); strict 2PL holds write locks to commit, so readers and writers wait on each other.</td>
+      </tr>
+      <tr>
+        <td><strong>MVCC</strong></td>
+        <td>Avoid the waiting by keeping <em>old versions</em>: each transaction reads a consistent snapshot, so
+        reads never block writes and writes never block reads; writers are still serialized by some protocol on top.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <!-- ===== ANSI CRITIQUE ===== -->
+  <h2>The ANSI critique note</h2>
+  <div class="callout why">
+    <p class="callout-title">Berenson, Bernstein, Gray, Melton, O'Neil, O'Neil, SIGMOD 1995</p>
+    <p>The critique paper argues the ANSI anomaly-based definitions are underspecified. Its main points:</p>
+  </div>
+  <ul>
+    <li><strong>Levels are defined by phenomena, not by locking.</strong> ANSI names which of P1, P2, P3 each
+    level must forbid; it does not mandate an implementation. A common MCQ trap states the reverse.</li>
+    <li><strong>P0 dirty write was missing.</strong> The paper adds it because the loosest level must still forbid
+    overlapping writes, otherwise rollback is ill defined.</li>
+    <li><strong>The phenomena are ambiguous.</strong> They admit a loose (strict) and a broad reading, which is
+    why the English definitions fail to pin down the intended locking levels.</li>
+    <li><strong>Snapshot isolation breaks the ladder.</strong> SI forbids P1, P2, and the simple phantom, so it
+    sits above repeatable read on those, yet it permits write skew (A5B) and a read-only anomaly, so it is weaker
+    than serializable. SI is therefore <em>incomparable</em> with repeatable read, the headline result.</li>
+  </ul>
+
+  <div class="callout keyidea">
+    <p class="callout-title">The one thing to remember</p>
+    <p>A phantom is a changed <em>row set</em> (insert or delete under a predicate); a non-repeatable read is a
+    changed <em>value</em> of a row already seen. Repeatable read forbids the second but allows the first, which
+    is exactly why predicate or range locking, not row locking, is needed for serializable.</p>
+  </div>
+
+  <!-- ===== FOOTER ===== -->
+  <footer class="lesson-nav">
+    <a href="../lessons/0012-transactions-isolation.html">
+      <span class="nav-dir">Lesson</span>
+      <span class="nav-title">Week 12 · Transactions, ACID, anomalies, and isolation levels</span>
+    </a>
+    <a class="next" href="../lessons/0013-concurrency-mvcc.html">
+      <span class="nav-dir">Lesson</span>
+      <span class="nav-title">Week 13 · Concurrency: 2PL and MVCC</span>
+    </a>
+  </footer>
+
+  </div>
+</main>
+</body>
+</html>

@@ -1,0 +1,820 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lesson 08 · Query parsing: lexing, parsing, binding, and logical plans · Field Guide to the Database Engine</title>
+<link rel="stylesheet" href="../assets/course.css">
+<script defer src="../assets/components.js"></script>
+</head>
+<body class="layer-query">
+<main class="page">
+
+  <!-- ===== MASTHEAD ===== -->
+  <header class="masthead col">
+    <div class="crumbs">
+      <a href="../index.html">Field Guide</a> <span>/</span>
+      <span>Part V · Query processing</span> <span>/</span>
+      <span>Week 08</span>
+    </div>
+    <span class="week-badge">Query processor · front of the pipeline</span>
+    <h1>Query parsing: lexing, parsing, binding, and logical plans</h1>
+    <p class="lede">A SQL statement arrives as a flat string of bytes. The engine cannot execute a string.
+    This lesson follows that string as it becomes tokens, then a syntax tree, then a name-resolved and
+    typed query tree, and finally a logical plan that says what to compute. Every later stage trusts this
+    one to have told the truth.</p>
+  </header>
+
+  <div class="col">
+
+  <!-- ===== OBJECTIVES ===== -->
+  <div class="objectives">
+    <h4>By the end you can</h4>
+    <ul>
+      <li>Separate the four jobs at the front of the pipeline: lex, parse, bind, rewrite, and say which one catches which kind of error.</li>
+      <li>Explain why parsing makes no catalog lookups and why binding must, and tie that to transactions.</li>
+      <li>Say why recursive descent (LL) loops on left recursion while a shift-reduce (LR) parser does not.</li>
+      <li>Draw the difference between a raw parse tree, a bound query tree, and a logical plan.</li>
+      <li>State the logical versus physical boundary and why there is no one-to-one mapping.</li>
+    </ul>
+  </div>
+
+  <!-- ===== WHERE THIS SITS (connective tissue) ===== -->
+  <p>Hold the running query in mind:</p>
+  <pre><code><span class="tok-kw">SELECT</span> name <span class="tok-kw">FROM</span> emp <span class="tok-kw">WHERE</span> salary &gt; <span class="tok-num">75000</span> <span class="tok-kw">ORDER BY</span> name;</code></pre>
+  <p>In <a href="0001-dbms-architecture.html">week 1</a> we watched this string arrive at the server: the
+  client communications manager took the bytes, the process manager assigned a worker and ran admission
+  control, and then it handed the raw SQL string to the relational query processor. That hand-off is where
+  this lesson starts. The layer above gives us a string and nothing else. The layer below, the
+  <a href="0011-query-optimization.html">optimizer in week 11</a>, wants something it can cost and search
+  over: a tree of relational-algebra operators with every name resolved and every type known. Our job is to
+  build exactly that. We turn text into a logical plan, projection(name) over selection(salary &gt; 75000)
+  over scan(emp) with a sort for ORDER BY, and hand it down.</p>
+
+  <p>This is milestone M2: the front of the pipeline is complete once you finish this week. After it, the
+  <a href="0009-query-execution-volcano.html">executor (week 9)</a> and the optimizer never touch the SQL
+  string again. They work only on the structured object we produce. If we resolve <code>emp</code> to the
+  wrong table, or miss that <code>salary</code> is a money type, every stage downstream is operating on a
+  lie and the bug surfaces far from its cause.</p>
+
+  <div class="callout intuition">
+    <div class="callout-title">Intuition</div>
+    <p>Think of an inbound letter written in a language the engine half-knows. First you cut it into words
+    (lexing). Then you work out the grammar, which clause is the subject and which is the condition (parsing).
+    Then you check the words against reality: does the person named actually exist, are you allowed to read
+    their file, does "salary times 1.15" even make sense for this column's type (binding). Only after all
+    that do you rephrase the request into a clean internal to-do list (the logical plan). Each step assumes
+    the previous one finished correctly.</p>
+  </div>
+
+  <!-- ===== THE FOUR JOBS ===== -->
+  <h2>Four jobs, in order</h2>
+
+  <p>The naive approach is to pattern-match keywords: see <code>SELECT</code>, grab the words after it, see
+  <code>WHERE</code>, grab the rest. This recovers no structure. You cannot push a predicate below a join if
+  you do not even know which token run is the predicate. You cannot tell whether <code>name</code> is a
+  column, an alias, or a function. And you certainly cannot decide whether <code>salary * 1.15</code> uses
+  integer or floating multiply, because a string has no types. So the engine builds structure first, then
+  layers meaning onto it.</p>
+
+  <p>The decomposition that PostgreSQL uses, and that the "Architecture of a Database System" survey
+  describes, has a deliberate seam in it. Pure syntax checking needs no database access. Name resolution
+  does. PostgreSQL splits raw parsing from analysis for one concrete reason:
+  "system catalog lookups can only be done within a transaction"
+  [<a href="https://www.postgresql.org/docs/current/parser-stage.html">PG: The Parser Stage</a>]. Parsing a
+  string for well-formedness needs no transaction. Checking that a table exists does. That single constraint
+  is why the line is drawn where it is.</p>
+
+  <!-- ===== FIGURE 1: the PostgreSQL chain ===== -->
+  <figure class="diagram">
+    <svg viewBox="0 0 760 150" role="img" aria-label="The PostgreSQL parsing chain from string to plan tree">
+      <defs>
+        <marker id="qp-arrow" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto">
+          <path d="M0,0 L7,3 L0,6 Z" fill="var(--ink-soft)"/>
+        </marker>
+      </defs>
+      <!-- string -->
+      <rect x="8" y="46" width="92" height="46" rx="6" fill="#fffdf8" stroke="var(--ink-soft)"/>
+      <text x="54" y="66" text-anchor="middle" class="svg-mono">SQL</text>
+      <text x="54" y="82" text-anchor="middle" class="svg-mono">string</text>
+      <!-- flex -->
+      <line x1="100" y1="69" x2="128" y2="69" stroke="var(--ink-soft)" marker-end="url(#qp-arrow)"/>
+      <text x="114" y="40" text-anchor="middle" class="svg-label sm">flex</text>
+      <rect x="130" y="46" width="92" height="46" rx="6" fill="var(--query-bg)" stroke="var(--query)"/>
+      <text x="176" y="66" text-anchor="middle" class="svg-label">tokens</text>
+      <text x="176" y="82" text-anchor="middle" class="svg-label sm">no catalog</text>
+      <!-- bison -->
+      <line x1="222" y1="69" x2="250" y2="69" stroke="var(--ink-soft)" marker-end="url(#qp-arrow)"/>
+      <text x="236" y="40" text-anchor="middle" class="svg-label sm">bison</text>
+      <rect x="252" y="46" width="104" height="46" rx="6" fill="var(--query-bg)" stroke="var(--query)"/>
+      <text x="304" y="66" text-anchor="middle" class="svg-label">raw parse</text>
+      <text x="304" y="82" text-anchor="middle" class="svg-label sm">tree (no catalog)</text>
+      <!-- analyze -->
+      <line x1="356" y1="69" x2="384" y2="69" stroke="var(--ink-soft)" marker-end="url(#qp-arrow)"/>
+      <text x="370" y="40" text-anchor="middle" class="svg-label sm">analyze</text>
+      <rect x="386" y="46" width="104" height="46" rx="6" fill="var(--query-bg)" stroke="var(--query)"/>
+      <text x="438" y="66" text-anchor="middle" class="svg-label">query tree</text>
+      <text x="438" y="82" text-anchor="middle" class="svg-label sm">names + types</text>
+      <!-- rewrite -->
+      <line x1="490" y1="69" x2="518" y2="69" stroke="var(--ink-soft)" marker-end="url(#qp-arrow)"/>
+      <text x="504" y="40" text-anchor="middle" class="svg-label sm">rewrite</text>
+      <rect x="520" y="46" width="104" height="46" rx="6" fill="var(--query-bg)" stroke="var(--query)"/>
+      <text x="572" y="66" text-anchor="middle" class="svg-label">query tree</text>
+      <text x="572" y="82" text-anchor="middle" class="svg-label sm">views expanded</text>
+      <!-- plan -->
+      <line x1="624" y1="69" x2="652" y2="69" stroke="var(--ink-soft)" marker-end="url(#qp-arrow)"/>
+      <text x="638" y="40" text-anchor="middle" class="svg-label sm">plan</text>
+      <rect x="654" y="46" width="98" height="46" rx="6" fill="#fffdf8" stroke="var(--ink-soft)"/>
+      <text x="703" y="66" text-anchor="middle" class="svg-mono">plan</text>
+      <text x="703" y="82" text-anchor="middle" class="svg-mono">tree</text>
+      <!-- bracket: this lesson -->
+      <line x1="130" y1="112" x2="624" y2="112" stroke="var(--query)" stroke-width="1.5"/>
+      <line x1="130" y1="108" x2="130" y2="116" stroke="var(--query)" stroke-width="1.5"/>
+      <line x1="624" y1="108" x2="624" y2="116" stroke="var(--query)" stroke-width="1.5"/>
+      <text x="377" y="132" text-anchor="middle" class="svg-label" fill="var(--query)">this lesson (week 8)</text>
+      <text x="703" y="132" text-anchor="middle" class="svg-label sm">week 11</text>
+    </svg>
+    <figcaption><b>Figure 1.</b> The PostgreSQL chain. Notice the seam: everything up to the raw parse tree
+    uses only fixed syntactic rules and touches no catalog. Analysis is the first stage that needs a
+    transaction, because resolving <code>emp</code> means reading the system catalog. The optimizer (week 11)
+    takes the final query tree.</figcaption>
+  </figure>
+
+  <!-- ===== LEXING ===== -->
+  <h3>Lexing: characters become tokens</h3>
+
+  <p>The lexer (also called the scanner or tokenizer) reads the character stream and emits a stream of
+  tokens: keywords like <code>SELECT</code>, identifiers like <code>emp</code>, literals like
+  <code>75000</code> or <code>'foo'</code>, and operators and punctuation like <code>&gt;</code> and
+  <code>,</code>. Whitespace and comments are recognized and thrown away. SQLite's documentation states the
+  rule plainly: whitespace and comment tokens are discarded; all others proceed to the parser
+  [<a href="https://www.sqlite.org/howitworks.html">SQLite: how it works</a>].</p>
+
+  <p>A lexer is a finite automaton. Each token class is a regular expression, the union of those regexes
+  compiles to a deterministic finite automaton, and that DFA runs in time linear in the input length with a
+  constant amount of work per character. PostgreSQL generates this DFA as C code from a flex file
+  (<code>scan.l</code>); SQLite hand-writes it in <code>tokenize.c</code>. Either way it is the cheapest
+  stage in the pipeline.</p>
+
+  <div class="callout why">
+    <div class="callout-title">Why keyword versus identifier is not obvious</div>
+    <p>SQL has hundreds of keywords. If every keyword were reserved, a user could never name a column
+    <code>name</code> or <code>value</code> or <code>level</code>. So the lexer cannot simply decide once and
+    for all that a word is a keyword. SQLite's Lemon grammar uses fallback tokens: a word first tried as a
+    keyword can fall back to being an identifier when the grammar context demands it
+    [<a href="https://www.sqlite.org/lemon.html">SQLite: Lemon</a>]. This keeps the reserved-word set
+    smaller than the keyword set, which is why <code>SELECT name FROM emp</code> works even though some
+    engines treat <code>name</code> as a soft keyword elsewhere.</p>
+  </div>
+
+  <!-- ===== PARSING ===== -->
+  <h3>Parsing: tokens become a tree</h3>
+
+  <p>The parser consumes the token stream and, guided by a context-free grammar, builds a tree that captures
+  the syntactic structure: this run of tokens is the target list, this is the FROM list, this is the WHERE
+  expression. There are two dominant strategies, and the exam loves the contrast.</p>
+
+  <p><b>Recursive descent (top-down, LL).</b> One function per grammar nonterminal, and the call stack
+  mirrors the parse tree. It is usually hand-written, easy to read, and easy to attach good error messages
+  to. Its classic weakness is left recursion. A rule like <code>expr := expr '+' term</code> makes the
+  <code>expr</code> function call itself with no token consumed, so it loops forever. Left recursion must be
+  rewritten into iteration or right recursion before a descent parser can handle it.</p>
+
+  <p><b>Table-driven bottom-up (LR, in practice LALR(1)).</b> A generator such as bison, yacc, or SQLite's
+  Lemon computes parse tables from the grammar. The parser then runs a shift-reduce loop: it shifts tokens
+  onto a stack, and when the top of the stack matches the right-hand side of a grammar rule, it reduces that
+  run to the rule's nonterminal. LALR(1) accepts a larger grammar class than LL, handles left recursion
+  natively, and still runs in linear time over the tokens. The cost is debuggability: grammar conflicts show
+  up in terms of the generated automaton, not your source.</p>
+
+  <p>Whichever strategy is used, parsing is a fixed-rules operation. PostgreSQL is explicit:
+  "The parser stage creates a parse tree using only fixed rules about the syntactic structure of SQL. It
+  does not make any lookups in the system catalogs"
+  [<a href="https://www.postgresql.org/docs/current/parser-stage.html">PG: The Parser Stage</a>]. The output
+  is a raw parse tree, also called an abstract syntax tree. At this point names are still strings and nothing
+  has been checked against the database.</p>
+
+  <div class="callout gotcha">
+    <div class="callout-title">Exam trap</div>
+    <p>Two directions get swapped constantly. Recursive descent is top-down and LL. LALR and LR are bottom-up
+    and shift-reduce. And "recursive descent handles left recursion" is false: it is exactly what breaks a
+    descent parser. If an option pairs "top-down" with "shift-reduce", or claims an LL parser eats left
+    recursion directly, that is the wrong answer.</p>
+  </div>
+
+  <!-- ===== SIMULATOR ===== -->
+  <h2>Watch a string become a tree</h2>
+
+  <p>The simulator below is the heart of this lesson. Pick one of three example statements. Pane one shows
+  the token chips the lexer produces, with whitespace dropped. Pane two animates the parse, and you can flip
+  between the LL recursive-descent call stack and the LR shift-reduce stack to feel why left recursion behaves
+  differently. Pane three shows the bound query tree against a tiny catalog: names resolve or turn red, and
+  the type of <code>salary</code> drives which multiply operator a bonus expression picks. Flip the privilege
+  toggle to see the exact step where a syntactically perfect query is rejected for a semantic reason.</p>
+
+  <figure class="sim" id="qp-sim">
+    <div class="sim-head">
+      <span class="sim-title">Lexer · parser · binder tracer</span>
+      <span class="sim-sub">step to advance, toggle the parser view and the catalog</span>
+    </div>
+    <div class="sim-body">
+      <div class="sim-controls" id="qp-pickbar"></div>
+      <div class="sim-stage" id="qp-tokens" style="min-height:48px"></div>
+      <div class="sim-controls" id="qp-toggles"></div>
+      <div class="sim-stage"><svg id="qp-svg" viewBox="0 0 480 230" width="100%"></svg></div>
+      <div class="sim-controls" id="qp-controls"></div>
+      <div class="sim-readout" id="qp-readout"></div>
+    </div>
+    <figcaption class="muted">Experiment: set <code>salary</code> to money and watch the
+    bonus expression bind to the money multiply, then revoke SELECT on <code>emp</code> and step until the bind
+    fails. The failure lands in the binder, never in the lexer or parser.</figcaption>
+  </figure>
+
+  <script>
+  // ===== Week 8: lexer / parser / binder tracer =====
+  (function () {
+    const tokensBox = document.getElementById("qp-tokens");
+    const svg       = document.getElementById("qp-svg");
+    const readout   = document.getElementById("qp-readout");
+    const pickbar   = document.getElementById("qp-pickbar");
+    const toggles   = document.getElementById("qp-toggles");
+
+    // ---- toy catalog (mutable) ----
+    const catalog = {
+      emp:  { schema: "public", cols: { name: "text", salary: "int", dept_id: "int" }, canSelect: true },
+      dept: { schema: "public", cols: { dept_id: "int", title: "text" }, canSelect: true }
+    };
+    let salaryType = "int";   // flipped by the type toggle
+    let empGranted = true;    // flipped by the privilege toggle
+
+    // ---- three example statements, each a hand-tokenized phase list ----
+    // Each token: {t: class, v: text}. classes: kw, id, num, op, punc, str
+    const EXAMPLES = {
+      basic: {
+        label: "SELECT name FROM emp WHERE salary > 75000",
+        tokens: [
+          {t:"kw",v:"SELECT"},{t:"id",v:"name"},{t:"kw",v:"FROM"},{t:"id",v:"emp"},
+          {t:"kw",v:"WHERE"},{t:"id",v:"salary"},{t:"op",v:">"},{t:"num",v:"75000"}
+        ],
+        refs: [ {kind:"col", name:"name", table:"emp"},
+                {kind:"col", name:"salary", table:"emp"} ],
+        bonus: false, badCol: false
+      },
+      bonus: {
+        label: "SELECT name, salary * 1.15 FROM emp WHERE salary > 75000",
+        tokens: [
+          {t:"kw",v:"SELECT"},{t:"id",v:"name"},{t:"punc",v:","},{t:"id",v:"salary"},
+          {t:"op",v:"*"},{t:"num",v:"1.15"},{t:"kw",v:"FROM"},{t:"id",v:"emp"},
+          {t:"kw",v:"WHERE"},{t:"id",v:"salary"},{t:"op",v:">"},{t:"num",v:"75000"}
+        ],
+        refs: [ {kind:"col", name:"name", table:"emp"},
+                {kind:"col", name:"salary", table:"emp"} ],
+        bonus: true, badCol: false
+      },
+      typo: {
+        label: "SELECT naem FROM emp WHERE salary > 75000",
+        tokens: [
+          {t:"kw",v:"SELECT"},{t:"id",v:"naem"},{t:"kw",v:"FROM"},{t:"id",v:"emp"},
+          {t:"kw",v:"WHERE"},{t:"id",v:"salary"},{t:"op",v:">"},{t:"num",v:"75000"}
+        ],
+        refs: [ {kind:"col", name:"naem", table:"emp"},
+                {kind:"col", name:"salary", table:"emp"} ],
+        bonus: false, badCol: true
+      }
+    };
+    let currentKey = "basic";
+    let parserView = "LR";   // "LL" or "LR"
+
+    const TOK_COLORS = {
+      kw:  ["var(--query)", "#fff"],
+      id:  ["var(--index-bg)", "var(--ink)"],
+      num: ["#fbe7c6", "var(--ink)"],
+      str: ["#fbe7c6", "var(--ink)"],
+      op:  ["#e9e4da", "var(--ink)"],
+      punc:["#e9e4da", "var(--ink-soft)"]
+    };
+    const TOK_NAME = { kw:"keyword", id:"identifier", num:"literal", str:"literal", op:"operator", punc:"punct" };
+
+    function renderTokens() {
+      tokensBox.innerHTML = "";
+      const wrap = DBMS.el("div", { class: "row", style: "display:flex;flex-wrap:wrap;gap:.4rem;align-items:center" });
+      EXAMPLES[currentKey].tokens.forEach(function (tk) {
+        const c = TOK_COLORS[tk.t];
+        wrap.appendChild(DBMS.el("span", {
+          title: TOK_NAME[tk.t],
+          style: "font-family:var(--mono);font-size:.82rem;padding:.18rem .5rem;border-radius:5px;"
+               + "background:" + c[0] + ";color:" + c[1] + ";border:1px solid var(--rule)"
+        }, tk.v));
+      });
+      tokensBox.appendChild(wrap);
+    }
+
+    // ---- the parse "stages" we step through ----
+    // 0 lex, 1 parse, 2 build raw tree, 3 bind names+types, 4 logical plan
+    const STAGES = ["lex", "parse", "raw tree", "bind", "logical plan"];
+
+    // Phase-2 parse animation content depends on parserView.
+    function parseRows() {
+      if (parserView === "LL") {
+        return [
+          "call SelectStmt()",
+          "  call TargetList()  -> name",
+          "  call FromClause()  -> emp",
+          "  call WhereClause()",
+          "    call Expr()  (right-recursive, no loop)",
+          "  return SelectStmt"
+        ];
+      }
+      return [
+        "shift  SELECT",
+        "shift  name        reduce -> target",
+        "shift  FROM emp    reduce -> from_item",
+        "shift  salary > 75000",
+        "reduce -> a_expr (left-recursive, fine in LR)",
+        "reduce -> SelectStmt"
+      ];
+    }
+
+    function bindStatus() {
+      // returns {ok, msg, badCols:[name...], mulType}
+      const ex = EXAMPLES[currentKey];
+      const badCols = [];
+      ex.refs.forEach(function (r) {
+        if (r.kind === "col" && !(r.name in catalog[r.table].cols)) badCols.push(r.name);
+      });
+      if (!empGranted) return { ok:false, stage:"authorization", msg:"permission denied for table emp", badCols:[], mulType:null };
+      if (badCols.length) return { ok:false, stage:"name resolution", msg:'no such column: "' + badCols[0] + '"', badCols:badCols, mulType:null };
+      const mulType = ex.bonus ? (salaryType === "money" ? "money_mul_float" : (salaryType === "float" ? "float8_mul" : "int4_mul_float")) : null;
+      return { ok:true, stage:"bound", msg:"query tree built", badCols:[], mulType:mulType };
+    }
+
+    function txt(x, y, s, cls, fill) {
+      return DBMS.svg("text", { x:x, y:y, "text-anchor":"middle", class: cls || "svg-mono", fill: fill || null }, s);
+    }
+    function box(x, y, w, h, fill, stroke, dash) {
+      return DBMS.svg("rect", { x:x, y:y, width:w, height:h, rx:5, fill:fill, stroke:stroke, "stroke-dasharray": dash || "0" });
+    }
+    function line(x1,y1,x2,y2) {
+      return DBMS.svg("line", { x1:x1,y1:y1,x2:x2,y2:y2, stroke:"var(--ink-soft)" });
+    }
+
+    function render(step) {
+      svg.innerHTML = "";
+      const ex = EXAMPLES[currentKey];
+      const bs = bindStatus();
+
+      if (step <= 0) {
+        // lex view: just point back at the chips
+        svg.appendChild(txt(240, 60, "Lexer emitted " + ex.tokens.length + " tokens (above).", "svg-label"));
+        svg.appendChild(txt(240, 84, "Whitespace and comments were discarded.", "svg-label sm"));
+        svg.appendChild(txt(240, 120, "A DFA, O(n) over the characters. No catalog touched.", "svg-label sm"));
+        readout.textContent = "stage 1/5: lex. Token classes recognized; nothing checked against the database yet.";
+        return;
+      }
+
+      if (step === 1) {
+        // parse animation
+        const rows = parseRows();
+        svg.appendChild(txt(240, 22, parserView === "LL" ? "LL recursive-descent call stack" : "LR shift-reduce stack", "svg-label", "var(--query)"));
+        rows.forEach(function (r, i) {
+          const y = 44 + i * 28;
+          svg.appendChild(box(20, y - 16, 440, 22, "#fffdf8", "var(--rule)"));
+          svg.appendChild(DBMS.svg("text", { x:30, y:y, class:"svg-mono", "text-anchor":"start" }, r));
+        });
+        readout.textContent = parserView === "LL"
+          ? "stage 2/5: parse (LL). One function per rule. A left-recursive expr := expr + term would call itself with no token consumed and loop; the grammar must be refactored to right recursion."
+          : "stage 2/5: parse (LR). Shift tokens, reduce when a rule's right side matches. Left recursion reduces cleanly, no refactor needed.";
+        return;
+      }
+
+      if (step === 2) {
+        // raw parse tree: names are strings, no types
+        drawTree(false, bs);
+        readout.textContent = "stage 3/5: raw parse tree. Structure recovered. Names are still plain strings, types unknown, nothing verified against the catalog.";
+        return;
+      }
+
+      if (step === 3) {
+        // bind
+        drawTree(true, bs);
+        if (!bs.ok) {
+          readout.textContent = "stage 4/5: bind FAILED at " + bs.stage + ": " + bs.msg
+            + ". The string was syntactically valid; this is a semantic error, caught only here.";
+        } else {
+          readout.textContent = "stage 4/5: bind ok. emp -> public.emp, columns resolved, types attached"
+            + (bs.mulType ? (". 'salary * 1.15' bound to " + bs.mulType + " because salary is " + salaryType + ".") : ".");
+        }
+        return;
+      }
+
+      // step 4: logical plan
+      if (!bs.ok) {
+        svg.appendChild(txt(240, 90, "No logical plan: binding failed.", "svg-label", "var(--query)"));
+        svg.appendChild(txt(240, 116, bs.stage + ": " + bs.msg, "svg-label sm"));
+        readout.textContent = "stage 5/5: no plan produced. A query that fails binding never reaches the optimizer.";
+        return;
+      }
+      drawPlan(ex);
+      readout.textContent = "stage 5/5: logical plan. projection over selection over scan(emp), plus a sort for ORDER BY. This says WHAT, not HOW. The optimizer (week 11) picks the access path and algorithms.";
+    }
+
+    function drawTree(bound, bs) {
+      const ex = EXAMPLES[currentKey];
+      // root SELECT
+      svg.appendChild(box(190, 8, 100, 30, "var(--query-bg)", "var(--query)"));
+      svg.appendChild(txt(240, 28, "SelectStmt"));
+      // target list node
+      svg.appendChild(line(240, 38, 110, 70));
+      svg.appendChild(line(240, 38, 240, 70));
+      svg.appendChild(line(240, 38, 380, 70));
+      // target
+      const nameBad = bound && bs.badCols.indexOf("naem") >= 0;
+      svg.appendChild(box(55, 70, 110, 34, nameBad ? "#f7dada" : "#fffdf8", nameBad ? "#b0392f" : "var(--rule)"));
+      svg.appendChild(txt(110, 86, ex.refs[0].name));
+      svg.appendChild(txt(110, 99, bound ? (nameBad ? "UNRESOLVED" : "emp.name : text") : "target", "svg-label sm",
+        nameBad ? "#b0392f" : "var(--ink-soft)"));
+      // from
+      svg.appendChild(box(185, 70, 110, 34, "#fffdf8", "var(--rule)"));
+      svg.appendChild(txt(240, 86, "FROM emp"));
+      svg.appendChild(txt(240, 99, bound ? "public.emp" : "rel-ref", "svg-label sm", "var(--ink-soft)"));
+      // where
+      svg.appendChild(box(325, 70, 120, 34, "#fffdf8", "var(--rule)"));
+      svg.appendChild(txt(385, 86, "WHERE >"));
+      svg.appendChild(txt(385, 99, bound ? "salary:" + salaryType + " > 75000" : "expr", "svg-label sm", "var(--ink-soft)"));
+
+      // bonus expr branch if present
+      if (ex.bonus) {
+        svg.appendChild(line(110, 104, 110, 130));
+        svg.appendChild(box(40, 130, 140, 40, "#fffdf8", "var(--rule)"));
+        svg.appendChild(txt(110, 148, "salary * 1.15"));
+        svg.appendChild(txt(110, 162, bound ? (bs.mulType || "?") : "FuncCall/op", "svg-label sm", "var(--query)"));
+      }
+
+      if (bound && !bs.ok && bs.stage === "authorization") {
+        svg.appendChild(box(120, 185, 240, 32, "#f7dada", "#b0392f"));
+        svg.appendChild(txt(240, 205, "AUTH: " + bs.msg, "svg-label", "#b0392f"));
+      }
+    }
+
+    function drawPlan(ex) {
+      // sort -> projection -> selection -> scan, stacked
+      const nodes = [
+        ["Sort (name)", "ORDER BY name"],
+        ["Projection", ex.bonus ? "name, salary*1.15" : "name"],
+        ["Selection", "salary > 75000"],
+        ["Scan", "emp"]
+      ];
+      nodes.forEach(function (n, i) {
+        const y = 14 + i * 52;
+        svg.appendChild(box(150, y, 180, 38, i === 3 ? "#fffdf8" : "var(--query-bg)", i === 3 ? "var(--ink-soft)" : "var(--query)"));
+        svg.appendChild(txt(240, y + 17, n[0], "svg-label", i === 3 ? "var(--ink)" : "var(--query)"));
+        svg.appendChild(txt(240, y + 31, n[1], "svg-label sm"));
+        if (i < 3) svg.appendChild(DBMS.svg("line", { x1:240, y1:y+38, x2:240, y2:y+52, stroke:"var(--ink-soft)" }));
+      });
+    }
+
+    // ---- controls ----
+    function buildPickbar() {
+      pickbar.innerHTML = "";
+      Object.keys(EXAMPLES).forEach(function (k) {
+        const b = DBMS.el("button", {
+          class: k === currentKey ? "" : "ghost",
+          text: EXAMPLES[k].label,
+          onclick: function () { currentKey = k; buildPickbar(); renderTokens(); stepper.goto(0); }
+        });
+        pickbar.appendChild(b);
+      });
+    }
+    function buildToggles() {
+      toggles.innerHTML = "";
+      toggles.appendChild(DBMS.el("button", {
+        class: "ghost",
+        text: "parser view: " + parserView,
+        onclick: function () { parserView = parserView === "LR" ? "LL" : "LR"; buildToggles(); stepper.goto(stepper.index); }
+      }));
+      toggles.appendChild(DBMS.el("button", {
+        class: "ghost",
+        text: "salary type: " + salaryType,
+        onclick: function () {
+          salaryType = salaryType === "int" ? "float" : (salaryType === "float" ? "money" : "int");
+          catalog.emp.cols.salary = salaryType;
+          buildToggles(); stepper.goto(stepper.index);
+        }
+      }));
+      toggles.appendChild(DBMS.el("button", {
+        class: "ghost",
+        text: empGranted ? "SELECT on emp: granted" : "SELECT on emp: REVOKED",
+        onclick: function () {
+          empGranted = !empGranted; catalog.emp.canSelect = empGranted;
+          buildToggles(); stepper.goto(stepper.index);
+        }
+      }));
+    }
+
+    buildPickbar();
+    buildToggles();
+    renderTokens();
+
+    const stepper = DBMS.stepper({
+      controls: document.getElementById("qp-controls"),
+      steps: STAGES.length - 1,
+      onRender: render,
+      labels: { step: "Next stage", back: "Back", reset: "Restart", play: "Play" },
+      autoMs: 1300
+    });
+  })();
+  </script>
+
+  <!-- ===== BINDING ===== -->
+  <h3>Binding: where meaning enters</h3>
+
+  <p>Binding (PostgreSQL calls it analysis or transformation; many courses call the component the binder)
+  walks the raw tree and produces a validated, typed query tree. The survey lists four jobs: confirm the
+  query is correctly specified, resolve names and references, convert it into the optimizer's internal
+  format, and verify the user is authorized
+  [<a href="https://dsf.berkeley.edu/papers/fntdb07-architecture.pdf">Architecture of a DB System, sec. 4.1</a>].
+  Concretely:</p>
+
+  <ol class="steps">
+    <li>Canonicalize table names. Each FROM reference is expanded to a fully qualified name, in the survey's
+    four-part form <code>server.database.schema.table</code>, reduced to <code>schema.table</code> in simpler
+    systems. Aliases and search-path defaults are resolved here, so <code>emp</code> becomes
+    <code>public.emp</code>.</li>
+    <li>Check existence. The analyzer calls the catalog manager to confirm each table is registered and caches
+    its metadata, then checks that every column reference is a real column of an in-scope table. A typo like
+    <code>naem</code> dies here, not in the parser.</li>
+    <li>Type-check and resolve overloads. Column types drive which operator and function implementations get
+    used. In <code>(EMP.salary * 1.15) &lt; 75000</code> the actual multiply and the assumed type of
+    <code>1.15</code> depend on whether <code>salary</code> is integer, float, or money. PostgreSQL shows the
+    same mechanism: a <code>FuncCall</code> node "might be transformed to either a FuncExpr or Aggref node
+    depending on whether the referenced name turns out to be an ordinary function or an aggregate function"
+    [<a href="https://www.postgresql.org/docs/current/parser-stage.html">PG: The Parser Stage</a>].</li>
+    <li>Run structural semantic checks: consistent tuple variables, union-compatibility of set operations,
+    legal aggregate usage, correct subquery nesting.</li>
+    <li>Authorize. Confirm the user holds the needed privilege on each object. Some checks (row-level
+    security) are deferred to execution because they depend on data values.</li>
+  </ol>
+
+  <p>The output is the query tree. PostgreSQL: it "is structurally similar to the raw parse tree in most
+  places, but it has many differences in detail," with types attached
+  [<a href="https://www.postgresql.org/docs/current/parser-stage.html">PG: The Parser Stage</a>]. Note what
+  binding does <em>not</em> read: it never reads table data. It reads only the query and the catalog.
+  Counting how many rows pass <code>salary &gt; 75000</code> is selectivity estimation, which belongs to the
+  cost-based optimizer in week 11, not here.</p>
+
+  <div class="callout keyidea">
+    <div class="callout-title">Keep this one thing</div>
+    <p>The parser checks shape, the binder checks meaning. "Table does not exist," "no such column,"
+    "wrong type," and "permission denied" are all binder errors, not parser errors. The seam exists because
+    catalog lookups need a transaction and pure syntax checking does not.</p>
+  </div>
+
+  <!-- ===== REWRITE ===== -->
+  <h3>Rewrite: normalize without changing meaning</h3>
+
+  <p>The rewriter simplifies and normalizes the query <em>without changing what it returns</em>. It can rely
+  only on the query and on catalog metadata, and cannot read table data
+  [<a href="https://dsf.berkeley.edu/papers/fntdb07-architecture.pdf">Architecture, sec. 4.2</a>]. Its main
+  jobs are view expansion (splice a view's definition into the query, recursively, until no views remain;
+  PostgreSQL calls this the rewrite system's most important use, the realization of views), constant folding
+  (<code>10+2+R.y</code> becomes <code>12+R.y</code>), predicate rewriting
+  (<code>NOT salary &gt; 1000000</code> becomes <code>salary &lt;= 1000000</code> so it matches an index; a
+  contradiction like <code>salary &lt; 75000 AND salary &gt; 1000000</code> collapses to FALSE), semantic
+  optimization using integrity constraints (redundant-join elimination), and subquery flattening.</p>
+
+  <p>Rewrite is a logical step, not always a separate module. DB2 has a stand-alone rewriter; SQL Server
+  folds it into an early phase of the optimizer. The boundary is conceptual.</p>
+
+  <div class="callout gotcha">
+    <div class="callout-title">Exam trap</div>
+    <p>"Query rewrite reads table data to simplify the query" is false. Rewrite uses only the query and the
+    catalog. Reading data and estimating costs is the optimizer's job. Equally false: "view expansion happens
+    in the optimizer." View expansion is driven by catalog view definitions and runs before cost-based
+    optimization.</p>
+  </div>
+
+  <!-- ===== LOGICAL PLAN ===== -->
+  <h2>From query tree to logical plan</h2>
+
+  <p>The validated, rewritten query tree is translated into a logical plan: a tree of relational-algebra
+  operators. As CMU puts it, the logical plan is roughly the relational algebra expression for the query
+  [<a href="https://15445.courses.cs.cmu.edu/fall2024/notes/15-optimization.pdf">CMU 15-445 L15</a>]. The
+  operators are the algebra primitives: selection (filter), projection (column list), cross product and join,
+  grouping and aggregation, set operations, sort, and limit. Our running query maps to
+  projection(name) over selection(salary &gt; 75000) over scan(emp), with a sort on top for the ORDER BY.</p>
+
+  <p>The logical plan says only what relation to produce. It does not say how to scan <code>emp</code>
+  (sequential or index), which join algorithm to use, or in what order to join. That is the physical plan's
+  job, and choosing among physical options is the optimizer's job in week 11.</p>
+
+  <!-- ===== FIGURE 2: logical to physical fan-out ===== -->
+  <figure class="diagram">
+    <svg viewBox="0 0 560 250" role="img" aria-label="One logical plan expands to many physical operator choices">
+      <defs>
+        <marker id="qp-arrow2" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+          <path d="M0,0 L6,3 L0,6 Z" fill="var(--ink-soft)"/>
+        </marker>
+      </defs>
+      <!-- logical column -->
+      <text x="110" y="20" text-anchor="middle" class="svg-label" fill="var(--query)">logical (what)</text>
+      <rect x="40" y="32" width="140" height="34" rx="5" fill="var(--query-bg)" stroke="var(--query)"/>
+      <text x="110" y="53" text-anchor="middle" class="svg-label">Projection(name)</text>
+      <line x1="110" y1="66" x2="110" y2="86" stroke="var(--ink-soft)"/>
+      <rect x="40" y="86" width="140" height="34" rx="5" fill="var(--query-bg)" stroke="var(--query)"/>
+      <text x="110" y="107" text-anchor="middle" class="svg-label">Selection(sal&gt;75k)</text>
+      <line x1="110" y1="120" x2="110" y2="140" stroke="var(--ink-soft)"/>
+      <rect x="40" y="140" width="140" height="34" rx="5" fill="var(--query-bg)" stroke="var(--query)"/>
+      <text x="110" y="161" text-anchor="middle" class="svg-label">Scan(emp)</text>
+
+      <!-- physical column -->
+      <text x="420" y="20" text-anchor="middle" class="svg-label" fill="var(--ink)">physical (how)</text>
+      <!-- selection options -->
+      <line x1="180" y1="103" x2="300" y2="60" stroke="var(--ink-soft)" marker-end="url(#qp-arrow2)"/>
+      <line x1="180" y1="103" x2="300" y2="103" stroke="var(--ink-soft)" marker-end="url(#qp-arrow2)"/>
+      <rect x="302" y="44" width="220" height="30" rx="5" fill="#fffdf8" stroke="var(--rule)"/>
+      <text x="412" y="63" text-anchor="middle" class="svg-label sm">Filter pushed into the scan</text>
+      <rect x="302" y="88" width="220" height="30" rx="5" fill="#fffdf8" stroke="var(--rule)"/>
+      <text x="412" y="107" text-anchor="middle" class="svg-label sm">Filter as a separate operator</text>
+      <!-- scan options -->
+      <line x1="180" y1="157" x2="300" y2="145" stroke="var(--ink-soft)" marker-end="url(#qp-arrow2)"/>
+      <line x1="180" y1="157" x2="300" y2="190" stroke="var(--ink-soft)" marker-end="url(#qp-arrow2)"/>
+      <rect x="302" y="132" width="220" height="30" rx="5" fill="#fffdf8" stroke="var(--rule)"/>
+      <text x="412" y="151" text-anchor="middle" class="svg-label sm">Sequential scan of emp</text>
+      <rect x="302" y="176" width="220" height="30" rx="5" fill="#fffdf8" stroke="var(--rule)"/>
+      <text x="412" y="195" text-anchor="middle" class="svg-label sm">Index scan on salary (B+tree)</text>
+
+      <text x="280" y="238" text-anchor="middle" class="svg-label sm">one logical node, several physical operators: no one-to-one mapping</text>
+    </svg>
+    <figcaption><b>Figure 2.</b> The logical-to-physical boundary. One logical scan can become a sequential
+    scan or an index scan on <code>salary</code>; the selection can fold into the scan or stand alone. CMU
+    states it outright: there does not always exist a one-to-one mapping from logical to physical plans. The
+    optimizer searches these physical choices and picks the cheapest.</figcaption>
+  </figure>
+
+  <table>
+    <caption>The four artifacts at the front of the pipeline, and what each knows.</caption>
+    <thead><tr><th>Artifact</th><th>Produced by</th><th>Knows</th><th>Does not know</th></tr></thead>
+    <tbody>
+      <tr><td>Token stream</td><td>Lexer</td><td>token classes</td><td>structure, names, types</td></tr>
+      <tr><td>Raw parse tree</td><td>Parser</td><td>syntactic structure</td><td>whether names exist, types</td></tr>
+      <tr><td>Query tree</td><td>Binder</td><td>names, types, privileges</td><td>row counts, costs</td></tr>
+      <tr><td>Logical plan</td><td>Translate / rewrite</td><td>algebra shape (what)</td><td>algorithms, access paths (how)</td></tr>
+    </tbody>
+  </table>
+
+  <!-- ===== REAL SYSTEMS ===== -->
+  <div class="callout realworld">
+    <div class="callout-title">In real systems</div>
+    <p>PostgreSQL keeps explicit, separately named tree stages: string to flex tokens to bison raw parse tree
+    to analyzed query tree to rewritten query tree to plan tree, then a tree-walking iterator executor
+    [<a href="https://www.postgresql.org/docs/current/query-path.html">PG: The Path of a Query</a>]. SQLite
+    collapses analysis through code generation into one pass and compiles the AST straight to VDBE bytecode
+    for a register virtual machine; <code>EXPLAIN</code> prints that bytecode
+    [<a href="https://www.sqlite.org/howitworks.html">SQLite: how it works</a>]. SQLite also uses Lemon
+    rather than yacc, where the tokenizer calls the parser, which makes it reentrant and threadsafe
+    [<a href="https://www.sqlite.org/lemon.html">SQLite: Lemon</a>]. Different middles, identical front:
+    both start with a tokenizer, then a grammar-driven parser, then an AST.</p>
+  </div>
+
+  <!-- ===== DEEP DIVE ===== -->
+  <details class="deepdive">
+    <summary>Deeper: why Lemon inverts the call direction</summary>
+    <div>
+      <p>In yacc the parser calls the tokenizer to pull the next token, and yacc keeps parser state in global
+      variables, so it is neither reentrant nor threadsafe. In Lemon the tokenizer calls the parser, feeding
+      it one token at a time, so all state is passed explicitly and the parser is reentrant. SQLite needs this
+      because it parses recursively: handling <code>CREATE TABLE</code> invokes the parser again to generate
+      the <code>INSERT</code> into the <code>sqlite_schema</code> table
+      [<a href="https://www.sqlite.org/lemon.html">SQLite: Lemon</a>]. Lemon also has nonterminal destructors
+      to reclaim memory on a syntax error, and fallback tokens for keyword/identifier collisions.</p>
+    </div>
+  </details>
+
+  <!-- ===== CODE ===== -->
+  <pre><code><span class="tok-com"># the front of the pipeline, as four stages with a hard seam</span>
+<span class="tok-kw">def</span> <span class="tok-fn">front_of_pipeline</span>(sql_text):
+    tokens   = lex(sql_text)              <span class="tok-com"># DFA, O(n), no catalog</span>
+    raw_tree = parse(tokens)              <span class="tok-com"># grammar only, no catalog</span>
+    <span class="tok-com"># ---- seam: everything below needs a transaction ----</span>
+    qtree    = bind(raw_tree, catalog)    <span class="tok-com"># resolve names, types, authorize</span>
+    qtree    = rewrite(qtree, catalog)    <span class="tok-com"># views, folding; never reads data</span>
+    <span class="tok-kw">return</span> to_logical_plan(qtree)         <span class="tok-com"># algebra: WHAT, not HOW</span></code></pre>
+
+  <!-- ===== MCQs ===== -->
+  <h2>Check yourself</h2>
+
+  <div class="mcq" data-answer="2">
+    <p class="mcq-q">Which statement is false?</p>
+    <button class="mcq-opt">The lexer discards whitespace and comments before tokens reach the parser.</button>
+    <button class="mcq-opt">The parser builds a tree using only fixed syntactic rules of SQL.</button>
+    <button class="mcq-opt">The parser confirms that the referenced tables and columns actually exist.</button>
+    <button class="mcq-opt">The binder resolves names and attaches data types to the query tree.</button>
+    <p class="mcq-explain">Existence and name resolution are binding, not parsing. The pure parser makes no
+    catalog lookups; PostgreSQL says the parse stage "does not make any lookups in the system catalogs."
+    The trap conflates parsing (shape) with binding (meaning).</p>
+  </div>
+
+  <div class="mcq" data-answer="1">
+    <p class="mcq-q">Which statement about parsing strategies is false?</p>
+    <button class="mcq-opt">Recursive descent is top-down and is usually written one function per rule.</button>
+    <button class="mcq-opt">Recursive descent parsers handle left-recursive grammar rules directly.</button>
+    <button class="mcq-opt">LALR parsers are bottom-up and run a shift-reduce loop over a stack.</button>
+    <button class="mcq-opt">LALR accepts a larger grammar class than LL and handles left recursion.</button>
+    <p class="mcq-explain">Left recursion is exactly what breaks recursive descent: a rule like
+    <code>expr := expr + term</code> calls itself with no token consumed and loops forever, so the grammar
+    must be refactored. LR/LALR handle left recursion natively.</p>
+  </div>
+
+  <div class="mcq" data-answer="3">
+    <p class="mcq-q">Which statement about logical and physical plans is false?</p>
+    <button class="mcq-opt">A logical plan is a relational-algebra tree describing what to compute.</button>
+    <button class="mcq-opt">A physical plan binds each operator to an algorithm and access path.</button>
+    <button class="mcq-opt">There is no one-to-one mapping from logical to physical plans.</button>
+    <button class="mcq-opt">A logical plan specifies the join algorithm and the access method.</button>
+    <p class="mcq-explain">Join algorithm and access method are physical decisions. A logical plan says join,
+    not hash-join; scan, not index-scan. One logical join can become nested-loop, hash, or merge; one logical
+    scan can become a sequential or several index scans.</p>
+  </div>
+
+  <div class="mcq" data-answer="0">
+    <p class="mcq-q">Which statement about query rewrite is false?</p>
+    <button class="mcq-opt">Rewrite reads table data to decide how to simplify the query.</button>
+    <button class="mcq-opt">Rewrite expands views by splicing in their definitions recursively.</button>
+    <button class="mcq-opt">Rewrite can fold a contradictory predicate to FALSE using only the query.</button>
+    <button class="mcq-opt">Rewrite must preserve the query's result set; it changes form, not meaning.</button>
+    <p class="mcq-explain">Rewrite uses only the query and the catalog, never table data. Reading data and
+    estimating cost is the cost-based optimizer's job, a later stage. View expansion and predicate folding
+    both run on the query and catalog alone.</p>
+  </div>
+
+  <div class="mcq" data-answer="2">
+    <p class="mcq-q">PostgreSQL separates raw parsing from analysis. Why?</p>
+    <button class="mcq-opt">Because the lexer and the parser are written in two different languages.</button>
+    <button class="mcq-opt">Because analysis runs on a different machine from parsing for speed.</button>
+    <button class="mcq-opt">Because catalog lookups need a transaction and pure parsing does not.</button>
+    <button class="mcq-opt">Because the optimizer requires the raw parse tree as its direct input.</button>
+    <p class="mcq-explain">The seam is drawn so that pure syntactic parsing, which needs no transaction, is
+    separated from analysis, which calls the catalog and therefore must run inside a transaction. The
+    optimizer takes the rewritten query tree, not the raw parse tree.</p>
+  </div>
+
+  <div class="mcq" data-answer="3">
+    <p class="mcq-q">In <code>(EMP.salary * 1.15) &lt; 75000</code>, what determines which multiply operator is chosen?</p>
+    <button class="mcq-opt">The order the tokens appear in the original SQL text string.</button>
+    <button class="mcq-opt">The number of rows in EMP that satisfy the comparison predicate.</button>
+    <button class="mcq-opt">Whether the optimizer chooses a sequential scan or an index scan.</button>
+    <button class="mcq-opt">The declared data type of EMP.salary: integer, float, or money.</button>
+    <p class="mcq-explain">Overload resolution during binding uses the column's type to pick the operator and
+    to type the literal. Row counts are selectivity (optimizer), and the scan choice is physical planning;
+    neither selects the multiply operator.</p>
+  </div>
+
+  <!-- ===== FLASHCARDS ===== -->
+  <div class="flashcard">
+    <div class="fc-front">Where is the seam in the front of the pipeline, and why is it there?</div>
+    <div class="fc-back">Between parsing and binding. Lexing and parsing use fixed syntactic rules and need no
+    catalog and no transaction. Binding resolves names and types against the catalog, and catalog lookups can
+    only happen inside a transaction.</div>
+  </div>
+
+  <div class="flashcard">
+    <div class="fc-front">Name the four artifacts in order and the one fact each adds.</div>
+    <div class="fc-back">Token stream (classes) to raw parse tree (structure) to query tree (names + types +
+    authorization) to logical plan (relational-algebra shape, what not how).</div>
+  </div>
+
+  <!-- ===== PRIMARY SOURCE ===== -->
+  <div class="source-box">
+    <div class="src-tag">Primary source</div>
+    <div class="src-title">Read this next:
+      <a href="https://www.postgresql.org/docs/current/parser-stage.html">PostgreSQL documentation, The Parser Stage</a></div>
+    <p class="muted">Highest-trust source for this lesson: it states the rule that parsing makes no catalog
+    lookups, names flex (<code>scan.l</code>) and bison (<code>gram.y</code>), distinguishes the raw parse tree
+    from the query tree, and gives the FuncCall to FuncExpr/Aggref transformation as the worked example of
+    binding. Pair it with The Path of a Query for the five-stage overview.</p>
+  </div>
+
+  <!-- ===== ASK YOUR TEACHER ===== -->
+  <div class="ask-teacher">
+    <div class="at-tag">Ask your teacher</div>
+    <p>Want me to trace a different statement through all four stages, draw the LL versus LR stacks for a real
+    left-recursive expression grammar, or quiz you on which error each stage catches? Ask, and I will go
+    deeper or harder. I am your teacher for this course, not just a document.</p>
+  </div>
+
+  <!-- ===== NAV ===== -->
+  <nav class="lesson-nav">
+    <a class="prev" href="0007-btree-delete-hash.html">
+      <span class="nav-dir">Previous</span>
+      <span class="nav-title">Week 07 · B+tree deletion, bulk loading, composite keys, and hash indexes</span>
+    </a>
+    <a class="next" href="0009-query-execution-volcano.html">
+      <span class="nav-dir">Next</span>
+      <span class="nav-title">Week 09 · Query execution: the Volcano iterator model</span>
+    </a>
+  </nav>
+
+  </div><!-- /.col -->
+</main>
+</body>
+</html>

@@ -1,0 +1,850 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lesson 16 · Distributed databases: partitioning, replication, 2PC, CAP · Field Guide to the Database Engine</title>
+<link rel="stylesheet" href="../assets/course.css">
+<script defer src="../assets/components.js"></script>
+</head>
+<body class="layer-modern">
+<main class="page">
+
+  <!-- ===== MASTHEAD ===== -->
+  <header class="masthead col">
+    <div class="crumbs">
+      <a href="../index.html">Field Guide</a> <span>/</span>
+      <span>Part VIII · Modern and distributed</span> <span>/</span>
+      <span>Week 16</span>
+    </div>
+    <span class="week-badge">Distributed databases</span>
+    <h1>Distributed databases: partitioning, replication, 2PC, CAP</h1>
+    <p class="lede">Once data outgrows one machine and the network can drop messages, a transaction
+    has to give something up. This last lesson takes the single-node engine you built over fifteen
+    weeks and spreads it across machines, then names exactly what breaks and what you trade to fix it.</p>
+  </header>
+
+  <div class="col">
+
+  <!-- ===== OBJECTIVES ===== -->
+  <div class="objectives">
+    <h4>By the end you can</h4>
+    <ul>
+      <li>Choose hash versus range partitioning and explain why one fans out range queries and the other hotspots.</li>
+      <li>Reason about leader/follower and quorum replication, and read the W + R &gt; N overlap rule.</li>
+      <li>Walk two-phase commit, locate the in-doubt state, and explain why a coordinator crash blocks.</li>
+      <li>State the CAP theorem precisely (consistency means linearizability, not the C in ACID) and add the PACELC else-branch.</li>
+      <li>Explain how consensus (Raft, equivalent to Multi-Paxos) replicates the coordinator log so a minority can fail without blocking.</li>
+    </ul>
+  </div>
+
+  <!-- ===== WHERE THIS SITS (connective tissue) ===== -->
+  <p>Hold the two journeys of this course in mind. Journey 1 sent
+  <code>SELECT name FROM emp WHERE salary &gt; 75000 ORDER BY name</code> down the stack: parser
+  (<a href="0008-query-parsing.html">week 8</a>), optimizer (<a href="0011-query-optimization.html">week 11</a>),
+  executor (<a href="0009-query-execution-volcano.html">weeks 9</a> and <a href="0010-query-execution-joins.html">10</a>),
+  index (<a href="0006-btree-search-insert.html">weeks 6</a> and <a href="0007-btree-delete-hash.html">7</a>),
+  buffer pool (<a href="0004-buffer-pool-design.html">weeks 4</a> and <a href="0005-buffer-pool-lru-k.html">5</a>),
+  storage (<a href="0002-storage-engine-disk-pages.html">weeks 2</a> and <a href="0003-storage-engine-heap-files.html">3</a>).
+  Journey 2 sent <code>UPDATE account SET balance = balance - 100 WHERE id = 42</code> through
+  concurrency control (<a href="0013-concurrency-mvcc.html">week 13</a>) and the write-ahead log
+  (<a href="0014-logging-recovery-aries.html">week 14</a>). Every one of those layers assumed a single
+  machine. Last week (<a href="0015-modern-architectures-lsm.html">week 15</a>) we kept the single machine
+  but changed its storage shape to the log-structured merge tree.</p>
+
+  <p>This week does not add a layer below storage. It takes the whole engine and copies it onto many
+  machines connected by a network that can drop and delay messages. Three new problems appear and each
+  maps back onto something you already know. Splitting <code>emp</code> across machines is the hash
+  versus B+tree trade-off from weeks 6 and 7, now at cluster scale. Keeping copies of a partition is
+  durability (<a href="0014-logging-recovery-aries.html">week 14</a>) extended across nodes. Committing
+  the <code>UPDATE</code> when <code>account</code> rows for two transfers live on two machines is
+  atomicity (<a href="0012-transactions-isolation.html">week 12</a>) extended across nodes, and that is
+  where the network can hurt you. The layer above hands in a transaction or a query; this layer decides
+  which machines hold the rows, how many copies agree before a write returns, and what answer a read
+  gets when the network splits the cluster in two.</p>
+
+  <div class="callout intuition">
+    <div class="callout-title">Intuition</div>
+    <p>On one machine, "did the write happen" has a yes or no answer the moment fsync returns. Across
+    machines, the question becomes "did enough of them agree, and can they still talk to each other."
+    A dropped message turns a local fact into a negotiation. Distributed databases are mostly about what
+    you do when that negotiation cannot finish in time.</p>
+  </div>
+
+  <!-- ===== PARTITIONING ===== -->
+  <h2>Partitioning: split the rows by hash or by range</h2>
+
+  <p>One node has finite disk, finite memory, and one failure domain. When the table or the request
+  rate exceeds it, you split the rows across machines. This is horizontal partitioning, also called
+  sharding: each row lives on exactly one shard, chosen by a partition key. Two strategies dominate, and
+  they are the same two ideas as a hash index versus a B+tree.</p>
+
+  <div class="callout why">
+    <div class="callout-title">Why two strategies, not one</div>
+    <p>A B+tree (<a href="0006-btree-search-insert.html">week 6</a>) keeps keys in order, so it answers
+    range queries by descending once and walking linked leaves. A hash index
+    (<a href="0007-btree-delete-hash.html">week 7</a>) scatters keys for O(1) point lookups but cannot
+    range, because hashing destroys order. Sharding inherits exactly this fork. Hash partitioning sends
+    a row to <code>hash(key) mod N</code>, spreading load evenly but scattering adjacent keys across all
+    shards. Range partitioning gives each shard a contiguous key interval, so a range query hits a
+    contiguous set of shards, but monotonically increasing keys (timestamps, auto-increment ids) all
+    land on the last shard and create a write hotspot.</p>
+  </div>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 640 230" role="img" aria-label="Hash versus range partitioning of a key space">
+      <text x="160" y="22" text-anchor="middle" class="svg-label">hash partitioning</text>
+      <text x="480" y="22" text-anchor="middle" class="svg-label">range partitioning</text>
+
+      <!-- hash side: keys scattered -->
+      <rect x="20" y="38" width="280" height="30" rx="4" fill="#fffdf8" stroke="var(--rule)"/>
+      <text x="160" y="58" text-anchor="middle" class="svg-mono">keys 1..12 (a range query)</text>
+      <g font-size="11">
+        <rect x="20" y="92" width="86" height="34" rx="5" fill="var(--modern-bg)" stroke="var(--modern)"/>
+        <text x="63" y="108" text-anchor="middle" class="svg-mono">shard A</text>
+        <text x="63" y="121" text-anchor="middle" class="svg-mono">3 7 10</text>
+        <rect x="117" y="92" width="86" height="34" rx="5" fill="var(--modern-bg)" stroke="var(--modern)"/>
+        <text x="160" y="108" text-anchor="middle" class="svg-mono">shard B</text>
+        <text x="160" y="121" text-anchor="middle" class="svg-mono">1 5 8 11</text>
+        <rect x="214" y="92" width="86" height="34" rx="5" fill="var(--modern-bg)" stroke="var(--modern)"/>
+        <text x="257" y="108" text-anchor="middle" class="svg-mono">shard C</text>
+        <text x="257" y="121" text-anchor="middle" class="svg-mono">2 4 6 9 12</text>
+      </g>
+      <text x="160" y="150" text-anchor="middle" class="svg-label sm">BETWEEN 4 AND 9 fans out to all three shards</text>
+
+      <!-- range side: keys contiguous -->
+      <rect x="340" y="38" width="280" height="30" rx="4" fill="#fffdf8" stroke="var(--rule)"/>
+      <text x="480" y="58" text-anchor="middle" class="svg-mono">keys 1..12 (a range query)</text>
+      <g font-size="11">
+        <rect x="340" y="92" width="86" height="34" rx="5" fill="var(--index-bg)" stroke="var(--index)"/>
+        <text x="383" y="108" text-anchor="middle" class="svg-mono">shard A</text>
+        <text x="383" y="121" text-anchor="middle" class="svg-mono">1 2 3 4</text>
+        <rect x="437" y="92" width="86" height="34" rx="5" fill="var(--index-bg)" stroke="var(--index)"/>
+        <text x="480" y="108" text-anchor="middle" class="svg-mono">shard B</text>
+        <text x="480" y="121" text-anchor="middle" class="svg-mono">5 6 7 8</text>
+        <rect x="534" y="92" width="86" height="34" rx="5" fill="var(--index-bg)" stroke="var(--index)"/>
+        <text x="577" y="108" text-anchor="middle" class="svg-mono">shard C</text>
+        <text x="577" y="121" text-anchor="middle" class="svg-mono">9 10 11 12</text>
+      </g>
+      <text x="480" y="150" text-anchor="middle" class="svg-label sm">BETWEEN 4 AND 9 touches a contiguous A, B set</text>
+
+      <text x="320" y="195" text-anchor="middle" class="svg-label sm">even load, no ranges &#8592; trade-off &#8594; ordered scans, monotonic-key hotspot</text>
+    </svg>
+    <figcaption><b>Figure 1.</b> The same twelve keys under hash and range partitioning. Notice that the
+    cost of a range query swaps with the risk of a hotspot. There is no layout that gives even spread and
+    cheap ranges at once, which is the week 6 to 7 lesson restated for a cluster.</figcaption>
+  </figure>
+
+  <div class="callout realworld">
+    <div class="callout-title">In real systems</div>
+    <p>Bigtable range-partitions every table by its lexicographic row key into <em>tablets</em>, each
+    roughly 100 to 200 MB, auto-splitting as they grow, and locates them through a three-level structure
+    (a Chubby file points to a root tablet, which points to METADATA tablets, which point to user tablets)
+    that addresses up to 2<sup>61</sup> bytes of data
+    [<a href="https://research.google.com/archive/bigtable-osdi06.pdf">Bigtable, OSDI 2006, Section 5.1</a>].
+    Because keys are sorted, the Webtable trick reverses hostnames so <code>maps.google.com/index.html</code>
+    is stored as <code>com.google.maps/index.html</code>, putting one domain's pages in adjacent rows.
+    PostgreSQL supports <code>PARTITION BY RANGE</code>, <code>LIST</code>, and <code>HASH</code> but only
+    within a single server; cross-node sharding needs an extension or a fork
+    [<a href="https://www.postgresql.org/docs/current/ddl-partitioning.html">PG docs, Table Partitioning</a>].</p>
+  </div>
+
+  <!-- ===== REPLICATION ===== -->
+  <h2>Replication: keep copies, then choose how many must agree</h2>
+
+  <p>Partitioning spreads load but makes every shard a new single point of failure: lose its machine and
+  you lose that slice of the table. So you keep copies. Replication serves two ends at once, surviving a
+  node failure and scaling reads, but it raises a question a single node never had: when a write arrives,
+  how many copies must store it before you tell the client "committed"?</p>
+
+  <p>The simplest scheme is leader/follower (also primary/replica or single-leader). One replica is the
+  leader and takes all writes; it ships its change log to followers, which replay it. Reads can go to
+  followers. The whole design rests on one knob.</p>
+
+  <table>
+    <caption>Synchronous versus asynchronous replication is the durability/latency knob.</caption>
+    <thead><tr><th>Mode</th><th>Commit waits for</th><th>On leader crash</th><th>Cost</th></tr></thead>
+    <tbody>
+      <tr><td>Synchronous</td><td>a follower to acknowledge</td><td>no committed data lost</td><td>higher commit latency</td></tr>
+      <tr><td>Asynchronous</td><td>nothing, returns at once</td><td>last writes can be lost</td><td>stale reads on followers</td></tr>
+    </tbody>
+  </table>
+
+  <p>This is the same write-ahead durability promise from <a href="0014-logging-recovery-aries.html">week
+  14</a>, now stretched across machines. On one node, COMMIT forces the log to stable storage. Across
+  nodes, synchronous commit forces the log to a follower too, so the promise survives the leader dying.
+  PostgreSQL streaming replication exposes exactly this as <code>synchronous_commit</code>: with it on,
+  "primary failure will never lose data"; with it off there is "no waiting for multiple servers" but
+  "possible data loss during fail over"
+  [<a href="https://www.postgresql.org/docs/current/different-replication-solutions.html">PG docs, replication solutions</a>].</p>
+
+  <p>Leaderless systems (the Dynamo lineage) drop the single leader and use quorums. With N replicas, a
+  write must be acknowledged by W of them and a read must consult R of them. The one rule to remember:</p>
+
+  <div class="callout keyidea">
+    <div class="callout-title">Keep this one thing</div>
+    <p>If <strong>W + R &gt; N</strong>, the write set and the read set must overlap in at least one
+    replica, so a read is guaranteed to touch a node that has the latest acknowledged write. Tuning W and
+    R slides you between write availability and read freshness without changing N.</p>
+  </div>
+
+  <div class="callout gotcha">
+    <div class="callout-title">Exam trap</div>
+    <p>Quorums do not have to be majorities. The overlap requirement is <code>W + R &gt; N</code>, which
+    <code>N = 3, W = 3, R = 1</code> satisfies just as well as the common <code>W = R = 2</code>. The
+    claim "quorum reads and writes always need a majority on each side" is false. A majority quorum is one
+    valid point on the line, not the only one.</p>
+  </div>
+
+  <!-- ===== TWO-PHASE COMMIT ===== -->
+  <h2>Two-phase commit: atomicity across nodes, and the blocking problem</h2>
+
+  <p>Now take journey 2's <code>UPDATE</code> and make it span machines. A transfer debits
+  <code>account</code> id 42 on shard A and credits id 99 on shard B. If each shard just commits locally,
+  one could commit while the other aborts, and money vanishes or doubles. Atomicity must hold across the
+  two shards: all commit or all abort. Two-phase commit (2PC) is the protocol that coordinates that
+  all-or-nothing decision.</p>
+
+  <ol class="steps">
+    <li><b>Phase 1, prepare and vote.</b> A coordinator asks every participant to prepare. A participant
+    that votes yes must durably log a prepare record and promise it can commit no matter what. It can no
+    longer abort on its own. It now sits in an uncertain, in-doubt state, holding its locks.</li>
+    <li><b>Phase 2, commit or abort.</b> If every participant voted yes, the coordinator logs and
+    broadcasts commit; if any voted no, it broadcasts abort. Participants apply the decision and release
+    their locks.</li>
+  </ol>
+
+  <div class="callout why">
+    <div class="callout-title">Why 2PC blocks, derived</div>
+    <p>The whole point of the prepare phase is that a yes-voter surrenders its right to abort, so the
+    coordinator can later force commit and know every participant will comply. That surrender is also the
+    trap. Suppose the coordinator crashes after participants prepared but before it delivers the decision.
+    A prepared participant cannot decide alone: committing might break atomicity if the coordinator had
+    chosen abort, and aborting might break it if the coordinator had chosen commit. So it waits, holding
+    locks, until the coordinator recovers. This is the blocking problem. 2PC is correct but not available
+    under a coordinator failure
+    [<a href="https://www.postgresql.org/docs/current/two-phase.html">PG prepared transactions</a>].</p>
+  </div>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 640 250" role="img" aria-label="Two-phase commit timeline with a coordinator crash">
+      <!-- left: normal 2PC -->
+      <text x="160" y="20" text-anchor="middle" class="svg-label">2PC, coordinator alive</text>
+      <line x1="60" y1="34" x2="60" y2="210" stroke="var(--ink-soft)"/>
+      <line x1="160" y1="34" x2="160" y2="210" stroke="var(--ink-soft)"/>
+      <line x1="260" y1="34" x2="260" y2="210" stroke="var(--ink-soft)"/>
+      <text x="60" y="226" text-anchor="middle" class="svg-label sm">coord</text>
+      <text x="160" y="226" text-anchor="middle" class="svg-label sm">P1</text>
+      <text x="260" y="226" text-anchor="middle" class="svg-label sm">P2</text>
+      <line x1="60" y1="56" x2="160" y2="70" stroke="var(--modern)" marker-end="url(#a16)"/>
+      <line x1="60" y1="56" x2="260" y2="70" stroke="var(--modern)" marker-end="url(#a16)"/>
+      <text x="110" y="50" text-anchor="middle" class="svg-label sm">prepare</text>
+      <line x1="160" y1="92" x2="60" y2="106" stroke="var(--good)" marker-end="url(#ag16)"/>
+      <line x1="260" y1="92" x2="60" y2="106" stroke="var(--good)" marker-end="url(#ag16)"/>
+      <text x="110" y="120" text-anchor="middle" class="svg-label sm">yes / yes</text>
+      <line x1="60" y1="140" x2="160" y2="154" stroke="var(--modern)" marker-end="url(#a16)"/>
+      <line x1="60" y1="140" x2="260" y2="154" stroke="var(--modern)" marker-end="url(#a16)"/>
+      <text x="120" y="178" text-anchor="middle" class="svg-label sm">commit, locks released</text>
+
+      <!-- right: crash -->
+      <text x="470" y="20" text-anchor="middle" class="svg-label">coordinator crashes after prepare</text>
+      <line x1="380" y1="34" x2="380" y2="210" stroke="var(--ink-soft)"/>
+      <line x1="480" y1="34" x2="480" y2="210" stroke="var(--ink-soft)"/>
+      <line x1="580" y1="34" x2="580" y2="210" stroke="var(--ink-soft)"/>
+      <text x="380" y="226" text-anchor="middle" class="svg-label sm">coord</text>
+      <text x="480" y="226" text-anchor="middle" class="svg-label sm">P1</text>
+      <text x="580" y="226" text-anchor="middle" class="svg-label sm">P2</text>
+      <line x1="380" y1="56" x2="480" y2="70" stroke="var(--modern)" marker-end="url(#a16)"/>
+      <line x1="380" y1="56" x2="580" y2="70" stroke="var(--modern)" marker-end="url(#a16)"/>
+      <line x1="480" y1="92" x2="385" y2="106" stroke="var(--good)" marker-end="url(#ag16)"/>
+      <line x1="580" y1="92" x2="385" y2="106" stroke="var(--good)" marker-end="url(#ag16)"/>
+      <text x="380" y="124" text-anchor="middle" fill="var(--bad)" font-size="18">&#10006;</text>
+      <text x="380" y="140" text-anchor="middle" class="svg-label sm" fill="var(--bad)">crash</text>
+      <rect x="440" y="150" width="80" height="26" rx="4" fill="var(--bad-bg)" stroke="var(--bad)"/>
+      <text x="480" y="167" text-anchor="middle" class="svg-mono">in-doubt</text>
+      <rect x="540" y="150" width="80" height="26" rx="4" fill="var(--bad-bg)" stroke="var(--bad)"/>
+      <text x="580" y="167" text-anchor="middle" class="svg-mono">in-doubt</text>
+      <text x="510" y="196" text-anchor="middle" class="svg-label sm" fill="var(--bad)">prepared, holding locks, cannot decide</text>
+
+      <defs>
+        <marker id="a16" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="var(--modern)"/></marker>
+        <marker id="ag16" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="var(--good)"/></marker>
+      </defs>
+    </svg>
+    <figcaption><b>Figure 2.</b> Left, the happy path: prepare, all vote yes, commit. Right, the
+    coordinator dies in the gap between the votes and the decision, and the prepared participants are
+    stuck in-doubt holding locks. The fix is not a cleverer protocol but a coordinator that cannot lose
+    its decision, which is what consensus buys.</figcaption>
+  </figure>
+
+  <div class="callout gotcha">
+    <div class="callout-title">Exam trap</div>
+    <p>"Two-phase commit guarantees the transaction never blocks" is false, and "three-phase commit is
+    non-blocking on any network" is also false. 3PC inserts a pre-commit phase to reduce blocking, but
+    its non-blocking property assumes a synchronous network with bounded message delay, which real
+    asynchronous networks violate. That is why 3PC is rarely deployed and why production systems instead
+    replicate the coordinator's decision log with consensus.</p>
+  </div>
+
+  <!-- ===== CONSENSUS ===== -->
+  <h2>Consensus: replicate the coordinator so a minority can fail</h2>
+
+  <p>The blocking problem comes from one fragile coordinator owning a decision. The principled fix is to
+  make the coordinator's decision log itself replicated, so no single crash loses it. Consensus is how a
+  set of nodes agree on an ordered log of commands despite crashes and message loss, as long as a majority
+  survive.</p>
+
+  <p>Paxos (Lamport) is the foundational protocol; Multi-Paxos extends single-value agreement to a log.
+  Raft (Ongaro and Ousterhout, 2014) was designed to be understandable and produces a result equivalent
+  to Multi-Paxos. It splits consensus into leader election, log replication, and safety. One leader is
+  elected per term; clients send commands to the leader; the leader appends to its log and replicates
+  entries to followers; an entry is committed once a majority has stored it, after which it is applied to
+  the state machine. The majority requirement guarantees any two committed decisions share a node, which
+  keeps the agreed log consistent. A five-node Raft group survives two failures
+  [<a href="https://raft.github.io/">Raft</a>].</p>
+
+  <div class="callout keyidea">
+    <div class="callout-title">Keep this one thing</div>
+    <p>Put the 2PC coordinator's state behind a Raft group and the in-doubt block disappears: a single
+    machine crash no longer loses the decision, because a majority of the Raft group still holds it. This
+    is how etcd, CockroachDB, and Spanner-style systems make replication and distributed commit
+    non-blocking.</p>
+  </div>
+
+  <!-- ===== CAP ===== -->
+  <h2>The CAP theorem and PACELC</h2>
+
+  <p>Partitioning, replication, and 2PC all assume the network mostly works. CAP names what happens when
+  it does not. Eric Brewer conjectured it and Gilbert and Lynch proved it in 2002. It concerns three
+  properties of a distributed store:</p>
+
+  <table>
+    <caption>The three CAP properties. Consistency here is linearizability, not the C in ACID.</caption>
+    <thead><tr><th>Property</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td>Consistency</td><td>linearizability: every read returns the most recent completed write, or an error</td></tr>
+      <tr><td>Availability</td><td>every request to a non-failing node gets a non-error response, freshness not guaranteed</td></tr>
+      <tr><td>Partition tolerance</td><td>the system keeps operating when the network drops or delays messages between nodes</td></tr>
+    </tbody>
+  </table>
+
+  <p>The theorem says you can have at most two of the three at once. The honest reading is not "pick any
+  two at design time." Partitions are not optional, the network can always split, so partition tolerance
+  is effectively mandatory for any real distributed store. The real choice is forced only during a
+  partition: keep consistency and refuse some requests, or stay available and risk returning stale data.
+  When there is no partition you can have both
+  [<a href="https://en.wikipedia.org/wiki/CAP_theorem">CAP theorem, Gilbert-Lynch summary</a>].</p>
+
+  <div class="callout gotcha">
+    <div class="callout-title">Exam trap</div>
+    <p>The most common CAP error: "the C in CAP is the same as the C in ACID." False. CAP consistency is
+    linearizability, a property of distributed reads and writes. ACID consistency
+    (<a href="0012-transactions-isolation.html">week 12</a>) is a transaction preserving integrity
+    constraints. They are different concepts that happen to share a letter. An MCQ that conflates them is
+    testing whether you noticed.</p>
+  </div>
+
+  <p>PACELC (Abadi, 2010) fixes what CAP leaves out. CAP only describes a partition. PACELC says: if there
+  is a Partition, trade Availability against Consistency (the CAP case); Else, in normal operation, trade
+  Latency against Consistency. The else-branch captures the cost CAP hides. Even with a healthy network,
+  stronger consistency means waiting for synchronous replication or a quorum, which costs latency, and you
+  can buy lower latency by relaxing consistency. A Dynamo-style store is PA/EL; a system that always
+  prioritizes consistency is PC/EC. This is why the synchronous versus asynchronous knob from the
+  replication table is the same trade-off as CAP's choice, just on a healthy network.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 560 200" role="img" aria-label="CAP triangle and the PACELC else-branch">
+      <polygon points="280,30 110,165 450,165" fill="none" stroke="var(--ink-soft)"/>
+      <text x="280" y="22" text-anchor="middle" class="svg-label">C (linearizability)</text>
+      <text x="92" y="182" text-anchor="middle" class="svg-label">A (availability)</text>
+      <text x="468" y="182" text-anchor="middle" class="svg-label">P (partition tolerance)</text>
+      <circle cx="280" cy="30" r="5" fill="var(--modern)"/>
+      <circle cx="110" cy="165" r="5" fill="var(--modern)"/>
+      <circle cx="450" cy="165" r="5" fill="var(--modern)"/>
+      <text x="280" y="110" text-anchor="middle" class="svg-label sm">during a partition:</text>
+      <text x="280" y="126" text-anchor="middle" class="svg-label sm">keep two, drop one</text>
+
+      <line x1="490" y1="40" x2="490" y2="170" stroke="var(--rule)"/>
+      <text x="525" y="50" text-anchor="middle" class="svg-label sm">PACELC</text>
+      <text x="525" y="86" text-anchor="middle" class="svg-label sm">P? &#8594; A vs C</text>
+      <text x="525" y="118" text-anchor="middle" class="svg-label sm">Else &#8594;</text>
+      <text x="525" y="134" text-anchor="middle" class="svg-label sm">Latency vs C</text>
+    </svg>
+    <figcaption><b>Figure 3.</b> CAP forces a choice only on the partition edge. PACELC adds the
+    else-branch: even when the network is healthy, consistency still costs latency. The synchronous
+    replication knob lives in that else-branch.</figcaption>
+  </figure>
+
+  <!-- ===== SIMULATOR ===== -->
+  <h2>Simulator: a partition sandbox with quorums and 2PC</h2>
+
+  <p>This is the experiment to run. You have a five-node cluster with a leader, replication that is
+  synchronous or asynchronous, and tunable quorum W and R. Cut the network and watch a CP setting refuse
+  the minority side while an AP setting serves stale data. With no partition, watch synchronous commit add
+  latency for nothing. Then switch on 2PC, kill the coordinator mid-protocol to see participants block
+  in-doubt, and replace the coordinator with a Raft group to watch the block disappear.</p>
+
+  <figure class="sim" id="cap-sim">
+    <div class="sim-head">
+      <span class="sim-title">CAP / PACELC partition sandbox with 2PC</span>
+      <span class="sim-sub">cut the network, tune the quorum, kill the coordinator</span>
+    </div>
+    <div class="sim-body">
+      <div class="sim-stage"><svg id="cap-svg" viewBox="0 0 560 260" width="100%"></svg></div>
+      <div class="sim-controls" id="cap-controls"></div>
+      <div class="sim-readout" id="cap-readout"></div>
+    </div>
+  </figure>
+  <figcaption class="muted" style="margin-top:-1rem">Try this in order: set mode to CP and W = 3, partition
+  the network, then read from the minority side and watch it refuse. Switch to AP and read again to get a
+  stale value. Heal, turn on synchronous replication, and watch write latency rise with no partition at
+  all. Then run 2PC, crash the coordinator, and finally enable the Raft coordinator.</figcaption>
+
+  <script>
+  // ===== Week 16 distributed sandbox. Self-contained, IIFE-scoped. =====
+  (function () {
+    const svg = document.getElementById("cap-svg");
+    const readout = document.getElementById("cap-readout");
+    const controls = document.getElementById("cap-controls");
+    const W = 560, H = 260;
+
+    // Five nodes: index 0 is the leader. Positions on two sides of a fault line at x=280.
+    const NODES = [
+      { id: "L", x: 130, y: 70,  side: 0, leader: true },
+      { id: "F1", x: 130, y: 150, side: 0 },
+      { id: "F2", x: 130, y: 215, side: 0 },
+      { id: "F3", x: 430, y: 110, side: 1 },
+      { id: "F4", x: 430, y: 185, side: 1 }
+    ];
+    const N = NODES.length;        // 5
+    const MAJ_SIDE = 0;            // side 0 holds the leader and the majority (3 nodes)
+
+    const state = {
+      mode: "CP",                 // CP or AP
+      sync: false,                // synchronous replication
+      W: 3, R: 3,
+      partition: false,           // network cut between side 0 and side 1
+      twopc: false,               // 2PC mode on
+      raft: false,                // coordinator replicated by Raft
+      coordDead: false,           // coordinator killed mid-2PC
+      committedValue: 100,        // the durably agreed value on the majority side
+      minorityValue: 100,         // value visible to the isolated minority (can go stale)
+      lastMsg: "Ready. Pick a mode and try a write or a read.",
+      lastKind: "info"            // info | good | bad | warn
+    };
+
+    function reachable(side) {
+      // From the client's vantage on the majority side: minority side is unreachable under partition.
+      if (!state.partition) return true;
+      return side === MAJ_SIDE;
+    }
+    function reachableCount() {
+      return NODES.filter(function (n) { return reachable(n.side); }).length;
+    }
+
+    function doWrite() {
+      if (state.twopc) { return twopcWrite(); }
+      const acks = reachableCount();          // reachable replicas can ack
+      if (state.mode === "CP") {
+        if (acks >= state.W) {
+          state.committedValue += 5;
+          // synchronous replication only updates the minority once the partition heals;
+          // here a reachable minority (no partition) gets the value immediately.
+          if (!state.partition) state.minorityValue = state.committedValue;
+          const lat = state.sync ? "high (waited for a follower ack)" : "low";
+          set("good", "Write committed. " + acks + " of " + N + " replicas acked, W=" + state.W +
+              " met. Latency " + lat + ".");
+        } else {
+          set("bad", "Write REFUSED. Only " + acks + " replicas reachable, W=" + state.W +
+              " not met. CP keeps consistency by sacrificing availability.");
+        }
+      } else { // AP
+        state.committedValue += 5;
+        set("warn", "Write accepted on " + acks + " reachable replica(s). AP stays available; the " +
+            (state.partition ? "isolated minority will be stale until the partition heals." :
+             "cluster is consistent because there is no partition."));
+      }
+    }
+
+    function doRead() {
+      // The client reads from "this side". We model reading the minority side after a partition.
+      const minorityUp = reachable(1);
+      if (state.mode === "CP") {
+        if (state.partition && !minorityUp) {
+          set("bad", "Read on the minority side REFUSED. CP will not serve a node that may be stale. " +
+              "Consistency kept, availability lost on this side.");
+        } else {
+          set("good", "Read returns " + state.committedValue + " (the latest committed value). " +
+              "W+R=" + (state.W + state.R) + " > N=" + N + " guarantees overlap." );
+        }
+      } else { // AP
+        if (state.partition) {
+          set("warn", "Read on the minority side returns " + state.minorityValue +
+              " (STALE). AP served an answer instead of an error; latest is " + state.committedValue + ".");
+        } else {
+          set("good", "Read returns " + state.committedValue + " (consistent, no partition).");
+        }
+      }
+    }
+
+    function twopcWrite() {
+      // Prepare phase. Participants are the two sides; the coordinator drives.
+      if (state.partition && !state.raft) {
+        set("bad", "2PC stalls: a partition split the participants and the single coordinator cannot " +
+            "reach them all. A Raft-replicated coordinator would still make progress.");
+        return;
+      }
+      if (state.coordDead && !state.raft) {
+        set("bad", "Participants PREPARED then the coordinator crashed. They are IN-DOUBT, holding " +
+            "locks, unable to commit or abort alone. This is the 2PC blocking problem.");
+        return;
+      }
+      // Healthy 2PC, or 2PC with a Raft coordinator that survives a crash.
+      state.committedValue += 5;
+      if (!state.partition) state.minorityValue = state.committedValue;
+      if (state.raft && state.coordDead) {
+        set("good", "Coordinator crashed, but its decision lived in a Raft log (majority held it). A new " +
+            "leader resumed phase 2 and committed. No in-doubt block.");
+      } else {
+        set("good", "2PC: prepare, all vote yes, commit. All participants applied the write and released locks.");
+      }
+    }
+
+    function set(kind, msg) { state.lastKind = kind; state.lastMsg = msg; render(); }
+
+    function colorFor(kind) {
+      return kind === "good" ? "var(--good)" : kind === "bad" ? "var(--bad)" :
+             kind === "warn" ? "var(--warn)" : "var(--ink-soft)";
+    }
+
+    function render() {
+      svg.innerHTML = "";
+      // fault line
+      if (state.partition) {
+        svg.appendChild(DBMS.svg("line", { x1: 280, y1: 20, x2: 280, y2: 240,
+          stroke: "var(--bad)", "stroke-width": 3, "stroke-dasharray": "6 5" }));
+        svg.appendChild(DBMS.svg("text", { x: 280, y: 14, "text-anchor": "middle",
+          class: "svg-label sm", fill: "var(--bad)" }, "network partition"));
+      }
+      // side labels
+      svg.appendChild(DBMS.svg("text", { x: 130, y: 248, "text-anchor": "middle", class: "svg-label sm" },
+        "majority side (3)"));
+      svg.appendChild(DBMS.svg("text", { x: 430, y: 248, "text-anchor": "middle", class: "svg-label sm" },
+        "minority side (2)"));
+
+      NODES.forEach(function (n) {
+        const up = reachable(n.side);
+        const isCoord = state.twopc && n.leader;
+        const dead = isCoord && state.coordDead && !state.raft;
+        const fill = !up ? "#fffdf8" : n.leader ? "var(--modern-bg)" : "#fffdf8";
+        const stroke = dead ? "var(--bad)" : !up ? "var(--rule)" : n.leader ? "var(--modern)" : "var(--ink-soft)";
+        svg.appendChild(DBMS.svg("circle", { cx: n.x, cy: n.y, r: 26, fill: fill, stroke: stroke,
+          "stroke-width": n.leader ? 2.5 : 1.5, "stroke-dasharray": up ? "0" : "4 3" }));
+        svg.appendChild(DBMS.svg("text", { x: n.x, y: n.y - 2, "text-anchor": "middle", class: "svg-mono" },
+          n.id));
+        const role = state.raft && n.side === MAJ_SIDE ? "raft" : n.leader ? (state.twopc ? "coord" : "leader") : "replica";
+        svg.appendChild(DBMS.svg("text", { x: n.x, y: n.y + 11, "text-anchor": "middle", class: "svg-label sm",
+          fill: dead ? "var(--bad)" : "var(--ink-faint)" }, dead ? "crashed" : role));
+        // value chip
+        const v = (n.side === 1 && state.partition) ? state.minorityValue : state.committedValue;
+        svg.appendChild(DBMS.svg("text", { x: n.x, y: n.y + 40, "text-anchor": "middle", class: "svg-mono",
+          fill: (n.side === 1 && state.partition && v !== state.committedValue) ? "var(--warn)" : "var(--ink-soft)" },
+          "v=" + v));
+      });
+
+      // raft ring hint
+      if (state.raft) {
+        svg.appendChild(DBMS.svg("text", { x: 130, y: 32, "text-anchor": "middle", class: "svg-label sm",
+          fill: "var(--good)" }, "coordinator = Raft group"));
+      }
+
+      // overlap indicator
+      const overlap = state.W + state.R > N;
+      svg.appendChild(DBMS.svg("rect", { x: 360, y: 16, width: 190, height: 24, rx: 4,
+        fill: overlap ? "var(--good-bg)" : "var(--bad-bg)", stroke: overlap ? "var(--good)" : "var(--bad)" }));
+      svg.appendChild(DBMS.svg("text", { x: 455, y: 32, "text-anchor": "middle", class: "svg-mono" },
+        "W+R=" + (state.W + state.R) + (overlap ? " > N: overlap" : " <= N: no overlap")));
+
+      readout.innerHTML = "";
+      readout.appendChild(DBMS.el("span", { html:
+        "<b>mode</b> " + state.mode + " &nbsp; <b>repl</b> " + (state.sync ? "sync" : "async") +
+        " &nbsp; <b>W</b>=" + state.W + " <b>R</b>=" + state.R +
+        " &nbsp; <b>2PC</b> " + (state.twopc ? "on" : "off") +
+        (state.twopc ? " (raft " + (state.raft ? "on" : "off") + ")" : "") }));
+      readout.appendChild(DBMS.el("div", { class: "", style: "margin-top:.5rem;color:" + colorFor(state.lastKind),
+        text: state.lastMsg }));
+    }
+
+    function btn(label, fn, ghost) {
+      return DBMS.el("button", { class: ghost ? "ghost" : "", text: label, onclick: function () { fn(); render(); } });
+    }
+
+    controls.append(
+      btn("Write", doWrite),
+      btn("Read minority side", doRead),
+      btn("Toggle partition", function () { state.partition = !state.partition; if (!state.partition) { state.minorityValue = state.committedValue; } }, true),
+      btn("Mode CP/AP", function () { state.mode = state.mode === "CP" ? "AP" : "CP"; }, true),
+      btn("Repl sync/async", function () { state.sync = !state.sync; }, true),
+      btn("W+", function () { state.W = DBMS.clamp(state.W + 1, 1, N); }, true),
+      btn("W-", function () { state.W = DBMS.clamp(state.W - 1, 1, N); }, true),
+      btn("R+", function () { state.R = DBMS.clamp(state.R + 1, 1, N); }, true),
+      btn("R-", function () { state.R = DBMS.clamp(state.R - 1, 1, N); }, true),
+      btn("2PC on/off", function () { state.twopc = !state.twopc; state.coordDead = false; }, true),
+      btn("Kill coordinator", function () { state.coordDead = true; }, true),
+      btn("Raft coordinator", function () { state.raft = !state.raft; }, true)
+    );
+
+    render();
+  })();
+  </script>
+
+  <!-- ===== BIGTABLE GROUNDING ===== -->
+  <h2>Bigtable: the whole picture in one production system</h2>
+
+  <p>Bigtable is the bridge that makes this lesson concrete and connects it to last week. It is a sparse,
+  distributed, persistent, multidimensional sorted map keyed by <code>(row, column, time)</code>, and it
+  composes everything here. The write path is the LSM design from
+  <a href="0015-modern-architectures-lsm.html">week 15</a>: a mutation goes to a per-tablet-server commit
+  log (with group commit) and then into an in-memory sorted memtable, flushed to immutable SSTables and
+  merged by minor, merging, and major compaction
+  [<a href="https://research.google.com/archive/bigtable-osdi06.pdf">Bigtable, Section 5.3 and 5.4</a>].</p>
+
+  <p>On the distributed side, Bigtable shows every idea above living together. Tables are range-partitioned
+  into tablets. Replication lives below Bigtable, not in its data plane: GFS replicates the commit log and
+  SSTable files, and Chubby replicates coordination state via Paxos. Membership and failure detection use a
+  lock service: each tablet server holds an exclusive Chubby lock on a uniquely named file, and the master
+  detects a dead server, grabs its lock, deletes its file so it can never serve again (fencing), and
+  reassigns its tablets. The master self-fences if its own Chubby session expires, and master death does not
+  move tablets, so there is no split brain (Section 5.2). Notice the deliberate scope cut: Bigtable offers
+  only single-row atomic operations, no general cross-row transactions, because most applications needed
+  only single-row atomicity and distributed transactions are expensive (Section 3 and Section 9). That is
+  the CAP and 2PC cost showing up as a product decision.</p>
+
+  <div class="callout realworld">
+    <div class="callout-title">In real systems</div>
+    <p>The survey that opened this course (<a href="0001-dbms-architecture.html">week 1</a>) already named
+    the cluster forms: shared-nothing partitions tables horizontally and still needs two-phase commit and
+    distributed deadlock detection across nodes
+    [<a href="https://dsf.berkeley.edu/papers/fntdb07-architecture.pdf">Architecture of a Database System,
+    Section 3.2</a>]. Sixteen weeks later, those two sentences have unpacked into this whole lesson.</p>
+  </div>
+
+  <!-- ===== TABLE COMPARISON ===== -->
+  <table>
+    <caption>The four problems of going distributed, each rooted in a single-node topic you already know.</caption>
+    <thead><tr><th>Distributed problem</th><th>Single-node ancestor</th><th>What you trade</th></tr></thead>
+    <tbody>
+      <tr><td>Partitioning (hash vs range)</td><td>hash index vs B+tree (weeks 6, 7)</td><td>even spread vs cheap ranges</td></tr>
+      <tr><td>Replication (sync vs async)</td><td>WAL durability (week 14)</td><td>commit latency vs data loss window</td></tr>
+      <tr><td>Two-phase commit</td><td>atomicity of a transaction (week 12)</td><td>atomicity across nodes vs blocking on coordinator loss</td></tr>
+      <tr><td>CAP during a partition</td><td>isolation and consistency (week 12)</td><td>consistency vs availability</td></tr>
+    </tbody>
+  </table>
+
+  <!-- ===== RETRIEVAL PRACTICE: MCQs ===== -->
+  <h2>Check yourself</h2>
+
+  <div class="mcq" data-answer="2">
+    <p class="mcq-q">Which statement about the CAP theorem is false?</p>
+    <button class="mcq-opt">CAP consistency means linearizability: a read sees the most recent write.</button>
+    <button class="mcq-opt">During a partition you must choose between consistency and availability.</button>
+    <button class="mcq-opt">The C in CAP is the same integrity-constraint guarantee as the C in ACID.</button>
+    <button class="mcq-opt">With no partition a store can provide both consistency and availability.</button>
+    <p class="mcq-explain">The false statement is the third. CAP consistency is linearizability, a property
+    of distributed reads and writes. ACID consistency is a transaction preserving integrity constraints.
+    They share a letter and nothing else, which is the trap most MCQs use.</p>
+  </div>
+
+  <div class="mcq" data-answer="1">
+    <p class="mcq-q">A coordinator crashes after every participant has voted yes in two-phase commit. What happens?</p>
+    <button class="mcq-opt">Participants independently abort, since silence from the coordinator means abort.</button>
+    <button class="mcq-opt">Participants stay in-doubt, holding locks, unable to commit or abort alone.</button>
+    <button class="mcq-opt">Participants commit, since voting yes already finalized the decision locally.</button>
+    <button class="mcq-opt">The protocol restarts from prepare, discarding the votes already cast.</button>
+    <p class="mcq-explain">A yes vote surrenders the right to abort, so a prepared participant cannot decide
+    alone: committing might violate atomicity if the coordinator chose abort, aborting might violate it if
+    it chose commit. It blocks in-doubt until the coordinator recovers. This is exactly the 2PC blocking
+    problem.</p>
+  </div>
+
+  <div class="mcq" data-answer="0">
+    <p class="mcq-q">Which claim about partitioning is false?</p>
+    <button class="mcq-opt">Hash partitioning supports efficient range queries because the hash preserves key order.</button>
+    <button class="mcq-opt">Range partitioning can create a write hotspot on monotonically increasing keys.</button>
+    <button class="mcq-opt">Hash partitioning spreads load evenly but a range query must fan out to every shard.</button>
+    <button class="mcq-opt">Range partitioning lets a range query hit a contiguous set of shards.</button>
+    <p class="mcq-explain">The first is false. Hashing destroys key order, so a range query under hash
+    partitioning cannot localize and must scan all shards. This is the same reason a hash index cannot
+    serve a range, just at cluster scale.</p>
+  </div>
+
+  <div class="mcq" data-answer="3">
+    <p class="mcq-q">With N replicas, what does the quorum condition W + R &gt; N guarantee?</p>
+    <button class="mcq-opt">That every write is acknowledged by a strict majority of the replicas.</button>
+    <button class="mcq-opt">That reads are always faster than writes because R can be set to one.</button>
+    <button class="mcq-opt">That the system stays available even when more than half the replicas fail.</button>
+    <button class="mcq-opt">That the read set and write set overlap in at least one replica.</button>
+    <button class="mcq-opt">That no replica ever holds stale data after a synchronous write.</button>
+    <p class="mcq-explain">W + R &gt; N forces the read set and write set to overlap in at least one node, so
+    a read touches a replica holding the latest acknowledged write. It does not require a majority on either
+    side (N=3, W=3, R=1 satisfies it), and it says nothing about failure tolerance or staleness elsewhere.</p>
+  </div>
+
+  <div class="mcq" data-answer="2">
+    <p class="mcq-q">Which statement about consensus and the 2PC blocking problem is false?</p>
+    <button class="mcq-opt">Raft commits an entry once a majority of the group has stored it.</button>
+    <button class="mcq-opt">Raft and Multi-Paxos give equivalent consistency guarantees.</button>
+    <button class="mcq-opt">Three-phase commit is non-blocking on any network, including asynchronous ones.</button>
+    <button class="mcq-opt">Replicating the coordinator log with consensus removes the in-doubt block.</button>
+    <p class="mcq-explain">The third is false. 3PC's non-blocking property assumes a synchronous network
+    with bounded message delay; on a real asynchronous network it can still fail to terminate. The practical
+    fix is to replicate the coordinator's decision via consensus, which Raft and Multi-Paxos both provide
+    with equivalent guarantees.</p>
+  </div>
+
+  <div class="mcq" data-answer="1">
+    <p class="mcq-q">In Bigtable, how is a dead tablet server detected and prevented from serving again?</p>
+    <button class="mcq-opt">The master pings every tablet server on a fixed timer and trusts the first missed reply.</button>
+    <button class="mcq-opt">The master grabs the server's Chubby lock and deletes its file, fencing it permanently.</button>
+    <button class="mcq-opt">Each tablet server gossips its health to peers, who vote a majority to evict it.</button>
+    <button class="mcq-opt">GFS reports the failure upward, and the master rewrites the SSTables to exclude it.</button>
+    <p class="mcq-explain">Each tablet server holds an exclusive Chubby lock on a uniquely named file. When
+    a server is unreachable or has lost its lock, the master acquires that lock and deletes the file, which
+    guarantees the old server can never serve again, then reassigns its tablets. The master also self-fences
+    if its own Chubby session expires.</p>
+  </div>
+
+  <!-- ===== FLASHCARDS ===== -->
+  <div class="flashcard">
+    <div class="fc-front">Why does two-phase commit block, and what removes the block?</div>
+    <div class="fc-back">A prepared participant has surrendered its right to abort, so if the coordinator
+    crashes before delivering the decision it cannot decide alone and waits in-doubt holding locks.
+    Replicating the coordinator's decision log with consensus (Raft or Multi-Paxos) removes the block: a
+    majority still holds the decision, so a new leader resumes phase 2.</div>
+  </div>
+
+  <div class="flashcard">
+    <div class="fc-front">State PACELC in one sentence and say what it adds to CAP.</div>
+    <div class="fc-back">If there is a Partition, trade Availability against Consistency; Else, in normal
+    operation, trade Latency against Consistency. It adds the else-branch CAP ignores: even on a healthy
+    network, stronger consistency costs latency.</div>
+  </div>
+
+  <!-- ===== VIVA ===== -->
+  <div class="callout viva">
+    <div class="callout-title">Viva prompt 1</div>
+    <p>Bigtable is a distributed database, yet the paper says it replicates nothing in its own data plane.
+    So where do durability and cross-cluster availability come from, and what does that tell you about how
+    Bigtable layers its system?</p>
+  </div>
+
+  <details class="deepdive">
+    <summary>Model answer</summary>
+    <div>
+      <p>Durability comes from below Bigtable. GFS stores both the commit log and the SSTable files and
+      replicates them, and Chubby replicates its coordination state via Paxos across five replicas (Section
+      4). Bigtable itself does not copy data between tablet servers; a tablet is assigned to exactly one
+      tablet server at a time. Cross-cluster availability is handled above the single-cluster data plane:
+      Personalized Search first used client-side eventual-consistency replication and later a server-side
+      replication subsystem, and the paper notes planned cross-data-center multi-master replication (Section
+      8.3 and Section 11).</p>
+      <p>The lesson is that Bigtable is composed, not monolithic. It pushes replication down into GFS and
+      Chubby and keeps its own layer focused on the sorted-map data model, range-partitioned tablets, and
+      the LSM write path. This is why a single tablet server is not a data-loss risk even though it is the
+      only server for its tablets: the bytes are safe in GFS, and the master can reassign the tablets to
+      another server, which rebuilds the memtable by replaying the commit log from the recorded redo points
+      (Section 5.3).</p>
+    </div>
+  </details>
+
+  <div class="callout viva">
+    <div class="callout-title">Viva prompt 2</div>
+    <p>Walk the three-level tablet location hierarchy and justify two design choices in it: why the root
+    tablet is never split, and why a stale client cache can cost up to six round-trips instead of three.</p>
+  </div>
+
+  <details class="deepdive">
+    <summary>Model answer</summary>
+    <div>
+      <p>The hierarchy has three levels (Section 5.1, Figure 4). Level one is a file in Chubby holding the
+      location of the root tablet. The root tablet is the first tablet of a special METADATA table and holds
+      the locations of all other METADATA tablets. Each other METADATA tablet holds the locations of a set
+      of user tablets. A METADATA row keys a tablet by an encoding of (table identifier, end row) and holds
+      about 1 KB in memory, so with 128 MB METADATA tablets the scheme addresses 2<sup>34</sup> tablets,
+      i.e. 2<sup>61</sup> bytes.</p>
+      <p>The root tablet is never split precisely to cap the hierarchy at three levels. If it could split,
+      you would need a fourth level to locate its pieces, and the addressing math and the bounded lookup
+      cost both depend on staying at three.</p>
+      <p>A cold cache costs three round-trips, one of which is the Chubby read for the root location, then
+      the root tablet, then the METADATA tablet. A stale cache can cost up to six because stale entries are
+      only discovered on a miss: the client chases a wrong location, misses, and has to walk back up the
+      hierarchy, doubling the worst-case path. The client library prefetches more than one tablet's metadata
+      per METADATA read to make stale entries rarer.</p>
+    </div>
+  </details>
+
+  <div class="callout viva">
+    <div class="callout-title">Viva prompt 3</div>
+    <p>Bigtable supports only single-row atomic operations, with no general cross-row transactions in its
+    base API. Connect that scope decision to two-phase commit and the CAP theorem. Was it a limitation or a
+    deliberate trade?</p>
+  </div>
+
+  <details class="deepdive">
+    <summary>Model answer</summary>
+    <div>
+      <p>It was deliberate. Every read or write under a single row key is atomic across any number of
+      columns, but cross-row writes can only be batched at the client (Section 2 and Section 3). The lessons
+      section explains the reasoning: most applications needed only single-row atomicity, and the main demand
+      for distributed transactions was secondary indexes, which they planned to serve with a narrower
+      mechanism (Section 9).</p>
+      <p>The connection to this lesson is direct. A general cross-row transaction spanning tablets on
+      different tablet servers would require two-phase commit, which brings the blocking problem: a
+      coordinator crash after participants prepare leaves them in-doubt holding locks. It also collides with
+      CAP, because during a network partition a cross-tablet transaction cannot both stay available and stay
+      consistent. By restricting atomicity to a single row, which lives entirely on one tablet server,
+      Bigtable keeps every atomic operation local and sidesteps distributed commit and the CAP choice for
+      the common case. The price is pushed to the application, which must design its row keys so that data
+      needing atomicity shares a row. That is the same kind of trade as choosing AP over CP: you do not
+      escape the cost, you decide who pays it.</p>
+    </div>
+  </details>
+
+  <!-- ===== PRIMARY SOURCE ===== -->
+  <div class="source-box">
+    <div class="src-tag">Primary source</div>
+    <div class="src-title">Read this next:
+      <a href="https://research.google.com/archive/bigtable-osdi06.pdf">Bigtable: A Distributed Storage
+      System for Structured Data (Chang et al., OSDI 2006)</a></div>
+    <p class="muted">Focus on Section 5: the three components (master, tablet servers, client library), the
+    three-level tablet location hierarchy in 5.1, tablet assignment and Chubby-based failure detection in
+    5.2, and the commit-log plus memtable plus SSTable write path in 5.3. It is the one paper that shows
+    the LSM write path of week 15 living inside a range-partitioned, lock-service-coordinated distributed
+    system, which is exactly this lesson.</p>
+  </div>
+
+  <!-- ===== ASK YOUR TEACHER ===== -->
+  <div class="ask-teacher">
+    <div class="at-tag">Ask your teacher</div>
+    <p>This is the last lesson, so it is also the place to test whether the islands joined up. Ask me to
+    trace the <code>SELECT</code> or the <code>UPDATE</code> across a sharded, replicated cluster end to
+    end, to quiz you on any of the four papers before the viva, or to draw the CAP and 2PC pictures
+    differently until they click. I am your teacher for this course, not just a document.</p>
+  </div>
+
+  <!-- ===== NAV ===== -->
+  <nav class="lesson-nav">
+    <a class="prev" href="0015-modern-architectures-lsm.html">
+      <span class="nav-dir">Previous</span>
+      <span class="nav-title">Week 15 · Modern architectures: LSM trees, columnar storage, DuckDB</span>
+    </a>
+    <a class="next" href="../reference/exam-mcq-bank.html">
+      <span class="nav-dir">Next</span>
+      <span class="nav-title">Exam prep · MCQ bank and viva review</span>
+    </a>
+  </nav>
+
+  </div><!-- /.col -->
+</main>
+</body>
+</html>

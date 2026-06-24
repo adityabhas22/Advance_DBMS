@@ -1,0 +1,845 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Viva prep: the four papers · Field Guide to the Database Engine</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body class="layer-recovery">
+<main class="page">
+
+  <!-- ===== MASTHEAD ===== -->
+  <header class="masthead col">
+    <div class="crumbs">
+      <a href="../index.html">Field Guide</a> <span>/</span>
+      <span>Reference</span> <span>/</span>
+      <span>Viva prep</span>
+    </div>
+    <span class="week-badge">Reference</span>
+    <h1>Viva prep: the four papers</h1>
+    <p class="lede">One page to drill before the oral. For each paper: a three-sentence what and why, the five
+    facts an examiner is most likely to pull, and the full question bank. Read the question, answer out loud,
+    then open the model answer to check yourself.</p>
+  </header>
+
+  <div class="col">
+
+  <div class="callout keyidea">
+    <p class="callout-title">How to use this</p>
+    <p>The four papers and their home lessons: Architecture of a DB System (weeks 1, 8, 9, 10, 11), Volcano
+    (weeks 9, 10), Bigtable (weeks 15, 16), ARIES (week 14). Each model answer is hidden inside a collapsible
+    block. Try to answer before you open it. Citations like (Section 5.1) point into the source paper.</p>
+  </div>
+
+  <p class="muted"><a href="#arch">Architecture of a DB System</a> &middot;
+  <a href="#volcano">Volcano</a> &middot;
+  <a href="#bigtable">Bigtable</a> &middot;
+  <a href="#aries">ARIES</a></p>
+
+  <hr>
+
+  <!-- ============================================================ -->
+  <!-- PAPER 1: ARCHITECTURE                                        -->
+  <!-- ============================================================ -->
+  <h2 id="arch">1. Architecture of a Database System</h2>
+  <p class="muted">Hellerstein, Stonebraker, Hamilton, 2007. Chapters 1 to 4: components, process models,
+  parallel architecture, relational query processor.</p>
+
+  <h3>What and why</h3>
+  <p>The paper fills a documentation gap: textbooks teach the algorithms (relational algebra, B+-trees, the
+  System R optimizer) but skip the systems engineering that makes a DBMS run as a multi-user server. It is
+  grounded in real commercial and open-source systems (DB2, Oracle, SQL Server, PostgreSQL, MySQL, Informix,
+  Sybase) and contrasts the design choices each vendor made. It matters because DBMSs were among the earliest
+  widely deployed online server systems and pioneered scalability and reliability techniques later reused
+  across operating systems and networked services.</p>
+
+  <div class="callout viva">
+    <p class="callout-title">Five facts most likely to be asked</p>
+    <ul>
+      <li>The five components: client communications manager, process manager, relational query processor,
+      transactional storage manager, shared components and utilities (Figure 1.1).</li>
+      <li>1:1 mapping between a DBMS worker and a DBMS client; the worker handles all SQL from that one client.</li>
+      <li>Three process models: process per worker, thread per worker, process pool. Thread per worker scales
+      best; process per worker gives OS isolation and tooling.</li>
+      <li>Three parallel hardware models: shared memory, shared nothing (horizontal partitioning, two-phase
+      commit, chained declustering), shared disk (distributed lock manager plus cache-coherency protocol).</li>
+      <li>The iterator model: init, get_next, close; any iterator feeds any other; parallelism is hidden inside
+      exchange iterators. Admission control gives graceful degradation, keyed mainly on memory footprint.</li>
+    </ul>
+  </div>
+
+  <table>
+    <caption>Process models at a glance</caption>
+    <thead><tr><th>Model</th><th>Mapping</th><th>Scaling</th><th>Used by</th></tr></thead>
+    <tbody>
+      <tr><td>Process per worker</td><td>worker = OS process</td><td>worst (heavy state, slow switches)</td><td>DB2, PostgreSQL, Oracle</td></tr>
+      <tr><td>Thread per worker</td><td>worker = OS thread</td><td>best for many connections</td><td>DB2, SQL Server, MySQL, Informix, Sybase</td></tr>
+      <tr><td>Process pool</td><td>borrowed process per statement</td><td>middle; waits if pool full</td><td>variant of process per worker</td></tr>
+    </tbody>
+  </table>
+
+  <table>
+    <caption>Parallel hardware models</caption>
+    <thead><tr><th>Model</th><th>Sharing</th><th>Extra machinery</th><th>Examples</th></tr></thead>
+    <tbody>
+      <tr><td>Shared memory</td><td>same RAM and disk, equal cost</td><td>just parallelize one query across CPUs</td><td>2 to 8-way servers, multi-core</td></tr>
+      <tr><td>Shared nothing</td><td>no node touches another's RAM or disk</td><td>partitioning, 2PC, distributed deadlock detection</td><td>DB2, Informix, Teradata, Greenplum</td></tr>
+      <tr><td>Shared disk</td><td>shared disks, private RAM</td><td>distributed lock manager, cache coherency</td><td>Oracle RAC, DB2 for zSeries</td></tr>
+    </tbody>
+  </table>
+
+  <figure>
+    <div class="diagram">
+      <svg viewBox="0 0 560 90" role="img" aria-label="Life of a query through the five components">
+        <g class="svg-label" text-anchor="middle">
+          <rect x="6"   y="28" width="96" height="34" rx="5" fill="var(--paper-2)" stroke="var(--rule)"/>
+          <text x="54"  y="49">Comms mgr</text>
+          <rect x="118" y="28" width="96" height="34" rx="5" fill="var(--paper-2)" stroke="var(--rule)"/>
+          <text x="166" y="49">Process mgr</text>
+          <rect x="230" y="28" width="96" height="34" rx="5" fill="var(--paper-2)" stroke="var(--rule)"/>
+          <text x="278" y="45">Query</text><text x="278" y="57">processor</text>
+          <rect x="342" y="28" width="96" height="34" rx="5" fill="var(--paper-2)" stroke="var(--rule)"/>
+          <text x="390" y="45">Storage</text><text x="390" y="57">manager</text>
+          <rect x="454" y="28" width="100" height="34" rx="5" fill="var(--paper-2)" stroke="var(--rule)"/>
+          <text x="504" y="45">Catalog,</text><text x="504" y="57">memory mgr</text>
+        </g>
+        <g stroke="var(--ink-faint)" fill="none">
+          <path d="M102 45 L118 45" marker-end="url(#ah)"/>
+          <path d="M214 45 L230 45" marker-end="url(#ah)"/>
+          <path d="M326 45 L342 45" marker-end="url(#ah)"/>
+        </g>
+        <defs><marker id="ah" markerWidth="7" markerHeight="7" refX="6" refY="3" orient="auto">
+          <path d="M0 0 L6 3 L0 6 z" fill="var(--ink-faint)"/></marker></defs>
+      </svg>
+    </div>
+    <figcaption><b>Life of a query.</b> Admission control sits in the process manager; the catalog and memory
+    manager are invoked during almost every query.</figcaption>
+  </figure>
+
+  <h3>Question bank</h3>
+
+  <p><strong>Q1. Name the five components of an RDBMS and what each does.</strong></p>
+  <details class="deepdive"><summary>Model answer</summary><div>
+    <p>Client communications manager (connection state and protocol handling), process manager (assigns workers
+    and does admission control), relational query processor (authorization, compilation, execution),
+    transactional storage manager (access methods, buffer pool, lock and log managers for ACID), and shared
+    components and utilities (catalog, memory manager, replication, backup). Introduced in Section 1.1 via the
+    gate-agent query and shown in Figure 1.1.</p>
+  </div></details>
+
+  <p><strong>Q2. What is the mapping between DBMS clients and workers, and why does it matter for the process models?</strong></p>
+  <details class="deepdive"><summary>Model answer</summary><div>
+    <p>It is 1:1: one worker handles all SQL from one client (Section 2, p. 151). It matters because the three
+    process models differ only in how that worker is realized (an OS process, an OS thread, or a borrowed
+    process from a pool), which changes memory footprint, isolation, and scalability.</p>
+  </div></details>
+
+  <p><strong>Q3. Contrast process per worker with thread per worker. Which scales better and why?</strong></p>
+  <details class="deepdive"><summary>Model answer</summary><div>
+    <p>Thread per worker scales better to many connections because a thread carries less state than a process
+    and thread switches avoid switching security context, memory-manager state, and file/network handle tables.
+    Process per worker is simpler and gets OS memory protection and tooling, but consumes more memory and
+    switches more slowly. Both still share the buffer pool and lock table, so process isolation is partial.</p>
+  </div></details>
+
+  <p><strong>Q4. Why did many DBMSs build their own lightweight thread packages, and what is the main hazard?</strong></p>
+  <details class="deepdive"><summary>Model answer</summary><div>
+    <p>Efficient, scalable OS threads were not widely available until the 1990s and varied across platforms, so
+    for legacy, portability, and scalability reasons DBMSs implemented their own (Section 2.2.1). The main
+    hazard is that one blocking operation blocks every thread in the process, so the package must use only
+    asynchronous non-blocking I/O and avoid blocking OS calls, replicating OS scheduling logic inside the DBMS.</p>
+  </div></details>
+
+  <p><strong>Q5. What is admission control, why is it needed, and where does it sit?</strong></p>
+  <details class="deepdive"><summary>Model answer</summary><div>
+    <p>It refuses new work unless resources are available, preventing thrashing so the system degrades
+    gracefully (latency rises with arrival rate but throughput stays at peak) (Section 2.4). It sits in two
+    tiers: a dispatcher-level cap on connections and an execution admission controller inside the query
+    processor that runs after parse and optimize and keys mainly on the optimizer's estimated memory footprint,
+    since buffer-pool memory pressure is the usual cause of thrashing.</p>
+  </div></details>
+
+  <p><strong>Q6. Distinguish shared memory, shared nothing, and shared disk.</strong></p>
+  <details class="deepdive"><summary>Model answer</summary><div>
+    <p>Shared memory: all processors reach the same RAM and disk at equal cost (typical 2 to 8-way servers and
+    multi-core). Shared nothing: a cluster where no node touches another's RAM or disk, with tables horizontally
+    partitioned. Shared disk: all processors reach the disks equally but cannot read each other's RAM
+    (Sections 3.1 to 3.3). The terminology comes from reference [87].</p>
+  </div></details>
+
+  <p><strong>Q7. In shared nothing, what coordination is still required, and how is partial failure handled?</strong></p>
+  <details class="deepdive"><summary>Model answer</summary><div>
+    <p>Even though value-based horizontal partitioning lets nodes work independently, they must still exchange
+    control messages for transaction completion, load balancing, distributed deadlock detection, and two-phase
+    commit (Section 3.2). Partial failure is handled by bringing all nodes down, Informix Data Skip (run on live
+    nodes with no well-defined semantics), or redundancy from full failover to chained declustering, under which
+    the n-1 survivors each take n/(n-1) of the load.</p>
+  </div></details>
+
+  <p><strong>Q8. What extra machinery does shared disk need, and what failure can it still not mask?</strong></p>
+  <details class="deepdive"><summary>Model answer</summary><div>
+    <p>Because each machine has its own buffer pool and locks with no shared memory to coordinate them, shared
+    disk needs a distributed lock manager and a cache-coherency protocol, which are complex and can bottleneck
+    under contention (Section 3.3). It cannot mask corruption that occurs before a page reaches storage, since
+    all nodes then see the corrupt page and RAID replicates it.</p>
+  </div></details>
+
+  <p><strong>Q9. List the rewriter's responsibilities and give an example of each.</strong></p>
+  <details class="deepdive"><summary>Model answer</summary><div>
+    <p>View expansion (replace a view with its tables and predicates recursively), constant arithmetic
+    evaluation (<code>10+2+R.y</code> becomes <code>12+R.y</code>), logical predicate rewriting
+    (<code>NOT salary &gt; 1000000</code> becomes <code>salary &lt;= 1000000</code>, and unsatisfiable
+    conjunctions become FALSE), semantic optimization using constraints (redundant join elimination via a
+    non-null foreign key), and subquery flattening/normalization (Section 4.2). The rewriter uses only the query
+    and catalog, never table data.</p>
+  </div></details>
+
+  <p><strong>Q10. What did the System R / Selinger optimizer do, and how have modern optimizers extended it?</strong></p>
+  <details class="deepdive"><summary>Model answer</summary><div>
+    <p>It optimized each SELECT-FROM-WHERE block with bottom-up dynamic programming, restricted to left-deep
+    plans, postponed Cartesian products, and used simple cardinality-based selectivity (Section 4.3). Modern
+    systems add bushy plans, histogram and sampling-based selectivity that handles column dependencies, top-down
+    Cascades search as an alternative to dynamic programming, two-phase parallel optimization, and plan caching
+    with recompilation. Both dynamic programming and top-down search remain exponential in the number of tables.</p>
+  </div></details>
+
+  <p><strong>Q11. Why does an early selectivity error matter more than a late one?</strong></p>
+  <details class="deepdive"><summary>Model answer</summary><div>
+    <p>Ioannidis and Christodoulakis showed that selectivity errors early in optimization propagate
+    multiplicatively up the plan tree, so a mistake near the leaves corrupts every estimate above it and can
+    produce a badly wrong plan (Section 4.3, reference [45]).</p>
+  </div></details>
+
+  <p><strong>Q12. Explain the iterator model and the significance of coupling dataflow with control flow.</strong></p>
+  <details class="deepdive"><summary>Model answer</summary><div>
+    <p>Every operator subclasses an iterator with init(), get_next(), and close(), and any iterator can feed any
+    other, so operator logic is independent of neighbors (Section 4.4). Because get_next() is an ordinary call
+    returning a tuple via the call stack, a tuple reaches the parent exactly when control returns, so one thread
+    runs the entire graph with no inter-operator queues or rate matching.</p>
+  </div></details>
+
+  <p><strong>Q13. How is parallelism added to the iterator model without rewriting operators?</strong></p>
+  <details class="deepdive"><summary>Model answer</summary><div>
+    <p>Parallelism and network communication are encapsulated in special exchange iterators (Graefe, reference
+    [23]) that push data internally between partitions while still exposing the pull-style get_next() API to
+    ordinary iterators, so the rest of the operators are unchanged (Section 4.4.1).</p>
+  </div></details>
+
+  <p><strong>Q14. What is the Halloween problem and how is it avoided?</strong></p>
+  <details class="deepdive"><summary>Model answer</summary><div>
+    <p>When a statement reads and updates the same table, pipelining an index scan into an update (for example a
+    10% raise for everyone under $20K) can rediscover a tuple that moved rightward in the B+-tree after being
+    updated and update it repeatedly, violating SQL's rule that a statement cannot see its own updates
+    (Section 4.4.3). Fixes: have the optimizer avoid indexes on the updated column, or materialize all target
+    Record-IDs first and then fetch and update them; pipelined updates need multiversion storage. It is
+    unrelated to the phantom problem.</p>
+  </div></details>
+
+  <p><strong>Q15. What is a SARG and why push it into the access method layer?</strong></p>
+  <details class="deepdive"><summary>Model answer</summary><div>
+    <p>A SARG is a search argument of the form column-operator-constant passed to an access method's init()
+    (NULL means scan all); it is a System R term (Section 4.5). Pushing it down lets B+-trees work efficiently
+    and, even for heap scans, lets the access method test predicates a page at a time, avoiding the per-tuple
+    cost of returning a pinned tuple or copy, having the caller reject it, then unpinning or deleting and
+    re-calling. This amortizes work across a collection for CPU savings while keeping a clean storage/relational
+    boundary.</p>
+  </div></details>
+
+  <p><strong>Q16. Why do some vendors re-optimize cached plans aggressively while others do not?</strong></p>
+  <details class="deepdive"><summary>Model answer</summary><div>
+    <p>It reflects customer base. IBM served high-budget shops with skilled DBAs who value predictable
+    performance, so it re-optimizes only when a plan can no longer run (for example a dropped index). Microsoft
+    entered at the low end where customers want self-tuning, so SQL Server re-optimizes on significant
+    cardinality changes (Section 4.3.1). The trade-off is predictability versus efficiency in a changing
+    environment.</p>
+  </div></details>
+
+  <hr>
+
+  <!-- ============================================================ -->
+  <!-- PAPER 2: VOLCANO                                             -->
+  <!-- ============================================================ -->
+  <h2 id="volcano">2. Volcano: an extensible and parallel query evaluation system</h2>
+  <p class="muted">Graefe, 1994. The iterator model, support functions, choose-plan, and the exchange operator.</p>
+
+  <h3>What and why</h3>
+  <p>Before Volcano, query execution research forced a choice between parallelism (GAMMA-style, one process per
+  operator, synchronized by the OS and network) and single-process efficiency and extensibility (System R,
+  Starburst, EXODUS, using the demand-driven iterator paradigm), and the two did not combine. Graefe's
+  contribution is one dataflow engine where every operator implements the same open-next-close iterator
+  interface, all item-level semantics are imported as support functions, and all parallelism is confined to one
+  operator, exchange. The payoff is that data manipulation and parallelism become orthogonal: an operator
+  written and debugged in a single process is parallelized just by inserting exchange, with no change to the
+  operator.</p>
+
+  <div class="callout viva">
+    <p class="callout-title">Five facts most likely to be asked</p>
+    <ul>
+      <li>The iterator interface is open, next, close. open recursively opens inputs; next pulls one record on
+      demand; close recursively shuts down. Demand-driven (pull, lazy) within a process.</li>
+      <li>State records hold all per-instance state; there are no static variables, so the same operator (for
+      example sort) can appear several times in one plan.</li>
+      <li>Support functions import all item-level work (predicate, hash, compare, transform, apply), so Volcano
+      has no instance type system and is data-model independent.</li>
+      <li>Two meta-operators provide control, not data: choose-plan (dynamic plans) and exchange (parallelism).</li>
+      <li>exchange encapsulates all parallelism and translates demand-driven dataflow inside a process to
+      data-driven (push, eager) dataflow between processes. Reported speedup 14.9 on 16 CPUs.</li>
+    </ul>
+  </div>
+
+  <table>
+    <caption>Course operators mapped onto Volcano operators</caption>
+    <thead><tr><th>Course operator</th><th>Volcano operator</th><th>Note</th></tr></thead>
+    <tbody>
+      <tr><td>SeqScan</td><td>file-scan iterator</td><td>leaf operator, optional predicate in state record</td></tr>
+      <tr><td>Filter</td><td>filter operator (predicate support fn)</td><td>fuses selection, projection, side effects in one operator</td></tr>
+      <tr><td>Project</td><td>filter operator (transform support fn)</td><td>projection without duplicate elimination</td></tr>
+      <tr><td>Join</td><td>one-to-one match</td><td>hybrid hash and sort-merge; build/probe/flush map onto open and next</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout gotcha">
+    <p class="callout-title">Exam trick: flow control is not pull</p>
+    <p>Flow control is an optional back-pressure semaphore on the data-driven path that bounds how far producers
+    run ahead, allowing slack and genuinely overlapped execution. Demand-driven dataflow is rigid: the consumer
+    blocks while the producer computes the next record, so there is no overlap. Flow control limits eager
+    production; pull never produces ahead at all.</p>
+  </div>
+
+  <h3>Question bank</h3>
+
+  <p><strong>Q1. What are the three procedures of the iterator interface and what does each do?</strong></p>
+  <details class="deepdive"><summary>Model answer</summary><div>
+    <p>open, next, and close. open initializes operator state (for example allocates a hash table) and
+    recursively opens all inputs. next produces and returns one result record at a time, calling next on inputs
+    only when more input is needed, and signals end-of-stream when exhausted. close releases resources and
+    recursively shuts down the inputs (Section III.B).</p>
+  </div></details>
+
+  <p><strong>Q2. Why does demand-driven (pull) dataflow matter, and who initiates the work?</strong></p>
+  <details class="deepdive"><summary>Model answer</summary><div>
+    <p>The consumer pulls: the root operator's next is called repeatedly, and each operator calls next on its
+    input only when it needs another record. This is lazy evaluation, so an operator never produces more than
+    the consumer demands, which the paper says minimizes both time overhead (operator synchronization) and space
+    (records resident in memory at once) for single-process execution (Section III.B).</p>
+  </div></details>
+
+  <p><strong>Q3. Why must every operator share exactly one interface? What does that buy?</strong></p>
+  <details class="deepdive"><summary>Model answer</summary><div>
+    <p>Because an operator only ever calls open-next-close on its input, it never needs to know what produces
+    that input (anonymous streams). This lets any operators nest in any combination, lets new operators be added
+    without touching existing ones, and lets exchange be inserted anywhere to add parallelism. Uniformity is the
+    basis of both extensibility and the orthogonality of data manipulation and parallelism (Sections III.B, IV, VI).</p>
+  </div></details>
+
+  <p><strong>Q4. What is a support function and why is it the key to data-model independence?</strong></p>
+  <details class="deepdive"><summary>Model answer</summary><div>
+    <p>A support function is an imported function entry point plus a typeless argument that performs all
+    item-level work (predicates, hashing, comparison, projection, side effects). Volcano's iterators are empty
+    shells without them. Because all interpretation of data items is imported, Volcano needs no instance type
+    system and works for any data type or model, which is why a new abstract data type does not change the
+    Volcano code at all (Introduction, Section III.A, Section IV).</p>
+  </div></details>
+
+  <p><strong>Q5. What is a state record and why can the same operator appear multiple times in one plan?</strong></p>
+  <details class="deepdive"><summary>Model answer</summary><div>
+    <p>A state record holds an iterator instance's arguments and runtime state, and operators are linked by input
+    pointers stored in state records. Because all state lives in the state record and there are no static
+    variables, an algorithm such as sort can be instantiated several times in one query by giving each
+    occurrence its own state record (Section III.B).</p>
+  </div></details>
+
+  <p><strong>Q6. How do SeqScan, Filter, Project, and Join map onto Volcano operators?</strong></p>
+  <details class="deepdive"><summary>Model answer</summary><div>
+    <p>SeqScan is the file-scan iterator. Filter is the filter operator's predicate function and Project is its
+    transform function, so Volcano fuses selection, projection, and side-effect/apply into one filter operator.
+    Join is the one-to-one match operator, with hybrid hash and sort-merge implementations whose build/probe/flush
+    phases map onto open (build) and next (probe then flush) (Sections III.B.1, III.B.2).</p>
+  </div></details>
+
+  <p><strong>Q7. Why is one-to-one match a single operator for so many logical operations?</strong></p>
+  <details class="deepdive"><summary>Model answer</summary><div>
+    <p>All of join, semi-join, outer joins, anti-join, intersection, union, difference, anti-difference,
+    aggregation, and duplicate elimination reduce to the same step: separate the matching and non-matching
+    subsets of two inputs and emit selected subsets, possibly transformed (Fig. 3). Unary operations compare
+    items within one input; binary operations compare items across two. One general module is more compact and
+    lets the same overflow and algorithm machinery serve all of them (Section III.B.2).</p>
+  </div></details>
+
+  <p><strong>Q8. What does the exchange operator do, and why is it called a meta-operator?</strong></p>
+  <details class="deepdive"><summary>Model answer</summary><div>
+    <p>Exchange encapsulates all parallelism: it forks processes, creates a shared-memory port, partitions or
+    routes data, and drives the subtree below it as a producer while acting as an ordinary iterator to the
+    consumer above. It is a meta-operator because it performs no data manipulation; it only provides control.
+    Crucially it uses and provides the standard iterator interface, so the operators around it never know it is
+    there (Section VI).</p>
+  </div></details>
+
+  <p><strong>Q9. Exchange uses a different dataflow paradigm internally. Which, and why?</strong></p>
+  <details class="deepdive"><summary>Model answer</summary><div>
+    <p>Within a process all operators use demand-driven (pull, lazy) dataflow. Between processes exchange uses
+    data-driven (push, eager) dataflow, so it can collect output into packets and push them through the port.
+    The two stated reasons are that data-driven flow composes more easily with horizontal partitioning and that
+    it removes the need for request messages, which would add control overhead. Exchange translates between the
+    two paradigms at the process boundary (Section VI.A).</p>
+  </div></details>
+
+  <p><strong>Q10. Follow-up: is flow control the same as demand-driven dataflow? Distinguish them.</strong></p>
+  <details class="deepdive"><summary>Model answer</summary><div>
+    <p>No. Flow control is an optional back-pressure semaphore on the data-driven path that bounds how far
+    producers may run ahead of consumers, allowing slack and genuinely overlapped producer/consumer execution.
+    Demand-driven dataflow is a rigid request-and-deliver discipline in which the consumer blocks while the
+    producer computes the next record, so there is no overlap. Flow control limits eager production; pull simply
+    never produces ahead at all (Section VI.A).</p>
+  </div></details>
+
+  <p><strong>Q11. Name the forms of parallelism exchange supports and how each is requested.</strong></p>
+  <details class="deepdive"><summary>Model answer</summary><div>
+    <p>Vertical parallelism (pipelining) between a producer process and a consumer process. Bushy parallelism,
+    where different CPUs run different subtrees. Intra-operator parallelism, where several CPUs run the same
+    operator on disjoint partitions. Vertical and bushy are inter-operator parallelism. Intra-operator
+    parallelism is requested by setting the degree-of-parallelism argument in the exchange state record and
+    supplying a partitioning support function; bushy parallelism is requested by inserting exchange operators
+    between subtrees (Section VI.A, VI.B).</p>
+  </div></details>
+
+  <p><strong>Q12. How is data partitioned across consumers, and how is the partitioning policy chosen?</strong></p>
+  <details class="deepdive"><summary>Model answer</summary><div>
+    <p>A port can hold multiple queues, one per consumer process. The producer calls a partitioning support
+    function to decide which queue (packet) each output record goes to. By supplying different support functions
+    you get round-robin, key-range, or hash partitioning. As elsewhere, exchange provides the mechanism and the
+    support function provides the policy (Section VI.B).</p>
+  </div></details>
+
+  <p><strong>Q13. What is the claimed benefit of orthogonalizing data manipulation and parallelism, and what evidence backs it?</strong></p>
+  <details class="deepdive"><summary>Model answer</summary><div>
+    <p>An operator is written, debugged, and tuned in a single process and then parallelized just by inserting
+    exchange into the plan, with no change to the operator; even operators not yet designed can be parallelized
+    if they use the iterator interface. To port to a new parallel machine only exchange changes. The evidence
+    cited is near-linear speedup, specifically 14.9 on 16 CPUs for parallel sorting on shared memory (Abstract,
+    Section VII, reference [18]).</p>
+  </div></details>
+
+  <p><strong>Q14. What is the choose-plan operator and when would you use it?</strong></p>
+  <details class="deepdive"><summary>Model answer</summary><div>
+    <p>choose-plan is a meta-operator with the standard open-next-close interface that selects among several
+    equivalent subplans at runtime. Its open calls a support function (given the bindings parameter) to pick a
+    plan, then opens it; next and close forward to the chosen input. It is used for dynamic query evaluation
+    plans, for example an embedded query whose predicate constant is a program variable, so the plan can switch
+    between an index scan and a full file scan depending on the actual value (Section V).</p>
+  </div></details>
+
+  <p><strong>Q15. Why does Volcano avoid temporary files between operators, and where do intermediate results live?</strong></p>
+  <details class="deepdive"><summary>Model answer</summary><div>
+    <p>Passing data through temporary files, as many textbooks suggest, has a substantial performance penalty
+    and is used in neither real systems nor Volcano. Intermediate results (streams) live on virtual devices
+    whose pages exist only in the buffer pool and disappear when unpinned, so the same file and buffer
+    mechanisms serve both permanent and intermediate data while keeping data in memory (Introduction,
+    Section III.A, Section III.B).</p>
+  </div></details>
+
+  <p><strong>Q16. How does Volcano keep buffer accounting correct as records flow between operators?</strong></p>
+  <details class="deepdive"><summary>Model answer</summary><div>
+    <p>Each pinned record is owned by exactly one operator at a time. On receiving a record an operator may keep
+    it, unfix it (for example on predicate failure), or pass it on; operators that build new records must fix
+    their outputs and unfix their inputs. To keep buffer-call counts low, the buffer interface needs two calls
+    per cluster on the producer side and one per cluster on the consumer side, independent of records per cluster
+    (Section III.B).</p>
+  </div></details>
+
+  <hr>
+
+  <!-- ============================================================ -->
+  <!-- PAPER 3: BIGTABLE                                            -->
+  <!-- ============================================================ -->
+  <h2 id="bigtable">3. Bigtable: a distributed storage system for structured data</h2>
+  <p class="muted">Chang et al., OSDI 2006. The data model, tablets, the LSM write path, and compaction.</p>
+
+  <h3>What and why</h3>
+  <p>Google needed one storage system to hold petabytes of structured data across thousands of commodity
+  machines and serve workloads as different as backend batch indexing and latency-sensitive user-facing
+  serving. Relational and parallel databases gave a full relational model with transactions but not the
+  elasticity, operational simplicity at scale, or direct control over physical data layout Google wanted.
+  Bigtable's answer was to drop the full relational model for a sparse, distributed, persistent,
+  multidimensional sorted map keyed by (row, column, timestamp), with every value an uninterpreted byte array,
+  and it became the template that HBase, Cassandra's storage engine, and the wider LSM lineage copied.</p>
+
+  <div class="callout viva">
+    <p class="callout-title">Five facts most likely to be asked</p>
+    <ul>
+      <li>Data model: <code>(row:string, column:string, time:int64) -&gt; string</code>; sparse, sorted by row
+      key; values are uninterpreted bytes. Single-row read/write is atomic; no general cross-row transactions.</li>
+      <li>Three building blocks: GFS (stores logs and SSTables), SSTable (immutable ordered map, ~64KB blocks,
+      single-seek lookup), Chubby (Paxos lock service, 5 replicas).</li>
+      <li>Three-level tablet location: Chubby file to root tablet (never split) to METADATA tablets to user
+      tablets; addresses 2^34 tablets = 2^61 bytes.</li>
+      <li>Write path: check and authorize, write to per-server commit log with group commit, then insert into
+      the in-memory sorted memtable. Reads merge memtable plus SSTables.</li>
+      <li>Compaction trio: minor (memtable to SSTable), merging (few SSTables to one), major (all to one,
+      dropping deletion entries). This is the LSM-tree pattern (Section 10).</li>
+    </ul>
+  </div>
+
+  <table>
+    <caption>The three compaction types</caption>
+    <thead><tr><th>Type</th><th>Inputs to outputs</th><th>Purpose</th></tr></thead>
+    <tbody>
+      <tr><td>Minor</td><td>frozen memtable to one new SSTable</td><td>shrink memory and commit-log replay on recovery</td></tr>
+      <tr><td>Merging</td><td>a few SSTables + memtable to one SSTable</td><td>bound how many files a read must merge</td></tr>
+      <tr><td>Major</td><td>all SSTables to exactly one</td><td>drop deletion entries and deleted data, reclaim space in bounded time</td></tr>
+    </tbody>
+  </table>
+
+  <figure>
+    <div class="diagram">
+      <svg viewBox="0 0 520 120" role="img" aria-label="Bigtable write and read paths">
+        <g class="svg-label">
+          <text x="10" y="20">write</text>
+          <rect x="60"  y="6" width="120" height="26" rx="4" fill="var(--paper-2)" stroke="var(--rule)"/>
+          <text x="120" y="23" text-anchor="middle">commit log (GFS)</text>
+          <rect x="210" y="6" width="120" height="26" rx="4" fill="var(--recovery-bg)" stroke="var(--rule)"/>
+          <text x="270" y="23" text-anchor="middle">memtable (RAM)</text>
+          <path d="M180 19 L210 19" stroke="var(--ink-faint)" fill="none" marker-end="url(#bh)"/>
+
+          <text x="10" y="80">read</text>
+          <rect x="210" y="66" width="120" height="26" rx="4" fill="var(--recovery-bg)" stroke="var(--rule)"/>
+          <text x="270" y="83" text-anchor="middle">memtable</text>
+          <rect x="350" y="52" width="100" height="22" rx="4" fill="var(--paper-2)" stroke="var(--rule)"/>
+          <text x="400" y="67" text-anchor="middle">SSTable</text>
+          <rect x="350" y="80" width="100" height="22" rx="4" fill="var(--paper-2)" stroke="var(--rule)"/>
+          <text x="400" y="95" text-anchor="middle">SSTable</text>
+          <text x="200" y="112" class="svg-faint">merged sorted view</text>
+        </g>
+        <defs><marker id="bh" markerWidth="7" markerHeight="7" refX="6" refY="3" orient="auto">
+          <path d="M0 0 L6 3 L0 6 z" fill="var(--ink-faint)"/></marker></defs>
+      </svg>
+    </div>
+    <figcaption><b>LSM write and read.</b> Writes land in the log then the memtable; reads merge the sorted
+    memtable with immutable SSTables. Compaction folds SSTables back down.</figcaption>
+  </figure>
+
+  <h3>Question bank</h3>
+
+  <p><strong>Q1. What exactly is the Bigtable data model, and what is the key type?</strong></p>
+  <details class="deepdive"><summary>Model answer</summary><div>
+    <p>It is a sparse, distributed, persistent, multidimensional sorted map (Section 2). The key is the triple
+    (row:string, column:string, time:int64) and the value is an uninterpreted array of bytes. Sparse means
+    absent cells cost nothing; sorted means rows are stored in lexicographic row-key order.</p>
+  </div></details>
+
+  <p><strong>Q2. What atomicity does Bigtable guarantee, and what does it not?</strong></p>
+  <details class="deepdive"><summary>Model answer</summary><div>
+    <p>Every read or write under a single row key is atomic across any number of columns (Section 2). It does not
+    provide general cross-row or distributed transactions in the base API; clients can only batch cross-row
+    writes (Section 3). They deferred general transactions deliberately because most applications needed only
+    single-row atomicity (Section 9).</p>
+  </div></details>
+
+  <p><strong>Q3. Walk through the write path.</strong></p>
+  <details class="deepdive"><summary>Model answer</summary><div>
+    <p>The tablet server checks the mutation is well-formed and the writer is authorized (reading
+    permitted-writers from a Chubby file, usually a cache hit), writes the mutation to the per-server commit log
+    using group commit, and only after the commit inserts it into the in-memory sorted memtable (Section 5.3).
+    The data is durable once the log write commits; the memtable insert just makes it readable.</p>
+  </div></details>
+
+  <p><strong>Q4. Walk through the read path and explain why the merge is cheap.</strong></p>
+  <details class="deepdive"><summary>Model answer</summary><div>
+    <p>A read runs over a merged view of the memtable plus the tablet's sequence of SSTables (Section 5.3). Both
+    structures are lexicographically sorted, so the merge is an efficient merge of sorted streams. Bloom filters
+    and the block/scan caches reduce how many SSTables actually get touched (Section 6).</p>
+  </div></details>
+
+  <p><strong>Q5. Define the three compaction types and what each is for.</strong></p>
+  <details class="deepdive"><summary>Model answer</summary><div>
+    <p>Minor compaction freezes a full memtable and writes it to GFS as a new SSTable, shrinking memory and
+    recovery cost. Merging compaction folds a few SSTables plus the memtable into one new SSTable to bound the
+    number of files a read must merge. Major compaction rewrites all SSTables into exactly one and drops all
+    deletion entries and deleted data, reclaiming space and ensuring timely physical deletion (Section 5.4).</p>
+  </div></details>
+
+  <p><strong>Q6. Why are SSTables immutable, and what does that buy?</strong></p>
+  <details class="deepdive"><summary>Model answer</summary><div>
+    <p>Immutability means reads need no file-system locking, so row concurrency control is cheap; the only
+    mutable shared structure is the memtable, made copy-on-write (Section 6, "Exploiting immutability"). It turns
+    deletion into garbage collection of obsolete SSTables (mark-and-sweep with METADATA as roots), and it makes
+    tablet splits fast because children share the parent's SSTables instead of rewriting them.</p>
+  </div></details>
+
+  <p><strong>Q7. Describe the three-level tablet location hierarchy and its addressing capacity.</strong></p>
+  <details class="deepdive"><summary>Model answer</summary><div>
+    <p>Level one is a Chubby file pointing to the root tablet; the root tablet (first METADATA tablet, never
+    split) points to all other METADATA tablets; each METADATA tablet points to user tablets (Section 5.1,
+    Figure 4). With ~1KB per METADATA row and 128 MB METADATA tablets, it addresses 2^34 tablets, i.e. 2^61
+    bytes. The root is never split precisely to cap the hierarchy at three levels.</p>
+  </div></details>
+
+  <p><strong>Q8. A client has a stale location cache. How many round-trips can a lookup take and why?</strong></p>
+  <details class="deepdive"><summary>Model answer</summary><div>
+    <p>Up to six round-trips, versus three for a cold cache (Section 5.1). Stale entries are only discovered on a
+    miss, so the client may chase a wrong location, miss, and have to walk back up the hierarchy, doubling the
+    worst-case path. Prefetching multiple tablets' metadata per METADATA read mitigates this.</p>
+  </div></details>
+
+  <p><strong>Q9. How does Bigtable detect a dead tablet server and prevent split-brain?</strong></p>
+  <details class="deepdive"><summary>Model answer</summary><div>
+    <p>Each tablet server holds an exclusive Chubby lock on a uniquely named file (Section 5.2). The master
+    periodically checks lock status; if a server is unreachable or reports losing its lock, the master tries to
+    acquire that lock and, on success, deletes the server's file so the server can never serve again, then
+    reassigns its tablets. The master also kills itself if its own Chubby session expires, and master death does
+    not reassign tablets, so there is no split brain.</p>
+  </div></details>
+
+  <p><strong>Q10. Why one commit log per tablet server rather than one per tablet, and what is the recovery cost?</strong></p>
+  <details class="deepdive"><summary>Model answer</summary><div>
+    <p>A log per tablet would create huge numbers of concurrent GFS files, cause many disk seeks, and shrink
+    group-commit batches (Section 6). The cost is that one log co-mingles many tablets' mutations, so recovery
+    sorts entries by (table, row name, log sequence number) to make each tablet's mutations contiguous,
+    parallelized over 64 MB segments coordinated by the master, avoiding re-reading the whole log once per
+    recovering server.</p>
+  </div></details>
+
+  <p><strong>Q11. What does Chubby provide to Bigtable, and what is the risk?</strong></p>
+  <details class="deepdive"><summary>Model answer</summary><div>
+    <p>Chubby ensures a single active master, stores the bootstrap location, discovers and fences tablet servers,
+    and stores schema and ACLs (Section 4). It is five Paxos replicas, live with a majority. The risk is a hard
+    dependency: if Chubby is unavailable long enough, Bigtable is unavailable; measured unavailability from
+    Chubby was 0.0047% on average across 14 clusters.</p>
+  </div></details>
+
+  <p><strong>Q12. What are locality groups and how do they differ from column families?</strong></p>
+  <details class="deepdive"><summary>Model answer</summary><div>
+    <p>A column family is the unit of access control and accounting, grouping related column keys (Section 2). A
+    locality group groups several families that are accessed together so each group gets its own SSTable per
+    tablet, letting a read skip groups it does not need (Section 6). A locality group can also be marked
+    in-memory and given its own compression settings.</p>
+  </div></details>
+
+  <p><strong>Q13. Why are small random reads the worst-performing and worst-scaling operation?</strong></p>
+  <details class="deepdive"><summary>Model answer</summary><div>
+    <p>Each random read must fetch a full 64KB SSTable block from GFS over the network even though only a
+    1000-byte value is wanted; at ~1212 reads/s that is ~75 MB/s and it saturates the tablet server CPU and the
+    network (Section 7). When scaling out, these block transfers saturate shared 1 Gbps links, so random reads
+    scale only ~100x across 500 servers while random reads from memory scale ~300x. Apps mitigate by lowering
+    block size to ~8KB.</p>
+  </div></details>
+
+  <p><strong>Q14. How is Bigtable related to the LSM-tree, and where does the paper say so?</strong></p>
+  <details class="deepdive"><summary>Model answer</summary><div>
+    <p>Bigtable's memtable-plus-immutable-SSTable design with compaction is an LSM-tree storage engine: writes
+    buffer in a sorted in-memory structure, flush to immutable sorted files, and reads merge memory and disk.
+    Section 10 states explicitly that this is "analogous to the way that the Log-Structured Merge Tree [26]
+    stores updates," citing O'Neil et al. 1996.</p>
+  </div></details>
+
+  <p><strong>Q15. Bigtable does not replicate data in its data plane. So how is durability and cross-cluster availability achieved?</strong></p>
+  <details class="deepdive"><summary>Model answer</summary><div>
+    <p>Durability comes from below Bigtable: GFS replicates the commit log and SSTable files, and Chubby
+    replicates coordination state via Paxos (Section 4). Cross-cluster availability is handled above the
+    single-cluster data plane; for example Personalized Search first used client-side eventual-consistency
+    replication and then a server-side replication subsystem (Section 8.3), and the paper notes planned
+    cross-data-center multi-master replication (Section 11).</p>
+  </div></details>
+
+  <p><strong>Q16. How does Bigtable delete data, given that SSTables are immutable?</strong></p>
+  <details class="deepdive"><summary>Model answer</summary><div>
+    <p>A delete writes a deletion entry (tombstone) into a new SSTable that suppresses older live values during
+    the merged read (Section 5.4). The data is only physically removed when a major compaction rewrites all
+    SSTables into one without any deletion entries or deleted data; Bigtable cycles major compactions over all
+    tablets so deleted data disappears in bounded time, which matters for sensitive data.</p>
+  </div></details>
+
+  <hr>
+
+  <!-- ============================================================ -->
+  <!-- PAPER 4: ARIES                                               -->
+  <!-- ============================================================ -->
+  <h2 id="aries">4. ARIES: a transaction recovery method</h2>
+  <p class="muted">Mohan et al., ACM TODS 1992. WAL, the page_LSN invariant, repeating history, CLRs, and the
+  three restart passes.</p>
+
+  <h3>What and why</h3>
+  <p>Before ARIES, the WAL recovery methods in shipping systems (IMS, DB2, Tandem NonStop SQL, AS/400) all had
+  defects: some undid the same action twice, some undid updates never present on the page, some undid committed
+  updates already on disk and then redid them, and rollback could generate unbounded new log. None cleanly
+  supported fine-granularity (record level) locking together with operation logging. ARIES gives one method
+  supporting steal and no-force, partial rollbacks, fine-granularity locking, operation and value logging,
+  fuzzy checkpoints, media recovery, and restart parallelism, keeping work bounded and page state always
+  precisely correlated with the log.</p>
+
+  <div class="callout viva">
+    <p class="callout-title">Five facts most likely to be asked</p>
+    <ul>
+      <li>Three principles: write-ahead logging, repeating history during redo, and logging changes during undo
+      via CLRs.</li>
+      <li>WAL protocol: log (at least undo portions) reaches stable storage before the dirty page; commit
+      forces the log up to the commit record's LSN.</li>
+      <li>page_LSN is the LSN of the most recent update to a page; it makes the conditional redo test sound.</li>
+      <li>Three restart passes: Analysis (rebuild tables, find losers, compute RedoLSN = min RecLSN), Redo
+      (conditional on page_LSN), Undo (unconditional, writes CLRs).</li>
+      <li>Steal implies undo may be needed; no-force implies redo may be needed. CLRs are redo-only and carry
+      UndoNxtLSN, which bounds logging under repeated or nested rollbacks.</li>
+    </ul>
+  </div>
+
+  <table>
+    <caption>The three restart passes</caption>
+    <thead><tr><th>Pass</th><th>Direction</th><th>Produces</th><th>Conditional?</th></tr></thead>
+    <tbody>
+      <tr><td>Analysis</td><td>forward from last checkpoint</td><td>Transaction Table, Dirty Pages Table, loser set, RedoLSN</td><td>n/a</td></tr>
+      <tr><td>Redo</td><td>forward from RedoLSN</td><td>failure-time state (repeating history), no logging</td><td>yes: redo only if page_LSN &lt; log LSN</td></tr>
+      <tr><td>Undo</td><td>backward over losers</td><td>rolled-back losers, writes CLRs</td><td>no: undo is unconditional</td></tr>
+    </tbody>
+  </table>
+
+  <table>
+    <caption>Buffer policy implies recovery work</caption>
+    <thead><tr><th>Policy</th><th>Meaning</th><th>Implies</th></tr></thead>
+    <tbody>
+      <tr><td>Steal</td><td>uncommitted dirty page may reach disk before commit</td><td>undo may be needed at restart</td></tr>
+      <tr><td>No-force</td><td>committed transaction need not flush its dirty pages</td><td>redo may be needed at restart</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout gotcha">
+    <p class="callout-title">Exam trick: redo conditional, undo unconditional</p>
+    <p>Redo checks the page (reapply only if page_LSN &lt; record LSN, else it already reached disk). Undo does
+    not consult page_LSN, because after repeating history every loser update is known to be present and must be
+    reversed. A CLR is redo-only and is never itself undone.</p>
+  </div>
+
+  <h3>Question bank</h3>
+
+  <p><strong>Q1. What does the page_LSN field store and why is it essential?</strong></p>
+  <details class="deepdive"><summary>Model answer</summary><div>
+    <p>The page_LSN is the LSN of the log record describing the most recent update applied to that page
+    (Section 4.2). It lets ARIES test, during redo, whether a logged update is already reflected on the page, so
+    the system never redoes an effect already present and never undoes an effect not present. Without it
+    operation logging would be unsound.</p>
+  </div></details>
+
+  <p><strong>Q2. State the WAL protocol precisely.</strong></p>
+  <details class="deepdive"><summary>Model answer</summary><div>
+    <p>Before a dirty page is written to the durable database, the log records describing its changes (at least
+    the undo portions) must already be on stable storage; and a transaction is not committed until its commit
+    record and all earlier log up to that LSN are forced to stable storage (Section 1.1). The buffer manager
+    enforces this, sometimes by forcing the log up to a page's page_LSN before stealing it.</p>
+  </div></details>
+
+  <p><strong>Q3. Why do steal and no-force respectively force ARIES to do undo and redo at restart?</strong></p>
+  <details class="deepdive"><summary>Model answer</summary><div>
+    <p>Steal lets an uncommitted transaction's dirty page reach disk before commit, so on a crash those
+    uncommitted changes must be undone. No-force lets a committed transaction's dirty pages stay in the buffer,
+    so on a crash those committed changes may be missing from disk and must be redone (buffer management
+    discussion in Section 4).</p>
+  </div></details>
+
+  <p><strong>Q4. What is "repeating history" and why does ARIES redo even the losers' updates?</strong></p>
+  <details class="deepdive"><summary>Model answer</summary><div>
+    <p>Repeating history means the redo pass reapplies every logged update whose effect did not reach disk, for
+    all transactions including losers (Section 3). This reestablishes the exact database state as of the failure.
+    Only then are losers undone. This guarantees ARIES never has to undo an update that is absent and never
+    undoes-then-redoes a committed update already on disk, the failures it criticizes in other methods (Section 2).</p>
+  </div></details>
+
+  <p><strong>Q5. What is a Compensation Log Record and why is it redo-only?</strong></p>
+  <details class="deepdive"><summary>Model answer</summary><div>
+    <p>A CLR is the log record written when ARIES undoes an update (Section 3). It is redo-only because it is
+    never itself undone; its UndoNxtLSN points to the predecessor of the record it compensated, so once undo
+    work is logged it is permanent and rollback proceeds forward through the remaining records to undo
+    (Section 4.1).</p>
+  </div></details>
+
+  <p><strong>Q6. How does UndoNxtLSN bound the amount of logging during repeated or nested rollbacks?</strong></p>
+  <details class="deepdive"><summary>Model answer</summary><div>
+    <p>UndoNxtLSN in the last-written CLR records exactly how far rollback has progressed. If a failure
+    interrupts rollback, recovery resumes at UndoNxtLSN and skips records already undone, so no record is undone
+    twice and no extra CLRs are generated for already-compensated work (Section 3). Contrast IMS, which can undo
+    the same non-CLR multiple times.</p>
+  </div></details>
+
+  <p><strong>Q7. What are the three restart passes and what does each produce?</strong></p>
+  <details class="deepdive"><summary>Model answer</summary><div>
+    <p>Analysis scans forward from the last checkpoint, rebuilds the Transaction Table and Dirty Pages Table,
+    identifies losers, and computes RedoLSN (Section 6.1). Redo scans forward from RedoLSN repeating history
+    (Section 6.2). Undo scans backward rolling back losers and writing CLRs (Section 6.3).</p>
+  </div></details>
+
+  <p><strong>Q8. How is RedoLSN, the start of the redo pass, computed?</strong></p>
+  <details class="deepdive"><summary>Model answer</summary><div>
+    <p>RedoLSN is the minimum RecLSN over all entries in the Dirty Pages Table (Section 4.4 and Section 6.1).
+    RecLSN for a page is the end-of-log LSN at the moment the page was first dirtied, marking the earliest log
+    point whose updates might not yet be on disk. The minimum across all dirty pages is therefore the earliest
+    point redo could matter.</p>
+  </div></details>
+
+  <p><strong>Q9. Why is redo conditional but undo unconditional?</strong></p>
+  <details class="deepdive"><summary>Model answer</summary><div>
+    <p>Redo checks the page: it reapplies a record only if the page's page_LSN is less than the record's LSN,
+    otherwise the update already reached disk and is skipped (Figure 11). Undo does not consult the page_LSN to
+    decide whether to undo, because after repeating history every loser update is known to be present and must be
+    reversed (Section 3, Section 6.3).</p>
+  </div></details>
+
+  <p><strong>Q10. What is logical undo and what makes it possible in ARIES?</strong></p>
+  <details class="deepdive"><summary>Model answer</summary><div>
+    <p>Logical undo means the undo of an action need not be the exact physical inverse on the same page(s) as the
+    original. It is possible because the CLR describes what the undo actually did, so the system has a precise
+    record independent of the original page layout (Section 3). This supports high-concurrency operations such as
+    record-level changes that may move data across pages.</p>
+  </div></details>
+
+  <p><strong>Q11. Which transactions are "losers" and where does the loser set come from?</strong></p>
+  <details class="deepdive"><summary>Model answer</summary><div>
+    <p>Losers are transactions that at the time of the failure had neither committed nor reached the in-doubt
+    (prepared) state of two-phase commit (Section 3). The set is determined by the analysis pass from the
+    Transaction Table state (Section 6.1).</p>
+  </div></details>
+
+  <p><strong>Q12. What does the Transaction Table track, and what are its key fields?</strong></p>
+  <details class="deepdive"><summary>Model answer</summary><div>
+    <p>It tracks the state of active transactions (Section 4.3). Key fields: TransID, State (for example
+    prepared/in-doubt 'P' or unprepared 'U'), LastLSN (latest log record of the transaction), and UndoNxtLSN
+    (next record to undo; taken from the last CLR's UndoNxtLSN if the latest record is a CLR, else equal to
+    LastLSN).</p>
+  </div></details>
+
+  <p><strong>Q13. How does ARIES differ from System R shadow paging, and why does that matter for recovery?</strong></p>
+  <details class="deepdive"><summary>Model answer</summary><div>
+    <p>System R writes the updated page to a new location and keeps the old version as a shadow for recovery;
+    ARIES updates in place and relies on the log (Section 1.1, Figure 1). The paper argues (Section 10) that
+    System R's logging and recovery paradigms are inappropriate in the WAL context, and that shadowing causes
+    large space overhead and major perturbations during checkpoint and image copy.</p>
+  </div></details>
+
+  <p><strong>Q14. During undo, what happens when the undo scan encounters a CLR?</strong></p>
+  <details class="deepdive"><summary>Model answer</summary><div>
+    <p>It skips to the record identified by that CLR's UndoNxtLSN rather than processing the compensated record
+    again (Section 3, Section 6.3). This is how the backward sweep avoids redoing undo work and how the
+    single-sweep, max-LSN driving of multiple losers stays efficient.</p>
+  </div></details>
+
+  <p><strong>Q15. After a redoable record is reapplied during redo, what is set, and what is logged?</strong></p>
+  <details class="deepdive"><summary>Model answer</summary><div>
+    <p>The affected page's page_LSN is set to the redone log record's LSN, and nothing is logged during redo
+    (Figure 11, Section 6.2). Logging is unnecessary because redo only repeats already-logged history.</p>
+  </div></details>
+
+  <hr>
+
+  <footer>
+    <p class="muted">Home lessons:
+      <a href="../lessons/0001-dbms-architecture.html">Week 1 · DBMS architecture</a>,
+      <a href="../lessons/0009-query-execution-volcano.html">Week 9 · Query execution (Volcano)</a>,
+      <a href="../lessons/0011-query-optimization.html">Week 11 · Query optimization</a>,
+      <a href="../lessons/0014-logging-recovery-aries.html">Week 14 · Logging and recovery (ARIES)</a>,
+      <a href="../lessons/0015-modern-architectures-lsm.html">Week 15 · Modern architectures (LSM, Bigtable)</a>,
+      <a href="../lessons/0016-distributed-databases.html">Week 16 · Distributed databases</a>.
+      &nbsp;<a href="../index.html">Back to the Field Guide</a>.</p>
+  </footer>
+
+  </div><!-- /.col -->
+</main>
+</body>
+</html>

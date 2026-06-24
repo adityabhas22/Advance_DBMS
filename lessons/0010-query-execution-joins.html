@@ -1,0 +1,701 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lesson 10 · Joins, external sort, and aggregation · Field Guide to the Database Engine</title>
+<link rel="stylesheet" href="../assets/course.css">
+<script defer src="../assets/components.js"></script>
+</head>
+<body class="layer-query">
+<main class="page">
+
+  <!-- ===== MASTHEAD ===== -->
+  <header class="masthead col">
+    <div class="crumbs">
+      <a href="../index.html">Field Guide</a> <span>/</span>
+      <span>Part V · Query processing</span> <span>/</span>
+      <span>Week 10</span>
+    </div>
+    <span class="week-badge">Query execution</span>
+    <h1>Joins, external sort, and aggregation</h1>
+    <p class="lede">A join is a Cartesian product with a predicate stapled on. Done literally, joining two
+    million-row tables is 10<sup>12</sup> comparisons. The whole craft of join algorithms is dodging that
+    product using sortedness, a hash table, or an index. This lesson is where the iterator tree from last
+    week meets the operators that actually cost money.</p>
+  </header>
+
+  <div class="col">
+
+  <!-- ===== OBJECTIVES ===== -->
+  <div class="objectives">
+    <h4>By the end you can</h4>
+    <ul>
+      <li>Explain why a literal join is quadratic and name the three escape routes (sort, hash, index).</li>
+      <li>Write the I/O cost of naive, block, and index nested loop, sort-merge, and grace hash join, and say which buffer or selectivity knob moves each one.</li>
+      <li>Derive the external merge sort pass count and explain why two passes is the usual case.</li>
+      <li>Tell sort-based from hash-based aggregation, and identify which operators are pipeline breakers.</li>
+      <li>Answer the classic traps: which side you build the hash table on, whether hash join does inequalities, and whether an index scan always wins.</li>
+    </ul>
+  </div>
+
+  <!-- ===== WHERE THIS SITS ===== -->
+  <h2>Where this sits in the engine</h2>
+  <p>Hold the running query in mind. Most of the course follows
+  <code>SELECT name FROM emp WHERE salary &gt; 75000 ORDER BY name</code>, which has no join. So widen it for
+  one lesson. Imagine the real reporting query is
+  <code>SELECT e.name, d.dname FROM emp e JOIN dept d ON e.dept_id = d.id WHERE e.salary &gt; 75000 ORDER BY e.name</code>.
+  Now there are two tables to combine and a final sort, and the executor has to decide <em>how</em>.</p>
+
+  <p>The layer above is the optimizer (<a href="0011-query-optimization.html">week 11</a>). It already chose
+  the physical operators: it picked a join algorithm and a scan type, costed them, and handed down a physical
+  plan tree. This lesson is the menu the optimizer was choosing from, plus the exact cost formulas it used to
+  choose. The layer below is the access method and buffer pool: every operator here reads and writes pages
+  through the buffer pool (<a href="0004-buffer-pool-design.html">week 4</a>), which is why buffer count
+  <var>B</var> shows up in every cost formula on this page. An index nested loop join leans on the B+tree from
+  <a href="0006-btree-search-insert.html">week 6</a>.</p>
+
+  <p>And the operators themselves are the iterators from <a href="0009-query-execution-volcano.html">week 9</a>.
+  Each join, sort, and aggregate is an iterator with <code>open</code> / <code>next</code> / <code>close</code>.
+  The new wrinkle this week is that some of them cannot stream: a sort or a hash build has to swallow its
+  entire input before it can hand out the first tuple. Those are the pipeline breakers, and they are exactly
+  where memory runs out and the operator spills to disk.</p>
+
+  <div class="callout intuition">
+    <div class="callout-title">Intuition</div>
+    <p>A join asks: for each row on one side, which rows on the other side match? The dumb way is to ask the
+    question fresh for every single row, rescanning the other table each time. The smart ways arrange the data
+    so the matches are easy to find: put both sides in the same order (sort-merge), or build a lookup table
+    keyed on the join column (hash), or keep a pre-built index so each lookup is a few page reads (index). All
+    three trade some setup cost for not paying the quadratic rescan.</p>
+  </div>
+
+  <!-- ===== THE COST OF THE PRODUCT ===== -->
+  <h2>The problem: the product is quadratic</h2>
+  <p>A join of <var>R</var> and <var>S</var> is the Cartesian product <var>R</var> &times; <var>S</var> with the
+  matching rows kept. There are <var>|R|</var> &times; <var>|S|</var> pairs to consider. For two tables of a
+  million rows that is 10<sup>12</sup> comparisons, which is not a number you want in a per-query budget. Every
+  join algorithm is a scheme to look at far fewer than all the pairs.</p>
+
+  <div class="callout why">
+    <div class="callout-title">Why three algorithms and not one</div>
+    <p>The product is unavoidable only if you know nothing about the data. The moment you can sort it, both
+    inputs in the same order let you sweep two cursors forward once and never look back. The moment you can
+    afford a hash table, one side becomes an O(1) lookup so the other side just probes. The moment an index
+    already exists on the join key, each lookup is a short tree descent. Each algorithm exploits a different
+    pre-condition, so the optimizer picks based on what is true about <em>this</em> query: are the inputs
+    already sorted, does the smaller side fit in memory, is there a usable index, is the predicate even an
+    equality?</p>
+  </div>
+
+  <!-- ===== FIGURE: three families ===== -->
+  <figure class="diagram">
+    <svg viewBox="0 0 720 220" role="img" aria-label="Three join families side by side">
+      <!-- nested loop -->
+      <text x="120" y="22" text-anchor="middle" class="svg-label">nested loop</text>
+      <rect x="40" y="36" width="60" height="120" rx="6" fill="var(--query-bg)" stroke="var(--query)"/>
+      <text x="70" y="100" text-anchor="middle" class="svg-mono">R</text>
+      <rect x="150" y="36" width="60" height="120" rx="6" fill="#fffdf8" stroke="var(--ink-soft)"/>
+      <text x="180" y="100" text-anchor="middle" class="svg-mono">S</text>
+      <path d="M150,52 C120,52 120,70 100,70" fill="none" stroke="var(--ink-soft)" marker-end="url(#nlarr)"/>
+      <path d="M150,84 C120,84 120,102 100,102" fill="none" stroke="var(--ink-soft)" marker-end="url(#nlarr)"/>
+      <path d="M150,116 C120,116 120,134 100,134" fill="none" stroke="var(--ink-soft)" marker-end="url(#nlarr)"/>
+      <text x="125" y="180" text-anchor="middle" class="svg-label sm">rescan S per R row</text>
+      <!-- sort-merge -->
+      <text x="370" y="22" text-anchor="middle" class="svg-label">sort-merge</text>
+      <rect x="290" y="36" width="50" height="120" rx="6" fill="var(--query-bg)" stroke="var(--query)"/>
+      <text x="315" y="100" text-anchor="middle" class="svg-mono">R&uarr;</text>
+      <rect x="400" y="36" width="50" height="120" rx="6" fill="var(--query-bg)" stroke="var(--query)"/>
+      <text x="425" y="100" text-anchor="middle" class="svg-mono">S&uarr;</text>
+      <line x1="340" y1="60" x2="400" y2="60" stroke="var(--query)"/>
+      <line x1="340" y1="96" x2="400" y2="96" stroke="var(--query)"/>
+      <line x1="340" y1="132" x2="400" y2="132" stroke="var(--query)"/>
+      <text x="370" y="180" text-anchor="middle" class="svg-label sm">two cursors, one pass</text>
+      <!-- hash -->
+      <text x="610" y="22" text-anchor="middle" class="svg-label">hash</text>
+      <rect x="540" y="36" width="50" height="120" rx="6" fill="var(--query-bg)" stroke="var(--query)"/>
+      <text x="565" y="100" text-anchor="middle" class="svg-mono">S small</text>
+      <rect x="640" y="36" width="50" height="120" rx="6" fill="#fffdf8" stroke="var(--ink-soft)"/>
+      <text x="665" y="100" text-anchor="middle" class="svg-mono">R big</text>
+      <text x="565" y="172" text-anchor="middle" class="svg-label sm">build</text>
+      <text x="665" y="172" text-anchor="middle" class="svg-label sm">probe</text>
+      <path d="M640,96 L590,96" fill="none" stroke="var(--ink-soft)" marker-end="url(#nlarr)"/>
+      <defs>
+        <marker id="nlarr" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto">
+          <path d="M0,0 L7,3 L0,6 Z" fill="var(--ink-soft)"/>
+        </marker>
+      </defs>
+    </svg>
+    <figcaption><b>Figure 1.</b> Nested loop rescans the inner side; sort-merge brings both sides into the same
+    order and sweeps once; hash builds a table on the smaller side and probes it with the larger. Notice that
+    only nested loop pays for repeated rescans.</figcaption>
+  </figure>
+
+  <!-- ===== NESTED LOOP ===== -->
+  <h2>Nested loop and why buffers matter</h2>
+  <p>The naive nested loop is two for-loops: for each tuple of the outer relation <var>R</var>, scan all of the
+  inner relation <var>S</var>. With <var>M</var> pages in <var>R</var> holding <var>m</var> tuples and
+  <var>N</var> pages in <var>S</var>, the cost is</p>
+
+  <pre><code><span class="tok-com"># naive: reread all of S once per outer TUPLE</span>
+cost = M + (m * N)</code></pre>
+
+  <p>The <code>m * N</code> term is the killer. On the standard CMU worked example
+  (<var>M</var>=1000, <var>m</var>=100000, <var>N</var>=500, <var>B</var>=100 buffers, 0.1&nbsp;ms per I/O) naive
+  nested loop is about 1.4 hours
+  [<a href="https://15445.courses.cs.cmu.edu/spring2025/notes/12-joins.pdf">CMU 15-445 L12</a>]. The block variant
+  fixes the obvious waste: reread <var>S</var> once per outer <em>block</em>, not per tuple. Give the outer scan
+  <var>B</var>&nbsp;&minus;&nbsp;2 frames (one frame holds an inner page, one holds output):</p>
+
+  <pre><code><span class="tok-com"># block: reread all of S once per outer BLOCK</span>
+cost = M + (ceil(M / (B - 2)) * N)</code></pre>
+
+  <p>On the same example this drops to about 6.5 seconds. This is the first place buffer count earns its keep:
+  more frames mean a bigger outer block, fewer rereads of <var>S</var>, lower cost. The index variant replaces the
+  inner scan with an index probe at constant cost <var>C</var> per outer tuple:</p>
+
+  <pre><code><span class="tok-com"># index: probe an index on S's join key per outer tuple</span>
+cost = M + (m * C)</code></pre>
+
+  <p>Index nested loop wins when <var>S</var> has an index on the join column and either <var>R</var> is small or
+  the join is selective. PostgreSQL flags this case directly: nested loop "can be a good strategy" specifically
+  "if the right relation can be scanned with an index scan"
+  [<a href="https://www.postgresql.org/docs/current/planner-optimizer.html">PG planner</a>].</p>
+
+  <!-- ===== SORT-MERGE ===== -->
+  <h2>Sort-merge join</h2>
+  <p>Sort both inputs on the join key, then walk two cursors forward in lockstep and emit matches, exactly like
+  the merge step of merge sort. Because most keys are mostly unique, the merge is roughly <code>M + N</code>:
+  one pass over each side. The total is the cost of the two sorts plus the merge.</p>
+
+  <div class="callout keyidea">
+    <div class="callout-title">Keep this one thing</div>
+    <p>Sort-merge does not always sort. If an input already arrives sorted on the join key (from a clustered
+    index scan, or an earlier sort, or an upstream ORDER BY) that sort cost is zero and only the
+    <code>M + N</code> merge remains. Sort-merge is also free for the next operator if the query wants the output
+    sorted on the join key anyway, because the merge hands that order on.</p>
+  </div>
+
+  <p>The worst case is pathological: if every tuple shares one join value, the merge degrades to <code>M * N</code>
+  because each outer page must rescan the whole inner side for that single value. That is the same quadratic blow-up
+  as nested loop, hiding inside a merge.</p>
+
+  <!-- ===== HASH ===== -->
+  <h2>Hash join, in memory and on disk</h2>
+  <p>In-memory hash join has two phases. <b>Build:</b> scan the smaller (build) input and insert each tuple into a
+  hash table keyed on the join attribute. <b>Probe:</b> scan the larger (probe) input, hash each tuple, look up
+  matches, and re-check the actual join values because buckets collide. When the build side fits in memory the cost
+  is about <code>M + N</code>, the cheapest of the lot (about 0.45 s on the CMU example).</p>
+
+  <div class="callout gotcha">
+    <div class="callout-title">Exam trap</div>
+    <p>Two facts that the "which is false" questions live on. First, you build on the <em>smaller</em> relation, not
+    the larger, so the hash table is more likely to fit in memory. Second, hash join works <em>only</em> for
+    equi-joins on the full join key. There is no hash that turns <code>R.a &lt; S.b</code> into bucket equality, so
+    range and inequality joins fall back to nested loop or merge.</p>
+  </div>
+
+  <p>When the build side does not fit in memory, in-memory hashing breaks. Grace (partitioned) hash join fixes it.
+  Phase 1, partition: hash both inputs with one hash function <var>h1</var> into the same set of partitions written
+  to disk, so that <var>R</var> partition <var>i</var> can only match <var>S</var> partition <var>i</var>. Phase 2,
+  probe: for each partition pair, build a hash table on the smaller side and probe with the other. If a single
+  partition still does not fit, recursively repartition it with a different hash function <var>h2</var>.</p>
+
+  <pre><code><span class="tok-com"># grace: read once + write once to partition, then read once to join</span>
+partition_cost = 2 * (M + N)     <span class="tok-com"># read both, write both</span>
+probe_cost     = (M + N)         <span class="tok-com"># read both partitioned files once</span>
+total          = 3 * (M + N)</code></pre>
+
+  <p>That is linear in the input size, which is why grace hash at <code>3*(M+N)</code> crushes naive nested loop at
+  <code>M + m*N</code>: 0.45 seconds versus 1.4 hours on the same tables. PostgreSQL implements the hybrid variant,
+  which keeps one partition resident in memory and probes it immediately instead of spilling it
+  [<a href="https://doxygen.postgresql.org/nodeHashjoin_8c_source.html">nodeHashjoin.c</a>].</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 640 240" role="img" aria-label="Grace hash join two phases">
+      <text x="320" y="18" text-anchor="middle" class="svg-label">phase 1: partition both inputs by h1</text>
+      <rect x="30" y="36" width="44" height="46" rx="5" fill="var(--query-bg)" stroke="var(--query)"/>
+      <text x="52" y="64" text-anchor="middle" class="svg-mono">R</text>
+      <rect x="30" y="100" width="44" height="46" rx="5" fill="#fffdf8" stroke="var(--ink-soft)"/>
+      <text x="52" y="128" text-anchor="middle" class="svg-mono">S</text>
+      <!-- partitions -->
+      <g>
+        <rect x="160" y="34" width="40" height="26" rx="4" fill="var(--query-bg)" stroke="var(--query)"/>
+        <rect x="160" y="64" width="40" height="26" rx="4" fill="var(--query-bg)" stroke="var(--query)"/>
+        <rect x="160" y="94" width="40" height="26" rx="4" fill="var(--query-bg)" stroke="var(--query)"/>
+        <rect x="160" y="124" width="40" height="26" rx="4" fill="#fffdf8" stroke="var(--ink-soft)"/>
+        <rect x="160" y="154" width="40" height="26" rx="4" fill="#fffdf8" stroke="var(--ink-soft)"/>
+        <rect x="160" y="184" width="40" height="26" rx="4" fill="#fffdf8" stroke="var(--ink-soft)"/>
+      </g>
+      <path d="M74,59 L160,47" fill="none" stroke="var(--ink-soft)" marker-end="url(#ghr)"/>
+      <path d="M74,123 L160,137" fill="none" stroke="var(--ink-soft)" marker-end="url(#ghr)"/>
+      <text x="180" y="226" text-anchor="middle" class="svg-label sm">R0..Rk and S0..Sk on disk</text>
+      <!-- phase 2 -->
+      <text x="470" y="18" text-anchor="middle" class="svg-label">phase 2: join pair by pair</text>
+      <rect x="360" y="44" width="40" height="26" rx="4" fill="var(--query-bg)" stroke="var(--query)"/>
+      <rect x="360" y="120" width="40" height="26" rx="4" fill="#fffdf8" stroke="var(--ink-soft)"/>
+      <text x="380" y="98" text-anchor="middle" class="svg-mono">Ri</text>
+      <text x="380" y="172" text-anchor="middle" class="svg-mono">Si</text>
+      <rect x="470" y="78" width="120" height="40" rx="6" fill="#fff" stroke="var(--query)"/>
+      <text x="530" y="103" text-anchor="middle" class="svg-label sm">build Si, probe Ri</text>
+      <path d="M400,57 C440,57 440,90 470,92" fill="none" stroke="var(--ink-soft)" marker-end="url(#ghr)"/>
+      <path d="M400,133 C440,133 440,105 470,103" fill="none" stroke="var(--ink-soft)" marker-end="url(#ghr)"/>
+      <defs>
+        <marker id="ghr" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto">
+          <path d="M0,0 L7,3 L0,6 Z" fill="var(--ink-soft)"/>
+        </marker>
+      </defs>
+    </svg>
+    <figcaption><b>Figure 2.</b> Grace hash join. Phase 1 routes both inputs through <var>h1</var> so matching
+    keys land in matching partition numbers. Phase 2 only ever joins <var>R</var><sub>i</sub> against
+    <var>S</var><sub>i</sub>, never across partitions, so the in-memory join is small even when the whole tables are
+    not.</figcaption>
+  </figure>
+
+  <!-- ===== SIMULATOR 1: cost playground ===== -->
+  <h2>Simulator: the join algorithm cost playground</h2>
+  <p>Set the table sizes, the buffer frames, and the join selectivity, then read the exact I/O cost of all five
+  algorithms at once. Experiment: drag <var>B</var> up and watch block nested loop and the sort passes fall; make
+  the join selective and watch index nested loop take the lead; push the build side over the memory limit and watch
+  in-memory hash flip to grace and gain the partition pass. The bars are log-scaled wall time so a quadratic loser
+  and a linear winner fit on one chart.</p>
+
+  <figure class="sim" id="jcp-sim">
+    <div class="sim-head">
+      <span class="sim-title">Join cost playground</span>
+      <span class="sim-sub">exact I/O formulas from CMU 15-445 L12</span>
+    </div>
+    <div class="sim-body">
+      <div class="sim-stage"><svg id="jcp-svg" viewBox="0 0 560 240" width="100%"></svg></div>
+      <div class="sim-controls" id="jcp-controls">
+        <label>R pages M <input type="range" id="jcp-M" min="100" max="4000" step="100" value="1000"><output id="jcp-Mo"></output></label>
+        <label>R tuples m <input type="range" id="jcp-m" min="2000" max="400000" step="2000" value="100000"><output id="jcp-mo"></output></label>
+        <label>S pages N <input type="range" id="jcp-N" min="50" max="2000" step="50" value="500"><output id="jcp-No"></output></label>
+        <label>buffers B <input type="range" id="jcp-B" min="3" max="400" step="1" value="100"><output id="jcp-Bo"></output></label>
+        <label>index probe C <input type="range" id="jcp-C" min="1" max="6" step="1" value="2"><output id="jcp-Co"></output></label>
+        <label>ms per I/O <input type="range" id="jcp-T" min="0.1" max="20" step="0.1" value="0.1"><output id="jcp-To"></output></label>
+        <label><input type="checkbox" id="jcp-grace"> build side over memory (force grace)</label>
+      </div>
+      <div class="sim-readout" id="jcp-readout"></div>
+    </div>
+  </figure>
+  <figcaption class="muted" style="margin-top:-1rem">Run the CMU example (M=1000, m=100000, N=500, B=100,
+  0.1&nbsp;ms/IO) and confirm naive nested loop dwarfs hash by orders of magnitude: about 1.4 hours versus 0.45 s.
+  Then drop B to 3 and watch block nested loop collapse toward naive.</figcaption>
+
+  <script>
+  // Join cost playground. Self-contained. All formulas from CMU 15-445 L12.
+  (function () {
+    const svg = document.getElementById("jcp-svg");
+    const readout = document.getElementById("jcp-readout");
+    const ids = ["M","m","N","B","C","T"];
+    const inp = {}, out = {};
+    ids.forEach(function (k) { inp[k] = document.getElementById("jcp-" + k); out[k] = document.getElementById("jcp-" + k + "o"); });
+    const graceBox = document.getElementById("jcp-grace");
+
+    function fmtTime(ms) {
+      if (ms < 1000) return ms.toFixed(1) + " ms";
+      if (ms < 60000) return (ms / 1000).toFixed(2) + " s";
+      if (ms < 3600000) return (ms / 60000).toFixed(2) + " min";
+      return (ms / 3600000).toFixed(2) + " h";
+    }
+    function log2(x) { return Math.log(x) / Math.log(2); }
+
+    function sortIO(pages, B) {            // 2*pages*(1 + ceil(log_{B-1}(ceil(pages/B))))
+      if (pages <= 0) return 0;
+      const runs = Math.ceil(pages / B);
+      const passes = (runs <= 1) ? 1 : 1 + Math.ceil(Math.log(runs) / Math.log(Math.max(2, B - 1)));
+      return 2 * pages * passes;
+    }
+
+    function compute() {
+      const M = +inp.M.value, m = +inp.m.value, N = +inp.N.value;
+      const B = +inp.B.value, C = +inp.C.value, T = +inp.T.value;
+      const naive = M + m * N;
+      const block = M + Math.ceil(M / Math.max(1, B - 2)) * N;
+      const index = M + m * C;
+      const smj = sortIO(M, B) + sortIO(N, B) + (M + N);
+      const memFits = !graceBox.checked && (Math.min(M, N) <= (B - 2));
+      const hash = memFits ? (M + N) : 3 * (M + N);
+      return [
+        { k: "naive NL",  io: naive, note: "M + m*N" },
+        { k: "block NL",  io: block, note: "M + ceil(M/(B-2))*N" },
+        { k: "index NL",  io: index, note: "M + m*C" },
+        { k: "sort-merge",io: smj,   note: "sortR + sortS + (M+N)" },
+        { k: memFits ? "hash (mem)" : "hash (grace)", io: hash, note: memFits ? "M+N" : "3*(M+N)" }
+      ].map(function (r) { r.ms = r.io * T; return r; });
+    }
+
+    function render() {
+      ids.forEach(function (k) { out[k].textContent = inp[k].value; });
+      const rows = compute();
+      const W = 560, H = 240, x0 = 110, barTop = 24, barH = 26, gap = 14;
+      const maxLog = Math.max.apply(null, rows.map(function (r) { return Math.log10(Math.max(1, r.ms)); }));
+      const scale = (W - x0 - 100) / Math.max(1, maxLog);
+      const best = rows.reduce(function (a, b) { return b.io < a.io ? b : a; });
+      svg.innerHTML = "";
+      rows.forEach(function (r, i) {
+        const y = barTop + i * (barH + gap);
+        const w = Math.max(2, Math.log10(Math.max(1, r.ms)) * scale);
+        const isBest = (r.io === best.io);
+        svg.appendChild(DBMS.svg("text", { x: x0 - 8, y: y + barH / 2 + 4, "text-anchor": "end", class: "svg-mono" }, r.k));
+        svg.appendChild(DBMS.svg("rect", {
+          x: x0, y: y, width: w, height: barH, rx: 4,
+          fill: isBest ? "var(--query)" : "var(--query-bg)", stroke: "var(--query)"
+        }));
+        svg.appendChild(DBMS.svg("text", { x: x0 + w + 8, y: y + barH / 2 + 4, class: "svg-label sm" },
+          fmtTime(r.ms) + "  (" + r.io.toLocaleString() + " IO)"));
+      });
+      svg.appendChild(DBMS.svg("text", { x: x0, y: H - 8, class: "svg-label sm" }, "bar length is log10(wall time); filled bar is the cheapest"));
+      readout.textContent = "winner: " + best.k + " at " + fmtTime(best.ms) + ". formula " + best.note + ".";
+    }
+
+    ids.forEach(function (k) { inp[k].addEventListener("input", render); });
+    graceBox.addEventListener("change", render);
+    render();
+  })();
+  </script>
+
+  <!-- ===== EXTERNAL MERGE SORT ===== -->
+  <h2>External merge sort: sorting more than fits in memory</h2>
+  <p>Sort-merge join and sort-based aggregation both need to sort, and the input is often larger than memory. You
+  cannot sort in place, so you sort in two parts. <b>Run generation (pass 0):</b> read the input <var>B</var> pages
+  at a time, sort each chunk in memory, write it out as a sorted run. That produces
+  <code>ceil(N / B)</code> sorted runs. <b>Multi-way merge:</b> merge runs <var>B</var>&nbsp;&minus;&nbsp;1 at a time
+  (one input buffer per run, one output buffer), repeatedly, until one run remains. Each pass cuts the run count by a
+  factor of <var>B</var>&nbsp;&minus;&nbsp;1.</p>
+
+  <pre><code>passes  = 1 + ceil(log_{B-1}(ceil(N / B)))   <span class="tok-com"># the "1+" is run generation</span>
+total_IO = 2 * N * passes                    <span class="tok-com"># every pass reads and writes all N pages</span></code></pre>
+
+  <div class="callout gotcha">
+    <div class="callout-title">Exam trap</div>
+    <p>External merge sort is not one pass. One pass happens only when the data already fits in <var>B</var> pages.
+    The realistic common case is two passes, which works whenever the number of initial runs is at most
+    <var>B</var>&nbsp;&minus;&nbsp;1. More buffers cut passes logarithmically because the merge fan-in grows.</p>
+  </div>
+
+  <figure class="sim" id="ems-sim">
+    <div class="sim-head">
+      <span class="sim-title">External merge sort pass counter</span>
+      <span class="sim-sub">watch the formula emerge</span>
+    </div>
+    <div class="sim-body">
+      <div class="sim-stage"><svg id="ems-svg" viewBox="0 0 540 150" width="100%"></svg></div>
+      <div class="sim-controls" id="ems-controls">
+        <label>data pages N <input type="range" id="ems-N" min="8" max="4000" step="8" value="800"><output id="ems-No"></output></label>
+        <label>buffer pages B <input type="range" id="ems-B" min="3" max="200" step="1" value="10"><output id="ems-Bo"></output></label>
+      </div>
+      <div class="sim-readout" id="ems-readout"></div>
+    </div>
+  </figure>
+  <figcaption class="muted" style="margin-top:-1rem">Hold N fixed and raise B. The number of merge passes drops in
+  steps, not smoothly, because the fan-in B&minus;1 changes the logarithm base.</figcaption>
+
+  <script>
+  // External merge sort pass visualizer. Self-contained.
+  (function () {
+    const svg = document.getElementById("ems-svg");
+    const readout = document.getElementById("ems-readout");
+    const Ni = document.getElementById("ems-N"), No = document.getElementById("ems-No");
+    const Bi = document.getElementById("ems-B"), Bo = document.getElementById("ems-Bo");
+
+    function render() {
+      const N = +Ni.value, B = +Bi.value;
+      No.textContent = N; Bo.textContent = B;
+      const runs0 = Math.ceil(N / B);
+      const fan = Math.max(2, B - 1);
+      let runs = runs0, mergePasses = 0;
+      const counts = [runs0];
+      while (runs > 1) { runs = Math.ceil(runs / fan); mergePasses++; counts.push(runs); }
+      const passes = 1 + mergePasses;
+      const io = 2 * N * passes;
+
+      svg.innerHTML = "";
+      const x0 = 20, y0 = 24, cellH = 14, maxBars = 22;
+      counts.forEach(function (c, level) {
+        const y = y0 + level * (cellH + 8);
+        const shown = Math.min(c, maxBars);
+        for (let i = 0; i < shown; i++) {
+          svg.appendChild(DBMS.svg("rect", {
+            x: x0 + i * 12, y: y, width: 10, height: cellH, rx: 2,
+            fill: level === 0 ? "var(--query-bg)" : "var(--query)", stroke: "var(--query)"
+          }));
+        }
+        const lbl = (level === 0 ? "after run gen: " : "merge pass " + level + ": ") + c + " run" + (c === 1 ? "" : "s");
+        svg.appendChild(DBMS.svg("text", { x: x0 + shown * 12 + 10, y: y + 11, class: "svg-label sm" },
+          lbl + (c > maxBars ? " (truncated)" : "")));
+      });
+      readout.textContent = "runs after pass 0 = ceil(" + N + "/" + B + ") = " + runs0 +
+        "   |   fan-in = B-1 = " + fan + "   |   passes = " + passes + "   |   total IO = " + io.toLocaleString();
+    }
+    Ni.addEventListener("input", render);
+    Bi.addEventListener("input", render);
+    render();
+  })();
+  </script>
+
+  <!-- ===== AGGREGATION ===== -->
+  <h2>Aggregation two ways</h2>
+  <p>A <code>GROUP BY</code> (or <code>DISTINCT</code>) has to bring equal keys together. There are two ways, and
+  they are duals of the two join strategies.</p>
+
+  <table>
+    <caption>Sort-based versus hash-based aggregation.</caption>
+    <thead><tr><th>Property</th><th>Sort-based</th><th>Hash-based</th></tr></thead>
+    <tbody>
+      <tr><td>Method</td><td>sort on the group key, then break into a new group whenever the key changes</td><td>one hash-table entry per distinct group, updated in place</td></tr>
+      <tr><td>State held</td><td>one running group at a time</td><td>one entry per distinct group</td></tr>
+      <tr><td>Wins when</td><td>input already sorted on the key, or output must be sorted</td><td>few distinct groups relative to input size</td></tr>
+      <tr><td>Output order</td><td>sorted on the group key</td><td>no particular order</td></tr>
+      <tr><td>Spills</td><td>via the external sort</td><td>overflow groups to per-partition files (grace-style)</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout gotcha">
+    <div class="callout-title">Exam trap</div>
+    <p>The one people invert: <em>sort-based</em> aggregation output is sorted; <em>hash-based</em> output is in no
+    particular order. If a question says "sort-based aggregation output is unordered" it is describing hash
+    aggregation, and it is false.</p>
+  </div>
+
+  <!-- ===== PIPELINE BREAKERS ===== -->
+  <h2>Pipeline breakers: where memory bites</h2>
+  <p>Last week the iterator model let tuples stream through filter and projection one at a time. Some operators
+  cannot stream. A sort cannot know the first sorted tuple until it has seen the last input tuple. A hash join's
+  build side must be fully built before any probe can match. Aggregation and <code>DISTINCT</code> cannot emit the
+  first group until the input ends, because the last tuple might belong to that group. These are the pipeline
+  breakers, and they are exactly where a whole input has to live in memory, so they set the query's memory budget
+  and are where spilling to disk begins.</p>
+
+  <div class="callout realworld">
+    <div class="callout-title">In real systems</div>
+    <p>PostgreSQL governs that budget with <code>work_mem</code>, "the base maximum amount of memory to be used by
+    a query operation (such as a sort or hash table) before writing to temporary disk files," default 4&nbsp;MB and
+    applied per operator per session, so one query with several sorts and hashes can use many multiples of it
+    [<a href="https://www.postgresql.org/docs/current/runtime-config-resource.html">PG resource config</a>]. Hash
+    operations get <code>work_mem * hash_mem_multiplier</code> (default 2.0) because they are "more sensitive to
+    memory availability than equivalent sort-based operations." SQLite goes the other way: it implements joins as
+    nested loops only, with no hash join and no merge join, and makes them fast with indexes and good join ordering
+    [<a href="https://sqlite.org/optoverview.html">SQLite optimizer overview</a>].</p>
+  </div>
+
+  <!-- ===== ALGORITHM SUMMARY TABLE ===== -->
+  <h3>The cost cheat sheet</h3>
+  <table>
+    <caption>I/O cost of each join algorithm. <var>M</var>,<var>N</var> are pages; <var>m</var> is tuples in
+    <var>R</var>; <var>B</var> is buffer frames; <var>C</var> is the per-probe index cost.</caption>
+    <thead><tr><th>Algorithm</th><th>I/O cost</th><th>Wins when</th></tr></thead>
+    <tbody>
+      <tr><td>Naive nested loop</td><td>M + m&middot;N</td><td>tiny inner, or no other option</td></tr>
+      <tr><td>Block nested loop</td><td>M + ceil(M/(B&minus;2))&middot;N</td><td>more buffers available</td></tr>
+      <tr><td>Index nested loop</td><td>M + m&middot;C</td><td>index on inner key, selective join</td></tr>
+      <tr><td>Sort-merge</td><td>sort(M) + sort(N) + (M+N)</td><td>inputs pre-sorted, or output sorted</td></tr>
+      <tr><td>Grace hash</td><td>3&middot;(M+N)</td><td>equi-join, build side over memory</td></tr>
+    </tbody>
+  </table>
+
+  <details class="deepdive">
+    <summary>Deeper: why one general operator handles join, aggregation, and DISTINCT</summary>
+    <div>
+      <p>The Volcano paper folds join, semi-join, all three outer joins, anti-join, intersection, union,
+      difference, aggregation, and duplicate elimination into one physical operator it calls
+      <em>one-to-one match</em> (Section III.B.2). The unifying step is the same for all of them: separate the
+      matching and non-matching subsets of two inputs, then emit the subsets you want, possibly transformed. A
+      join emits the matching pairs; a semi-join emits matching <var>R</var> rows once; aggregation treats one
+      input as empty and groups the other. Both the hash and the sort-merge implementations live inside that one
+      module, which is why the same overflow machinery (the packing and spilling thresholds) serves a hash join
+      and a hash aggregation. Graefe even added a "flush" phase to the hash version specifically so aggregation
+      could emit its groups after the build, and the build / probe / flush phases map cleanly onto
+      <code>open</code> (build) and <code>next</code> (probe then flush).</p>
+    </div>
+  </details>
+
+  <!-- ===== FLASHCARDS ===== -->
+  <h2>Active recall</h2>
+  <div class="flashcard">
+    <div class="fc-front">Which side do you build the hash table on, and why?</div>
+    <div class="fc-back">The smaller relation, so the hash table is more likely to fit in memory. You then probe it
+    with the larger relation. Cost is about M + N when the build side fits.</div>
+  </div>
+  <div class="flashcard">
+    <div class="fc-front">Why is grace hash <code>3*(M+N)</code> and not <code>2*(M+N)</code>?</div>
+    <div class="fc-back">Partitioning reads both inputs and writes both back to disk: <code>2*(M+N)</code>. The probe
+    phase then reads both partitioned files once more: <code>+(M+N)</code>. Total <code>3*(M+N)</code>.</div>
+  </div>
+  <div class="flashcard">
+    <div class="fc-front">When does external merge sort take exactly one pass?</div>
+    <div class="fc-back">Only when the whole input fits in B pages, so run generation produces a single sorted run
+    and no merge is needed. Otherwise passes = 1 + ceil(log_{B-1}(ceil(N/B))).</div>
+  </div>
+
+  <!-- ===== VIVA ===== -->
+  <h2>Paper viva</h2>
+  <p>This week shares its assigned paper with week 9: Graefe's Volcano. The examiner will probe how the abstract
+  iterator model from last week meets the concrete join and overflow machinery of this one.</p>
+
+  <div class="callout viva">
+    <div class="callout-title">Viva prompt 1</div>
+    <p>Volcano implements join with two algorithm families, hybrid hash and sort-based merge. For the hash version,
+    how do its build, probe, and flush phases map onto the <code>open</code> / <code>next</code> / <code>close</code>
+    iterator interface?</p>
+  </div>
+  <details class="deepdive">
+    <summary>Model answer</summary>
+    <div>
+      <p>In the hash one-to-one match, <code>open</code> performs the build: it consumes the entire first
+      (build) input and inserts it into the in-memory hash table. The probe and flush phases both run inside
+      <code>next</code>. Successive <code>next</code> calls probe the second input against the hash table and
+      emit matches; when the second input is exhausted, <code>next</code> switches automatically to the flush
+      phase, which is Graefe's addition so the same operator can serve aggregation (emit the accumulated groups).
+      Because the entire build input is consumed in <code>open</code> before any output, the build side is a
+      pipeline breaker. This is from Volcano Section III.B.2. The point to make is that even a stateful,
+      memory-hungry operator hides behind the same three-procedure interface, so the operators above it never
+      learn it is a hash join rather than a scan.</p>
+    </div>
+  </details>
+
+  <div class="callout viva">
+    <div class="callout-title">Viva prompt 2</div>
+    <p>Textbooks suggest passing intermediate results between operators through temporary files. Volcano refuses to.
+    Where do intermediate results live instead, and what is the cost argument?</p>
+  </div>
+  <details class="deepdive">
+    <summary>Model answer</summary>
+    <div>
+      <p>Volcano keeps intermediate streams on <em>virtual devices</em> whose pages exist only in the buffer pool
+      and vanish when unpinned (Section III.A, III.B). The cost argument is that routing data through real
+      temporary files carries a substantial penalty and is used in neither real systems nor Volcano. Each record
+      handed between operators is pinned in the buffer and owned by exactly one operator at a time; an operator may
+      hold it, unfix it on a predicate failure, or pass it on. To keep buffer-manager call counts low the interface
+      was redesigned to need two buffer calls per cluster on the producer side and one per cluster on the consumer
+      side, independent of how many records a cluster holds. The connection to this week: this is exactly why a
+      pipelined chain (scan to filter to projection to probe) never touches disk, while a pipeline breaker that
+      overflows memory is the one place data does spill, through the same buffer and file machinery.</p>
+    </div>
+  </details>
+
+  <div class="callout viva">
+    <div class="callout-title">Viva prompt 3</div>
+    <p>Volcano controls hash overflow with two state-record parameters, a packing threshold and a spilling
+    threshold. What do they do, and what does setting both to zero give you?</p>
+  </div>
+  <details class="deepdive">
+    <summary>Model answer</summary>
+    <div>
+      <p>The hash table points directly into buffer-resident records, with no copying. When the item count reaches
+      the <em>packing threshold</em>, items are packed densely into overflow files but not yet written to disk.
+      When it reaches the <em>spilling threshold</em>, the first partition file is unfixed and written to disk and
+      the count is reduced; the cycle repeats and partitioning recurses with adjusted thresholds (Section III.B.2).
+      Setting both thresholds to zero gives Grace-style overflow avoidance: nothing is kept resident, everything is
+      partitioned to disk up front, which is the textbook grace hash join. This is Volcano's "mechanism, not
+      policy" principle in miniature. The operator provides the spilling mechanism, and an optimizer sets the
+      thresholds from estimated input-size distributions, choosing anywhere on the spectrum from fully in-memory
+      hybrid hash to pure grace.</p>
+    </div>
+  </details>
+
+  <!-- ===== MCQs ===== -->
+  <h2>Check yourself</h2>
+
+  <div class="mcq" data-answer="2">
+    <p class="mcq-q">Which statement about hash join is false?</p>
+    <button class="mcq-opt">You build the hash table on the smaller input so it is likelier to fit in memory.</button>
+    <button class="mcq-opt">In memory its cost is about M + N, the cheapest of the common join methods.</button>
+    <button class="mcq-opt">It can evaluate any join predicate, including ranges like R.a &lt; S.b.</button>
+    <button class="mcq-opt">Grace hash partitions both inputs to disk first, at a total cost of 3 times (M + N).</button>
+    <p class="mcq-explain">Hash join is equi-join only, on the full join key. There is no hash that turns an
+    inequality into bucket equality, so range and inequality joins fall back to nested loop or merge. The other
+    three are correct.</p>
+  </div>
+
+  <div class="mcq" data-answer="1">
+    <p class="mcq-q">Block nested loop join costs M + ceil(M/(B&minus;2)) times N. Why does adding buffer frames help?</p>
+    <button class="mcq-opt">More frames let the inner table be cached entirely, removing the N term outright.</button>
+    <button class="mcq-opt">More frames make each outer block larger, so the inner table is reread fewer times.</button>
+    <button class="mcq-opt">More frames let the join skip the build phase and probe the inner directly.</button>
+    <button class="mcq-opt">More frames raise the index probe constant C, which lowers the total comparisons.</button>
+    <button class="mcq-opt">More frames turn the equi-join into a range join, which scans fewer inner rows.</button>
+    <p class="mcq-explain">The outer side gets B&minus;2 frames, so a bigger B means a bigger outer block and
+    ceil(M/(B&minus;2)) fewer rereads of the inner table. The inner is reread once per outer block, not per outer
+    tuple (that is the naive form).</p>
+  </div>
+
+  <div class="mcq" data-answer="3">
+    <p class="mcq-q">Which statement about external merge sort is false?</p>
+    <button class="mcq-opt">Run generation reads B pages at a time and writes ceil(N/B) sorted runs.</button>
+    <button class="mcq-opt">Each merge pass combines up to B&minus;1 runs using one buffer per run plus an output buffer.</button>
+    <button class="mcq-opt">Total I/O is 2N times the number of passes, since every pass reads and writes all N pages.</button>
+    <button class="mcq-opt">It always completes in a single pass regardless of how N compares to B.</button>
+    <p class="mcq-explain">A single pass happens only when the data already fits in B pages. In general
+    passes = 1 + ceil(log_{B-1}(ceil(N/B))), and two passes is the common realistic case. The other three are
+    correct descriptions of the algorithm.</p>
+  </div>
+
+  <div class="mcq" data-answer="0">
+    <p class="mcq-q">Which statement about aggregation is false?</p>
+    <button class="mcq-opt">Sort-based aggregation produces output in no particular order.</button>
+    <button class="mcq-opt">Hash-based aggregation holds one entry per distinct group and updates it in place.</button>
+    <button class="mcq-opt">Hash aggregation wins when the number of distinct groups is small relative to the input.</button>
+    <button class="mcq-opt">Sort-based aggregation needs only one running group of state at a time.</button>
+    <p class="mcq-explain">Inverted on purpose. Sort-based aggregation comes out sorted on the group key; it is
+    hash-based aggregation whose output has no order. The other three are accurate.</p>
+  </div>
+
+  <div class="mcq" data-answer="2">
+    <p class="mcq-q">Which statement about sort-merge join is false?</p>
+    <button class="mcq-opt">If an input already arrives sorted on the join key, that input's sort cost is zero.</button>
+    <button class="mcq-opt">The merge step walks two cursors forward and is roughly M + N for mostly-unique keys.</button>
+    <button class="mcq-opt">It can evaluate inequality joins efficiently because both inputs are sorted.</button>
+    <button class="mcq-opt">If every tuple shares one join value the merge degrades toward M times N.</button>
+    <p class="mcq-explain">Sort-merge is an equi-join method in practice; the lockstep merge matches equal keys.
+    Sortedness does not make an inequality join cheap. The pre-sorted input saving, the M + N merge, and the
+    single-value worst case are all real.</p>
+  </div>
+
+  <div class="mcq" data-answer="3">
+    <p class="mcq-q">A sort node and a hash join's build side are both pipeline breakers. What does that mean?</p>
+    <button class="mcq-opt">They never write to disk, holding their whole input in CPU registers.</button>
+    <button class="mcq-opt">They push tuples to their parent rather than waiting to be pulled.</button>
+    <button class="mcq-opt">They process exactly one tuple of state, like filter and projection.</button>
+    <button class="mcq-opt">They must consume all of their input before they can emit the first output tuple.</button>
+    <p class="mcq-explain">A pipeline breaker cannot emit until it has seen its entire input: the sort needs the
+    last tuple to know the first sorted one, and a hash build must finish before any probe can match. That is why
+    breakers set the query's memory budget and are where spilling begins.</p>
+  </div>
+
+  <!-- ===== PRIMARY SOURCE ===== -->
+  <div class="source-box">
+    <div class="src-tag">Primary source</div>
+    <div class="src-title">Read this next:
+      <a href="https://15445.courses.cs.cmu.edu/spring2025/notes/12-joins.pdf">CMU 15-445 Lecture 12, Join Algorithms (Spring 2025)</a></div>
+    <p class="muted">The exact I/O cost formulas behind the playground (naive, block, and index nested loop;
+    sort-merge; grace hash at 3 times (M+N)) and the worked timing example that ranks the algorithms from 1.4 hours
+    down to 0.45 seconds. Focus on the Cost Analysis sections under each join.</p>
+  </div>
+
+  <!-- ===== ASK YOUR TEACHER ===== -->
+  <div class="ask-teacher">
+    <div class="at-tag">Ask your teacher</div>
+    <p>Want me to walk the grace hash recursion when even a single partition overflows, derive the two-pass sort
+    condition from the formula, or quiz you on which join the optimizer picks for the widened
+    <code>emp JOIN dept</code> query? Ask and I will go deeper or harder. I am your teacher for this course, not
+    just a document.</p>
+  </div>
+
+  <!-- ===== NAV ===== -->
+  <nav class="lesson-nav">
+    <a class="prev" href="0009-query-execution-volcano.html">
+      <span class="nav-dir">Previous</span>
+      <span class="nav-title">Week 09 · Query execution: the Volcano iterator model</span>
+    </a>
+    <a class="next" href="0011-query-optimization.html">
+      <span class="nav-dir">Next</span>
+      <span class="nav-title">Week 11 · Query optimization: cost, selectivity, and join ordering</span>
+    </a>
+  </nav>
+
+  </div><!-- /.col -->
+</main>
+</body>
+</html>

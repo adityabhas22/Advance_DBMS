@@ -1,0 +1,863 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lesson 12 · Transactions, ACID, anomalies, and isolation levels · Field Guide to the Database Engine</title>
+<link rel="stylesheet" href="../assets/course.css">
+<script defer src="../assets/components.js"></script>
+</head>
+<body class="layer-txn">
+<main class="page">
+
+  <!-- ===== MASTHEAD ===== -->
+  <header class="masthead col">
+    <div class="crumbs">
+      <a href="../index.html">Field Guide</a> <span>/</span>
+      <span>Part VI · Transactions</span> <span>/</span>
+      <span>Week 12</span>
+    </div>
+    <span class="week-badge">Transactions</span>
+    <h1>Transactions, ACID, anomalies, and isolation levels</h1>
+    <p class="lede">Running transactions one at a time is always correct and always slow. Interleaving them
+    reclaims throughput but lets some wrong answers leak through. This lesson is a catalogue of exactly which
+    interleavings are wrong, a single graph test that decides correctness, and the isolation levels that name
+    how much wrongness you are willing to permit.</p>
+  </header>
+
+  <div class="col">
+
+  <!-- ===== OBJECTIVES ===== -->
+  <div class="objectives">
+    <h4>By the end you can</h4>
+    <ul>
+      <li>State each ACID guarantee and say which engine subsystem actually delivers it.</li>
+      <li>Recognise dirty write, dirty read, non-repeatable read, phantom, lost update, and write skew from their operation traces.</li>
+      <li>Build a precedence graph for a schedule and use acyclicity to decide conflict serializability.</li>
+      <li>Separate the serializability axis from the recoverability axis (recoverable, cascadeless, strict).</li>
+      <li>Explain why 2PL gives conflict serializability, why strict 2PL is needed on top, and why snapshot isolation is neither above nor below Repeatable Read.</li>
+      <li>Answer the standard traps: levels are defined by phenomena not locking, serializable does not mean serial, a phantom is not a non-repeatable read.</li>
+    </ul>
+  </div>
+
+  <!-- ===== WHERE THIS SITS ===== -->
+  <h2>Where this sits in the engine</h2>
+  <p>The first eleven weeks followed one read down the stack:
+  <code>SELECT name FROM emp WHERE salary &gt; 75000 ORDER BY name</code>, from the parser
+  (<a href="0008-query-parsing.html">week 8</a>) through the optimizer (<a href="0011-query-optimization.html">week 11</a>)
+  to the executor, the B+tree, the buffer pool, and the slotted page. A read can be careless about other
+  transactions because it does not change anything. This week starts the second journey, the one a write forces
+  you to confront. The running statement becomes a transaction:</p>
+
+  <pre><code><span class="tok-kw">BEGIN</span>;
+<span class="tok-kw">UPDATE</span> account <span class="tok-kw">SET</span> balance = balance - <span class="tok-num">100</span> <span class="tok-kw">WHERE</span> id = <span class="tok-num">42</span>;
+<span class="tok-kw">COMMIT</span>;</code></pre>
+
+  <p>The layer above is the query processor, which has already turned this into a plan that locates the row for
+  id 42 exactly as journey 1 located its tuples (optimizer, access method, buffer, storage). What this layer adds
+  is the question that plan never had to ask: while this transaction runs, other transactions are touching the
+  same rows, and the machine can crash. This week (week 12) frames the problem and the correctness theory. It
+  hands down to <a href="0013-concurrency-mvcc.html">week 13</a> the mechanisms that enforce it (strict 2PL, the
+  lock manager, MVCC), and those hand down to <a href="0014-logging-recovery-aries.html">week 14</a> the logging
+  that makes a committed write survive a crash. Atomicity and durability are mostly week 14's job. Isolation,
+  the property that concurrency control delivers, is the subject here.</p>
+
+  <div class="callout intuition">
+    <div class="callout-title">Intuition</div>
+    <p>Think of a transaction as a single edit to the database that must look instantaneous from the outside,
+    even though inside it is many small steps. The database wants to run several such edits at once so the CPU
+    is not idle while one of them waits on disk. The danger is that two edits, interleaved, can land on a result
+    that neither could have produced if it had run alone. The whole job of this lesson is to catalogue those bad
+    landings and find a cheap test that spots them.</p>
+  </div>
+
+  <!-- ===== ACID ===== -->
+  <h2>ACID: four guarantees against two threats</h2>
+  <p>A transaction is a unit of work the database promises to treat as one logical step although it is built from
+  many physical ones: read this page, write that row, append this log record. Two things threaten that promise.
+  Failures: the machine crashes halfway through. Concurrency: other transactions run at the same time and touch
+  the same data. ACID is the name for the four guarantees that close those threats. The thing worth carrying away
+  is which subsystem each one belongs to, because they are not all the same machinery.</p>
+
+  <table>
+    <caption>The four guarantees and the subsystem that actually provides each one.</caption>
+    <thead><tr><th>Letter</th><th>Guarantee</th><th>Delivered by</th></tr></thead>
+    <tbody>
+      <tr><td>Atomicity</td><td>All of a transaction's effects happen, or none do.</td><td>The log and the abort/undo path (<a href="0014-logging-recovery-aries.html">week 14</a>), not locking.</td></tr>
+      <tr><td>Consistency</td><td>Each transaction moves the database between states that satisfy declared rules.</td><td>Partly the application's logic, partly declared constraints the engine checks. The weakest engine guarantee.</td></tr>
+      <tr><td>Isolation</td><td>Concurrent transactions produce a result equal to some serial order.</td><td>Concurrency control (this week and <a href="0013-concurrency-mvcc.html">week 13</a>).</td></tr>
+      <tr><td>Durability</td><td>Once committed, effects survive a crash.</td><td>Write-ahead logging plus forcing the log at commit (<a href="0014-logging-recovery-aries.html">week 14</a>).</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout gotcha">
+    <div class="callout-title">Exam trap</div>
+    <p>The C in ACID is not the same property as serializability, and it is the weakest of the four as an engine
+    guarantee. The engine cannot know your application's intended invariants beyond the constraints you declared
+    (a <code>CHECK</code>, a foreign key, a unique index). Atomicity and durability come from the log; isolation
+    comes from concurrency control. Only isolation is really about the interleaving of transactions, which is why
+    this whole lesson is about isolation and the other three letters are handled elsewhere.</p>
+  </div>
+
+  <div class="callout why">
+    <div class="callout-title">Why interleave at all</div>
+    <p>Run transactions strictly one at a time and you get isolation for free: there is no interleaving to go
+    wrong. But a transaction that blocks on a disk read would idle the whole CPU while it waits, and disk is five
+    to six orders of magnitude slower than memory (<a href="0004-buffer-pool-design.html">week 4</a>). Interleaving
+    lets one transaction use the CPU while another waits on I/O. That throughput is the entire reason concurrency
+    control exists. We accept interleaving and then forbid exactly the interleavings that produce wrong answers.</p>
+  </div>
+
+  <!-- ===== THE ANOMALIES ===== -->
+  <h2>The catalogue of wrong answers</h2>
+  <p>Every anomaly below is one shape: an interleaved schedule producing a result that no serial order could.
+  The notation follows the critique paper [<a href="https://www.cs.cmu.edu/~15721-f24/papers/Critique_of_ANSI_Isolation_Levels.pdf">Berenson et al. 1995</a>].
+  <code>w1[x]</code> is transaction 1 writing item x, <code>r2[x]</code> is transaction 2 reading x,
+  <code>c1</code> is transaction 1 committing, <code>a1</code> is transaction 1 aborting.</p>
+
+  <table>
+    <caption>The six anomalies, their traces, and what goes wrong.</caption>
+    <thead><tr><th>Anomaly</th><th>Trace</th><th>What breaks</th></tr></thead>
+    <tbody>
+      <tr><td>Dirty write (P0)</td><td><code>w1[x] w2[x] c1 c2</code></td><td>Two transactions' writes to x interleave, so rollback cannot restore a clean before-image. Forbidden at <em>every</em> level.</td></tr>
+      <tr><td>Dirty read (P1)</td><td><code>w1[x] r2[x] a1</code></td><td>T2 reads a value T1 wrote then never committed. T2 saw something that officially never existed.</td></tr>
+      <tr><td>Non-repeatable read (P2)</td><td><code>r1[x] w2[x] c2 r1[x]</code></td><td>T1 reads x twice and gets two different committed values inside one transaction.</td></tr>
+      <tr><td>Phantom (P3)</td><td><code>r1[P] w2[y in P] c2 r1[P]</code></td><td>T1 re-runs a predicate query and the <em>set</em> of matching rows changed. A row appeared or vanished, not just a value.</td></tr>
+      <tr><td>Lost update</td><td><code>r1[x] r2[x] w1[x] w2[x]</code></td><td>Both read 10, both compute 11, both write 11. One increment is silently discarded.</td></tr>
+      <tr><td>Write skew (A5B)</td><td><code>r1[x] r1[y] r2[x] r2[y] w1[x] w2[y]</code></td><td>Each transaction reads an overlapping set, checks a constraint that holds, then writes a <em>different</em> item. Individually fine, together a violation.</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout gotcha">
+    <div class="callout-title">Exam trap: a phantom is not a non-repeatable read</div>
+    <p>A non-repeatable read is a changed <em>value</em> of a row T1 already saw. A phantom is a changed <em>set</em>
+    of rows matching a predicate, because someone inserted or deleted a matching row. The distinction matters
+    because preventing phantoms needs predicate or gap locking, not just locking the rows that currently exist.
+    There is no existing row to lock for a row that does not exist yet. This is exactly why Repeatable Read can
+    forbid P2 yet still permit P3.</p>
+  </div>
+
+  <p>Write skew is the subtle one and the one the critique paper uses as its headline result. The textbook case:
+  two doctors are on call, a rule says at least one must stay on call. Both read "two on call, fine," each takes
+  themselves off, and now zero are on call. There was no write-write conflict on a single item (each wrote a
+  different doctor's row), so a rule that only watches single-item write conflicts will never catch it. Hold that
+  thought; it is what breaks snapshot isolation below.</p>
+
+  <!-- ===== SERIALIZABILITY ===== -->
+  <h2>Serializability, and the graph that tests it</h2>
+  <p>We want a precise target, not a vibe. A schedule is <strong>serializable</strong> if its final effect equals
+  some serial schedule of the same transactions. That is the correctness goal. The trouble is that "equal effect"
+  over all possible data is expensive to reason about, so engines test a sufficient proxy that is cheap to check.</p>
+
+  <p>Two operations <strong>conflict</strong> when they come from different transactions, touch the same item, and
+  at least one is a write. The three conflict types are write-read, read-write, and write-write. A schedule is
+  <strong>conflict-serializable</strong> if you can turn it into a serial schedule by repeatedly swapping adjacent
+  non-conflicting operations. This is sufficient for serializability and, unlike view serializability (which is
+  NP-complete to test and so never used), it is decidable in polynomial time.</p>
+
+  <div class="callout keyidea">
+    <div class="callout-title">Keep this one thing</div>
+    <p>Build a directed graph, one node per transaction. Draw an edge from Ti to Tj whenever an operation of Ti
+    conflicts with and precedes a later operation of Tj on the same item. The schedule is conflict-serializable
+    if and only if this precedence graph is acyclic. A topological sort of an acyclic graph gives an equivalent
+    serial order. A cycle means no serial order exists.</p>
+  </div>
+
+  <!-- ===== SIMULATOR 1: interleaving sandbox + precedence graph ===== -->
+  <h2>Simulator: build a schedule, watch the precedence graph</h2>
+  <p>Pick a preset anomaly or drag your own operations onto the shared timeline. The tool draws the precedence
+  graph live and colours it green when acyclic (with the equivalent serial order shown) or red when a cycle
+  appears (with the conflicting edges highlighted). A second readout classifies the schedule on the independent
+  recoverability axis. Try the write-skew preset: you will watch it form a two-node cycle even though no two
+  operations write the same item.</p>
+
+  <figure class="sim" id="txn-pg-sim">
+    <div class="sim-head">
+      <span class="sim-title">Interleaving sandbox with live precedence graph</span>
+      <span class="sim-sub">click an op to append it, or load a preset</span>
+    </div>
+    <div class="sim-body">
+      <div class="sim-controls" id="txn-pg-presets"></div>
+      <div class="sim-controls" id="txn-pg-ops"></div>
+      <div class="sim-stage" style="display:flex;gap:1rem;flex-wrap:wrap;align-items:flex-start">
+        <div style="flex:2 1 320px;min-width:300px">
+          <svg id="txn-pg-timeline" viewBox="0 0 560 150" width="100%"></svg>
+        </div>
+        <div style="flex:1 1 200px;min-width:200px">
+          <svg id="txn-pg-graph" viewBox="0 0 220 200" width="100%"></svg>
+        </div>
+      </div>
+      <div class="sim-controls" id="txn-pg-controls"></div>
+      <div class="sim-readout" id="txn-pg-readout"></div>
+    </div>
+  </figure>
+  <figcaption class="muted" style="margin-top:-1rem">Experiment: load Lost update, then load Write skew. Both
+  go red, but watch the timeline: lost update has a write-write conflict on x, write skew has none, yet the graph
+  still cycles. Then load Recoverable-but-not-serializable to see the two axes come apart.</figcaption>
+
+  <script>
+  // ============== Simulator 1: precedence graph sandbox ==============
+  (function () {
+    var timelineSvg = document.getElementById("txn-pg-timeline");
+    var graphSvg = document.getElementById("txn-pg-graph");
+    var readout = document.getElementById("txn-pg-readout");
+    var opsBar = document.getElementById("txn-pg-ops");
+    var presetBar = document.getElementById("txn-pg-presets");
+    var controlsBar = document.getElementById("txn-pg-controls");
+
+    // a schedule is a list of ops: {t:1|2, kind:'r'|'w'|'c'|'a', item:'x'|'y'|null}
+    var schedule = [];
+
+    var PRESETS = {
+      "Lost update": [
+        {t:1,kind:'r',item:'x'},{t:2,kind:'r',item:'x'},
+        {t:1,kind:'w',item:'x'},{t:2,kind:'w',item:'x'},
+        {t:1,kind:'c'},{t:2,kind:'c'}
+      ],
+      "Write skew": [
+        {t:1,kind:'r',item:'x'},{t:1,kind:'r',item:'y'},
+        {t:2,kind:'r',item:'x'},{t:2,kind:'r',item:'y'},
+        {t:1,kind:'w',item:'x'},{t:2,kind:'w',item:'y'},
+        {t:1,kind:'c'},{t:2,kind:'c'}
+      ],
+      "Serializable": [
+        {t:1,kind:'r',item:'x'},{t:1,kind:'w',item:'x'},{t:1,kind:'c'},
+        {t:2,kind:'r',item:'x'},{t:2,kind:'w',item:'x'},{t:2,kind:'c'}
+      ],
+      "Dirty read": [
+        {t:1,kind:'w',item:'x'},{t:2,kind:'r',item:'x'},
+        {t:2,kind:'c'},{t:1,kind:'a'}
+      ],
+      "Recoverable-but-not-serializable": [
+        {t:1,kind:'r',item:'x'},{t:2,kind:'w',item:'x'},{t:2,kind:'c'},
+        {t:1,kind:'w',item:'x'},{t:1,kind:'c'}
+      ]
+    };
+
+    function opLabel(op) {
+      if (op.kind === 'c') return 'c' + op.t;
+      if (op.kind === 'a') return 'a' + op.t;
+      return op.kind + op.t + '[' + op.item + ']';
+    }
+    function color(t) { return t === 1 ? "var(--txn)" : "#2f6f8f"; }
+
+    // ---- build precedence graph; return {edges:[{from,to}], cycle:bool, order:[t...]} ----
+    function analyze() {
+      var nodes = {};
+      schedule.forEach(function (op) { if (op.kind !== 'a') nodes[op.t] = true; });
+      var nodeList = Object.keys(nodes).map(Number);
+      var edgeSet = {};
+      var edges = [];
+      // for each pair of conflicting ops i<j on same item, Ti->Tj
+      for (var i = 0; i < schedule.length; i++) {
+        var a = schedule[i];
+        if (a.kind !== 'r' && a.kind !== 'w') continue;
+        for (var j = i + 1; j < schedule.length; j++) {
+          var b = schedule[j];
+          if (b.kind !== 'r' && b.kind !== 'w') continue;
+          if (a.t === b.t) continue;
+          if (a.item !== b.item) continue;
+          if (a.kind === 'r' && b.kind === 'r') continue; // both reads, no conflict
+          var key = a.t + '->' + b.t;
+          if (!edgeSet[key]) { edgeSet[key] = true; edges.push({ from: a.t, to: b.t }); }
+        }
+      }
+      // cycle detection via DFS
+      var adj = {};
+      nodeList.forEach(function (n) { adj[n] = []; });
+      edges.forEach(function (e) { adj[e.from].push(e.to); });
+      var state = {}; // 0 unvisited, 1 in-stack, 2 done
+      var hasCycle = false;
+      function dfs(u) {
+        state[u] = 1;
+        adj[u].forEach(function (v) {
+          if (state[v] === 1) hasCycle = true;
+          else if (!state[v]) dfs(v);
+        });
+        state[u] = 2;
+      }
+      nodeList.forEach(function (n) { if (!state[n]) dfs(n); });
+      // topological order if acyclic
+      var order = [];
+      if (!hasCycle) {
+        var indeg = {}; nodeList.forEach(function (n) { indeg[n] = 0; });
+        edges.forEach(function (e) { indeg[e.to]++; });
+        var q = nodeList.filter(function (n) { return indeg[n] === 0; }).sort();
+        while (q.length) {
+          var u = q.shift(); order.push(u);
+          adj[u].forEach(function (v) { if (--indeg[v] === 0) q.push(v); });
+        }
+      }
+      return { nodes: nodeList, edges: edges, cycle: hasCycle, order: order };
+    }
+
+    // ---- recoverability classification ----
+    function recoverability() {
+      // reads-from: T2 reads x last written by T1 (uncommitted at read time)
+      // recoverable: every Tj that read uncommitted data of Ti commits after Ti commits
+      // cascadeless: no transaction reads uncommitted data at all
+      var committedAt = {}; // t -> index of commit
+      schedule.forEach(function (op, idx) { if (op.kind === 'c') committedAt[op.t] = idx; });
+      var dirtyRead = false;     // any read of uncommitted write -> breaks cascadeless
+      var unrecoverable = false; // a reader committed before its source committed
+      var lastWriter = {};       // item -> {t, committed:bool}
+      for (var i = 0; i < schedule.length; i++) {
+        var op = schedule[i];
+        if (op.kind === 'w') {
+          lastWriter[op.item] = { t: op.t, idx: i };
+        } else if (op.kind === 'r') {
+          var src = lastWriter[op.item];
+          if (src && src.t !== op.t) {
+            // did source commit before this read?
+            var srcCommit = committedAt[src.t];
+            if (srcCommit == null || srcCommit > i) {
+              dirtyRead = true; // read uncommitted value
+              // does the reader commit before the source?
+              var readerCommit = committedAt[op.t];
+              if (readerCommit != null && (srcCommit == null || readerCommit < srcCommit)) {
+                unrecoverable = true;
+              }
+            }
+          }
+        }
+      }
+      if (unrecoverable) return { label: "not recoverable", cls: "bad" };
+      if (dirtyRead) return { label: "recoverable, not cascadeless", cls: "warn" };
+      return { label: "cascadeless (strict)", cls: "ok" };
+    }
+
+    function renderTimeline() {
+      timelineSvg.innerHTML = "";
+      // two lanes
+      [1, 2].forEach(function (t, k) {
+        var y = 40 + k * 60;
+        timelineSvg.appendChild(DBMS.svg("text", { x: 8, y: y + 4, class: "svg-mono", fill: color(t) }, "T" + t));
+      });
+      var x = 46;
+      schedule.forEach(function (op) {
+        var lane = op.t === 1 ? 0 : 1;
+        var y = 24 + lane * 60;
+        var w = 50;
+        timelineSvg.appendChild(DBMS.svg("rect", {
+          x: x, y: y, width: w, height: 32, rx: 5,
+          fill: op.kind === 'a' ? "#fbeaea" : (op.kind === 'c' ? "#eef6ee" : "#fffefb"),
+          stroke: color(op.t), "stroke-width": 1.5
+        }));
+        timelineSvg.appendChild(DBMS.svg("text", {
+          x: x + w / 2, y: y + 21, "text-anchor": "middle", class: "svg-mono"
+        }, opLabel(op)));
+        x += w + 6;
+        if (x > 540) x = 540;
+      });
+      if (schedule.length === 0) {
+        timelineSvg.appendChild(DBMS.svg("text", { x: 280, y: 75, "text-anchor": "middle", class: "svg-label" }, "empty schedule, add operations above"));
+      }
+    }
+
+    function renderGraph(info) {
+      graphSvg.innerHTML = "";
+      var pos = { 1: { x: 70, y: 55 }, 2: { x: 150, y: 130 }, 3: { x: 70, y: 130 } };
+      var defs = DBMS.svg("defs", {}, [
+        DBMS.svg("marker", { id: "txnpg-arrow", markerWidth: 9, markerHeight: 9, refX: 8, refY: 3, orient: "auto" },
+          DBMS.svg("path", { d: "M0,0 L8,3 L0,6 Z", fill: info.cycle ? "#b03b6b" : "var(--ink-soft)" }))
+      ]);
+      graphSvg.appendChild(defs);
+      // edges
+      info.edges.forEach(function (e) {
+        var p = pos[e.from], q = pos[e.to];
+        var dx = q.x - p.x, dy = q.y - p.y, len = Math.sqrt(dx * dx + dy * dy) || 1;
+        var r = 20;
+        var x1 = p.x + dx / len * r, y1 = p.y + dy / len * r;
+        var x2 = q.x - dx / len * (r + 4), y2 = q.y - dy / len * (r + 4);
+        graphSvg.appendChild(DBMS.svg("line", {
+          x1: x1, y1: y1, x2: x2, y2: y2,
+          stroke: info.cycle ? "#b03b6b" : "var(--ink-soft)", "stroke-width": info.cycle ? 2.4 : 1.6,
+          "marker-end": "url(#txnpg-arrow)"
+        }));
+      });
+      // nodes
+      info.nodes.forEach(function (n) {
+        var p = pos[n];
+        graphSvg.appendChild(DBMS.svg("circle", {
+          cx: p.x, cy: p.y, r: 20,
+          fill: info.cycle ? "#fbeaea" : "#eef6ee",
+          stroke: color(n), "stroke-width": 2
+        }));
+        graphSvg.appendChild(DBMS.svg("text", { x: p.x, y: p.y + 5, "text-anchor": "middle", class: "svg-mono" }, "T" + n));
+      });
+      if (info.nodes.length === 0) {
+        graphSvg.appendChild(DBMS.svg("text", { x: 110, y: 100, "text-anchor": "middle", class: "svg-label" }, "no nodes yet"));
+      }
+    }
+
+    function refresh() {
+      renderTimeline();
+      var info = analyze();
+      renderGraph(info);
+      var rec = recoverability();
+      var serial;
+      if (info.nodes.length === 0) serial = "Add operations to begin.";
+      else if (info.cycle) serial = "CYCLE: not conflict-serializable. No equivalent serial order exists.";
+      else serial = "Acyclic: conflict-serializable. Equivalent serial order is " +
+        info.order.map(function (t) { return "T" + t; }).join(" then ") + ".";
+      readout.innerHTML = "<b>Serializability:</b> " + serial +
+        "<br><b>Recoverability:</b> " + rec.label +
+        "<br><span class='muted'>edges: " + info.edges.map(function (e) { return "T" + e.from + "->T" + e.to; }).join(", ") + "</span>";
+    }
+
+    // ---- op palette buttons ----
+    [
+      { label: "r1[x]", op: { t: 1, kind: 'r', item: 'x' } },
+      { label: "w1[x]", op: { t: 1, kind: 'w', item: 'x' } },
+      { label: "r1[y]", op: { t: 1, kind: 'r', item: 'y' } },
+      { label: "w1[y]", op: { t: 1, kind: 'w', item: 'y' } },
+      { label: "c1", op: { t: 1, kind: 'c' } },
+      { label: "a1", op: { t: 1, kind: 'a' } },
+      { label: "r2[x]", op: { t: 2, kind: 'r', item: 'x' } },
+      { label: "w2[x]", op: { t: 2, kind: 'w', item: 'x' } },
+      { label: "r2[y]", op: { t: 2, kind: 'r', item: 'y' } },
+      { label: "w2[y]", op: { t: 2, kind: 'w', item: 'y' } },
+      { label: "c2", op: { t: 2, kind: 'c' } },
+      { label: "a2", op: { t: 2, kind: 'a' } }
+    ].forEach(function (b) {
+      opsBar.appendChild(DBMS.el("button", {
+        class: "ghost", text: b.label,
+        onclick: function () { schedule.push(Object.assign({}, b.op)); refresh(); }
+      }));
+    });
+
+    // ---- preset buttons ----
+    Object.keys(PRESETS).forEach(function (name) {
+      presetBar.appendChild(DBMS.el("button", {
+        text: name,
+        onclick: function () { schedule = PRESETS[name].map(function (o) { return Object.assign({}, o); }); refresh(); }
+      }));
+    });
+
+    // ---- undo / clear ----
+    controlsBar.appendChild(DBMS.el("button", {
+      class: "ghost", text: "Undo last",
+      onclick: function () { schedule.pop(); refresh(); }
+    }));
+    controlsBar.appendChild(DBMS.el("button", {
+      class: "ghost", text: "Clear",
+      onclick: function () { schedule = []; refresh(); }
+    }));
+
+    schedule = PRESETS["Lost update"].map(function (o) { return Object.assign({}, o); });
+    refresh();
+  })();
+  </script>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 560 170" role="img" aria-label="A precedence graph going from acyclic to cyclic">
+      <text x="120" y="20" text-anchor="middle" class="svg-label">acyclic: serializable</text>
+      <circle cx="70" cy="70" r="22" fill="#eef6ee" stroke="var(--txn)" stroke-width="2"/>
+      <text x="70" y="75" text-anchor="middle" class="svg-mono">T1</text>
+      <circle cx="170" cy="70" r="22" fill="#eef6ee" stroke="#2f6f8f" stroke-width="2"/>
+      <text x="170" y="75" text-anchor="middle" class="svg-mono">T2</text>
+      <line x1="92" y1="70" x2="144" y2="70" stroke="var(--ink-soft)" stroke-width="1.8" marker-end="url(#txnd-arrow)"/>
+      <text x="120" y="118" text-anchor="middle" class="svg-label">order: T1 then T2</text>
+
+      <text x="430" y="20" text-anchor="middle" class="svg-label">cyclic: not serializable</text>
+      <circle cx="380" cy="70" r="22" fill="#fbeaea" stroke="var(--txn)" stroke-width="2"/>
+      <text x="380" y="75" text-anchor="middle" class="svg-mono">T1</text>
+      <circle cx="480" cy="70" r="22" fill="#fbeaea" stroke="#2f6f8f" stroke-width="2"/>
+      <text x="480" y="75" text-anchor="middle" class="svg-mono">T2</text>
+      <path d="M402,62 C425,48 455,48 478,62" fill="none" stroke="#b03b6b" stroke-width="2.2" marker-end="url(#txnd-arrowr)"/>
+      <path d="M478,78 C455,92 425,92 402,78" fill="none" stroke="#b03b6b" stroke-width="2.2" marker-end="url(#txnd-arrowr)"/>
+      <text x="430" y="125" text-anchor="middle" class="svg-label">no serial order exists</text>
+      <defs>
+        <marker id="txnd-arrow" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto">
+          <path d="M0,0 L7,3 L0,6 Z" fill="var(--ink-soft)"/>
+        </marker>
+        <marker id="txnd-arrowr" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto">
+          <path d="M0,0 L7,3 L0,6 Z" fill="#b03b6b"/>
+        </marker>
+      </defs>
+    </svg>
+    <figcaption><b>Figure 1.</b> Moving one operation can add the second edge that closes the cycle. When the
+    graph is acyclic, any topological sort is a serial schedule with the same effect. When it has a cycle, there
+    is no consistent order to run the transactions in, which is precisely the write-skew failure.</figcaption>
+  </figure>
+
+  <!-- ===== RECOVERABILITY ===== -->
+  <h2>The second axis: recoverability</h2>
+  <p>Serializability is about correctness under concurrency. Recoverability is a separate concern about correctness
+  under aborts, and the two are independent: a schedule can be serializable but not recoverable, and vice versa.
+  Three nested classes, each stronger than the last.</p>
+
+  <ol class="steps">
+    <li><strong>Recoverable.</strong> A transaction commits only after every transaction whose data it read has
+    already committed. If T2 read T1's write, T2 must not commit before T1. Otherwise T1 aborts and you have a
+    committed transaction that read a value that was rolled back, which you cannot undo. Every real system requires
+    at least this.</li>
+    <li><strong>Cascadeless (avoids cascading aborts).</strong> Transactions read only values written by already
+    committed transactions. This stops one abort from forcing a chain of dependent aborts. Stronger than recoverable.</li>
+    <li><strong>Strict.</strong> No transaction reads or overwrites an item until the transaction that last wrote it
+    has committed or aborted. This makes undo trivial: the before-image to restore is always the value that existed
+    before this transaction's write. Strict 2PL produces strict schedules, which is why production locking systems
+    use it.</li>
+  </ol>
+
+  <p>The containment is strict &sub; cascadeless &sub; recoverable. In the simulator, the dirty-read and
+  recoverable-but-not-serializable presets are the ones to study: they show that a schedule can sit anywhere on one
+  axis independent of the other.</p>
+
+  <div class="callout gotcha">
+    <div class="callout-title">Exam trap</div>
+    <p>"Recoverable implies serializable" and "serializable implies recoverable" are both false. They are
+    independent axes. Recoverability constrains commit order relative to reads. Serializability constrains the
+    equivalent serial order. A schedule can satisfy one and violate the other.</p>
+  </div>
+
+  <!-- ===== 2PL ===== -->
+  <h2>Two-phase locking: how you actually get serializability</h2>
+  <p>The precedence graph tells you whether a finished schedule was serializable. It does not tell you how to make
+  the scheduler produce only good ones as it runs. The dominant lock-based answer is two-phase locking. Each
+  transaction obeys one rule with two phases.</p>
+
+  <ul>
+    <li><strong>Growing phase.</strong> The transaction may acquire locks but may not release any.</li>
+    <li><strong>Shrinking phase.</strong> Once the transaction releases its first lock, it may release more but may
+    not acquire any. The instant it holds all its locks, just before the first release, is the <strong>lock
+    point</strong>.</li>
+  </ul>
+
+  <div class="callout why">
+    <div class="callout-title">Why 2PL gives conflict serializability</div>
+    <p>Order the transactions by their lock points. Suppose Ti has an operation that conflicts with and precedes
+    Tj's on some item. Then Ti held the lock on that item before Tj could acquire it, so Ti's lock point comes
+    before Tj's. Every precedence-graph edge therefore points in lock-point order, which means the graph cannot
+    contain a cycle. An acyclic graph is conflict-serializable. The lock-point order is itself a valid serial
+    order. The rule is sufficient, not necessary: some conflict-serializable schedules cannot be produced under
+    2PL [<a href="https://15445.courses.cs.cmu.edu/fall2022/notes/15-concurrencycontrol.pdf">CMU 15-445 notes</a>].</p>
+  </div>
+
+  <p>Plain 2PL still allows dirty reads and cascading aborts, because a transaction can release a write lock during
+  its shrinking phase and commit later. Another transaction can read that just-unlocked but uncommitted value. Two
+  stronger variants close the gap, and they are what production systems run.</p>
+
+  <table>
+    <caption>Plain, strict, and rigorous 2PL hold locks for different durations.</caption>
+    <thead><tr><th>Variant</th><th>Lock-holding rule</th><th>What it buys</th></tr></thead>
+    <tbody>
+      <tr><td>Plain 2PL</td><td>Two phases, but locks may be released before commit.</td><td>Conflict serializability only. Still allows dirty reads and cascading aborts.</td></tr>
+      <tr><td>Strict 2PL</td><td>Hold all exclusive (write) locks until commit or abort.</td><td>Adds recoverability and cascadelessness; produces strict schedules.</td></tr>
+      <tr><td>Rigorous 2PL</td><td>Hold all locks, shared and exclusive, until commit or abort.</td><td>Serialization order equals commit order; the shrinking phase collapses to one instant.</td></tr>
+    </tbody>
+  </table>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 560 200" role="img" aria-label="The 2PL lock profile">
+      <line x1="40" y1="170" x2="540" y2="170" stroke="var(--ink-soft)"/>
+      <line x1="40" y1="30" x2="40" y2="170" stroke="var(--ink-soft)"/>
+      <text x="20" y="100" text-anchor="middle" class="svg-label" transform="rotate(-90 20 100)">locks held</text>
+      <text x="290" y="192" text-anchor="middle" class="svg-label">time</text>
+      <!-- plain 2PL: growing then shrinking, release before commit -->
+      <polyline points="60,170 60,150 120,150 120,120 180,120 180,90 240,90 240,150 300,150 300,170" fill="none" stroke="var(--txn)" stroke-width="2.4"/>
+      <circle cx="240" cy="90" r="4" fill="var(--txn)"/>
+      <text x="248" y="84" class="svg-label" fill="var(--txn)">lock point</text>
+      <text x="180" y="50" text-anchor="middle" class="svg-label">growing</text>
+      <text x="270" y="50" text-anchor="middle" class="svg-label">shrinking</text>
+      <!-- strict 2PL: hold to commit -->
+      <polyline points="340,170 340,150 400,150 400,120 460,120 460,90 520,90 520,170" fill="none" stroke="#2f6f8f" stroke-width="2.4" stroke-dasharray="5 3"/>
+      <circle cx="520" cy="170" r="4" fill="#2f6f8f"/>
+      <text x="520" y="186" text-anchor="middle" class="svg-label" fill="#2f6f8f">commit</text>
+      <text x="430" y="50" text-anchor="middle" class="svg-label" fill="#2f6f8f">strict: held to commit</text>
+    </svg>
+    <figcaption><b>Figure 2.</b> Plain 2PL (solid) releases write locks during the shrinking phase, after the lock
+    point, so an uncommitted value can leak. Strict 2PL (dashed) holds write locks flat until commit, dropping them
+    all at once, which is what makes the schedule strict and undo simple.</figcaption>
+  </figure>
+
+  <div class="callout realworld">
+    <div class="callout-title">In real systems</div>
+    <p>2PL does not by itself prevent deadlock: two transactions can each hold a lock the other wants. PostgreSQL
+    detects deadlocks with a waits-for graph and aborts a victim rather than preventing them up front
+    [<a href="https://www.postgresql.org/docs/current/explicit-locking.html">PG Explicit Locking</a>]. The lock
+    manager itself is a hash table keyed by object id, each entry holding a granted-modes set and a FIFO wait queue,
+    protected by latches (short mutexes, distinct from locks). All of that mechanism is <a href="0013-concurrency-mvcc.html">week 13</a>.</p>
+  </div>
+
+  <!-- ===== ISOLATION LEVELS ===== -->
+  <h2>Isolation levels: choosing how much wrongness to permit</h2>
+  <p>Strict 2PL gives you serializability, but it is expensive: readers and writers block each other. Most
+  applications do not need full serializability for every statement, so SQL defines weaker levels. The defining
+  insight of the ANSI standard, and the central correction in the critique paper, is that the levels are defined by
+  <em>which phenomena they forbid</em>, not by which locking they use. An implementation is free to forbid more
+  than the floor requires.</p>
+
+  <table>
+    <caption>The ANSI levels by phenomenon, with snapshot isolation added as its own row.</caption>
+    <thead><tr><th>Level</th><th>Dirty read</th><th>Non-repeatable read</th><th>Phantom</th><th>Write skew</th></tr></thead>
+    <tbody>
+      <tr><td>Read Uncommitted</td><td>possible</td><td>possible</td><td>possible</td><td>possible</td></tr>
+      <tr><td>Read Committed</td><td>no</td><td>possible</td><td>possible</td><td>possible</td></tr>
+      <tr><td>Repeatable Read</td><td>no</td><td>no</td><td>possible (ANSI)</td><td>possible</td></tr>
+      <tr><td>Serializable</td><td>no</td><td>no</td><td>no</td><td>no</td></tr>
+      <tr><td>Snapshot isolation</td><td>no</td><td>no</td><td>no</td><td><b>possible</b></td></tr>
+    </tbody>
+  </table>
+
+  <p>Notice the snapshot-isolation row. It forbids dirty reads, non-repeatable reads, and even phantoms, yet it
+  permits write skew. That single cell is why SI does not fit on the ANSI ladder at all.</p>
+
+  <div class="callout why">
+    <div class="callout-title">Why snapshot isolation permits write skew</div>
+    <p>Under SI each transaction reads from a consistent snapshot taken at its start, so it never sees another
+    transaction's in-progress or concurrently-committed changes. Write conflicts are resolved by
+    <strong>First-Committer-Wins</strong>: if two concurrent transactions wrote the same item, the first to commit
+    wins and the second aborts. But First-Committer-Wins only catches write-write conflicts <em>on the same item</em>.
+    Write skew is two transactions writing <em>different</em> items after reading an overlapping set, so there is no
+    write-write conflict to catch, even though the precedence graph has a cycle. SI therefore forbids the ANSI
+    phantom yet permits an anomaly Serializable forbids, which makes it <em>incomparable</em> with Repeatable Read,
+    not simply above or below it [<a href="https://www.cs.cmu.edu/~15721-f24/papers/Critique_of_ANSI_Isolation_Levels.pdf">Berenson et al. 1995, section 4.2</a>].</p>
+  </div>
+
+  <!-- ===== SIMULATOR 2: isolation-level phenomenon checker ===== -->
+  <h2>Simulator: does this level block this anomaly?</h2>
+  <p>Pick an isolation level and an anomaly. The tool runs the canonical two-transaction script under that level's
+  rules and shows, step by step, whether the anomaly is blocked or slips through. Fill in the whole grid and you
+  reproduce the table above, including the cell where snapshot isolation breaks on write skew while ANSI
+  Serializable does not.</p>
+
+  <figure class="sim" id="txn-iso-sim">
+    <div class="sim-head">
+      <span class="sim-title">Isolation-level phenomenon checker</span>
+      <span class="sim-sub">choose a level and an anomaly</span>
+    </div>
+    <div class="sim-body">
+      <div class="sim-controls" id="txn-iso-levels"></div>
+      <div class="sim-controls" id="txn-iso-anoms"></div>
+      <div class="sim-stage"><div id="txn-iso-script" style="font-family:var(--mono,monospace);font-size:.92rem;line-height:1.7"></div></div>
+      <div class="sim-readout" id="txn-iso-readout"></div>
+    </div>
+  </figure>
+  <figcaption class="muted" style="margin-top:-1rem">Experiment: set the anomaly to Write skew and step Snapshot
+  isolation against Serializable. The snapshot row lets both writes through; Serializable aborts one transaction
+  on a read/write dependency. That one difference is the whole point of the critique paper.</figcaption>
+
+  <script>
+  // ============== Simulator 2: isolation level checker ==============
+  (function () {
+    var levelBar = document.getElementById("txn-iso-levels");
+    var anomBar = document.getElementById("txn-iso-anoms");
+    var scriptBox = document.getElementById("txn-iso-script");
+    var readout = document.getElementById("txn-iso-readout");
+
+    var LEVELS = ["Read Uncommitted", "Read Committed", "Repeatable Read", "Snapshot isolation", "Serializable"];
+    var ANOMS = ["Dirty read", "Non-repeatable read", "Phantom", "Lost update", "Write skew"];
+
+    var SCRIPTS = {
+      "Dirty read":           ["w1[x]=50", "r2[x]  <- reads x", "a1  (T1 aborts)", "T2 used 50, which never existed"],
+      "Non-repeatable read":  ["r1[x]=10", "w2[x]=99  c2", "r1[x]  <- reads again", "same x, two values in T1"],
+      "Phantom":              ["r1[count where dept=5]=3", "w2[insert row, dept=5]  c2", "r1[count where dept=5]", "set of matching rows changed"],
+      "Lost update":          ["r1[x]=10", "r2[x]=10", "w1[x]=11  c1", "w2[x]=11  c2  <- T1 lost"],
+      "Write skew":           ["r1[oncall]=2", "r2[oncall]=2", "w1[drop doc A]  c1", "w2[drop doc B]  c2  <- 0 on call"]
+    };
+
+    // does LEVEL block ANOM?  returns {blocked:bool, how:string}
+    function verdict(level, anom) {
+      var li = LEVELS.indexOf(level);
+      // Read Uncommitted blocks nothing
+      if (anom === "Dirty read") {
+        if (li >= 1) return { blocked: true, how: "T2's read is forced to wait for committed data (or sees the old value); the uncommitted 50 is never visible." };
+        return { blocked: false, how: "Read Uncommitted lets T2 read T1's uncommitted write. When T1 aborts, T2 used a phantom value." };
+      }
+      if (anom === "Non-repeatable read") {
+        if (li >= 2) return { blocked: true, how: "From Repeatable Read up, T1 reads a fixed snapshot, so its second read of x equals its first." };
+        return { blocked: false, how: level + " takes a fresh view per statement, so T1's second read sees T2's committed change." };
+      }
+      if (anom === "Phantom") {
+        // ANSI RR allows phantoms; but SI and Serializable forbid them. We model the ANSI ladder plus SI.
+        if (level === "Snapshot isolation" || level === "Serializable") return { blocked: true, how: "A frozen snapshot (SI) or predicate locking (Serializable) keeps the matching row set stable, so no new row appears." };
+        return { blocked: false, how: level + " does not lock the predicate, so T2's inserted row appears on the re-query." };
+      }
+      if (anom === "Lost update") {
+        if (level === "Snapshot isolation" || level === "Serializable") return { blocked: true, how: "Both wrote x; First-Committer-Wins (SI) or a write/serialization conflict (Serializable) aborts the second writer, who must retry." };
+        if (level === "Repeatable Read") return { blocked: true, how: "A transaction-level snapshot detects the concurrent update of x and raises a serialization failure (PostgreSQL behaviour)." };
+        return { blocked: false, how: level + " lets both read-modify-write cycles commit; T1's increment is silently overwritten." };
+      }
+      if (anom === "Write skew") {
+        if (level === "Serializable") return { blocked: true, how: "Serializable (SSI) tracks read/write dependencies and aborts one transaction on the dangerous structure, so the constraint holds." };
+        return { blocked: false, how: level + " sees no write-write conflict (different items written), so both commit and the constraint is violated. SI's headline weakness." };
+      }
+      return { blocked: false, how: "" };
+    }
+
+    var curLevel = "Read Committed", curAnom = "Lost update";
+
+    function render() {
+      Array.prototype.forEach.call(levelBar.children, function (b) { b.classList.toggle("active", b.textContent === curLevel); });
+      Array.prototype.forEach.call(anomBar.children, function (b) { b.classList.toggle("active", b.textContent === curAnom); });
+      var lines = SCRIPTS[curAnom];
+      scriptBox.innerHTML = lines.map(function (l, i) {
+        return "<div><span style='color:var(--ink-faint)'>" + (i + 1) + ".</span> " + l + "</div>";
+      }).join("");
+      var v = verdict(curLevel, curAnom);
+      var badge = v.blocked
+        ? "<b style='color:#2f7d4f'>BLOCKED</b>"
+        : "<b style='color:#b03b6b'>ALLOWED</b>";
+      readout.innerHTML = "<b>" + curLevel + "</b> on <b>" + curAnom + "</b>: " + badge + "<br>" + v.how;
+    }
+
+    LEVELS.forEach(function (l) {
+      levelBar.appendChild(DBMS.el("button", { class: "ghost", text: l, onclick: function () { curLevel = l; render(); } }));
+    });
+    ANOMS.forEach(function (a) {
+      anomBar.appendChild(DBMS.el("button", { class: "ghost", text: a, onclick: function () { curAnom = a; render(); } }));
+    });
+    render();
+  })();
+  </script>
+
+  <div class="callout realworld">
+    <div class="callout-title">In real systems</div>
+    <p>PostgreSQL exposes all four ANSI levels but implements only three: its Read Uncommitted behaves exactly like
+    Read Committed, so dirty reads are impossible at any level. Read Committed (the default) takes a fresh snapshot
+    per statement; Repeatable Read is snapshot isolation taken once at transaction start (and, unlike bare ANSI, it
+    does not show phantoms); Serializable is Serializable Snapshot Isolation, which adds dependency checks on top of
+    SI and aborts transactions forming a dangerous structure
+    [<a href="https://www.postgresql.org/docs/current/transaction-iso.html">PG Transaction Isolation</a>]. SQLite
+    reaches serializability by the opposite route: it allows only one writer at a time, and WAL mode gives readers a
+    snapshot so they do not block that writer [<a href="https://www.sqlite.org/isolation.html">SQLite isolation</a>].</p>
+  </div>
+
+  <!-- ===== HAND-OFF ===== -->
+  <h2>What this hands down</h2>
+  <p>This lesson set the target (serializability), the test (the acyclic precedence graph), the second axis
+  (recoverability), and the vocabulary of phenomena and levels. It did not build the machinery that enforces any of
+  it at runtime. <a href="0013-concurrency-mvcc.html">Week 13</a> picks up exactly there: the lock manager and the
+  S/X compatibility matrix that implement 2PL, deadlock detection versus prevention, and MVCC, which delivers
+  snapshot isolation by keeping old row versions so readers never block writers. When you see PostgreSQL stamp a
+  tuple's <code>xmin</code> and <code>xmax</code> next week, remember that the visibility rule it computes is just a
+  mechanical way of giving each transaction the snapshot this lesson described.</p>
+
+  <!-- ===== MCQs ===== -->
+  <h2>Check yourself</h2>
+
+  <div class="mcq" data-answer="2">
+    <p class="mcq-q">Which statement about the ANSI SQL isolation levels is false?</p>
+    <button class="mcq-opt">They are defined by which phenomena (P1, P2, P3) each level forbids.</button>
+    <button class="mcq-opt">A stronger implementation may forbid more phenomena than the floor requires.</button>
+    <button class="mcq-opt">They are defined by which locking protocol each level uses internally.</button>
+    <button class="mcq-opt">Read Committed forbids dirty reads but still permits non-repeatable reads.</button>
+    <p class="mcq-explain">The levels are defined by forbidden phenomena, not by an implementation. The whole point
+    of the critique paper is that the phenomenon definitions are implementation-independent (and were originally
+    ambiguous, which is why P0 dirty write was added). PostgreSQL and a lock-based engine can both be Serializable
+    by completely different mechanisms.</p>
+  </div>
+
+  <div class="mcq" data-answer="1">
+    <p class="mcq-q">Snapshot isolation differs from Serializable because it:</p>
+    <button class="mcq-opt">permits dirty reads of uncommitted data written by other transactions.</button>
+    <button class="mcq-opt">permits write skew, where two transactions write different items.</button>
+    <button class="mcq-opt">permits non-repeatable reads within a single running transaction.</button>
+    <button class="mcq-opt">permits phantom rows to appear on a repeated predicate query.</button>
+    <p class="mcq-explain">SI reads from a frozen snapshot, so it forbids dirty reads, non-repeatable reads, and
+    phantoms. Its one gap is write skew: First-Committer-Wins only catches two writes to the same item, and write
+    skew writes different items, so no conflict is detected even though the precedence graph cycles. That is why SI
+    is incomparable with Repeatable Read rather than strictly stronger.</p>
+  </div>
+
+  <div class="mcq" data-answer="3">
+    <p class="mcq-q">A schedule's precedence graph is acyclic. Which conclusion is correct?</p>
+    <button class="mcq-opt">The schedule is guaranteed to be recoverable as well.</button>
+    <button class="mcq-opt">The schedule must have been produced by strict two-phase locking.</button>
+    <button class="mcq-opt">The schedule is view-serializable but may not be conflict-serializable.</button>
+    <button class="mcq-opt">The schedule is conflict-serializable; a topological sort gives a serial order.</button>
+    <p class="mcq-explain">Acyclic precedence graph if and only if conflict-serializable, and any topological order
+    is an equivalent serial schedule. Recoverability is a separate axis (an acyclic graph can still be
+    unrecoverable), and 2PL is sufficient but not necessary, so the schedule need not come from 2PL.</p>
+  </div>
+
+  <div class="mcq" data-answer="0">
+    <p class="mcq-q">Which statement about two-phase locking is false?</p>
+    <button class="mcq-opt">Plain 2PL produces strict, cascadeless schedules with no further conditions.</button>
+    <button class="mcq-opt">2PL guarantees conflict serializability but does not by itself prevent deadlock.</button>
+    <button class="mcq-opt">Strict 2PL holds all write locks until commit, giving recoverable schedules.</button>
+    <button class="mcq-opt">The lock point is the moment a transaction holds all of its locks at once.</button>
+    <p class="mcq-explain">Plain 2PL only guarantees conflict serializability. It may release a write lock during the
+    shrinking phase before commit, which permits a dirty read and therefore a cascading abort. You need strict 2PL
+    (hold write locks to commit) to get cascadeless, strict schedules. The other three are true.</p>
+  </div>
+
+  <div class="mcq" data-answer="2">
+    <p class="mcq-q">"Serializable" isolation means:</p>
+    <button class="mcq-opt">transactions are physically executed one at a time with no interleaving.</button>
+    <button class="mcq-opt">every read is repeatable and every write is held until the end of the batch.</button>
+    <button class="mcq-opt">the result is equivalent to some serial order, though execution is concurrent.</button>
+    <button class="mcq-opt">the database forbids all locking so that no transaction ever waits on another.</button>
+    <p class="mcq-explain">Serializable constrains the result, not the execution. PostgreSQL's Serializable runs
+    transactions concurrently and only aborts the ones whose interleaving could not match any serial order.
+    Confusing "serializable" with "serial execution" is the classic trap.</p>
+  </div>
+
+  <div class="mcq" data-answer="1">
+    <p class="mcq-q">A non-repeatable read and a phantom both involve a re-read returning something new. The
+    difference is:</p>
+    <button class="mcq-opt">a phantom changes a value while a non-repeatable read changes a row's existence.</button>
+    <button class="mcq-opt">a phantom changes which rows match a predicate; a non-repeatable read changes a seen row's value.</button>
+    <button class="mcq-opt">a phantom occurs only under Serializable while a non-repeatable read occurs only under SI.</button>
+    <button class="mcq-opt">a phantom is caused by an abort while a non-repeatable read is caused by a commit.</button>
+    <p class="mcq-explain">A non-repeatable read is a changed value of a row you already saw. A phantom is a changed
+    set of matching rows (an insert or delete). The practical consequence is that stopping phantoms needs predicate
+    or gap locking, not just row locks, which is why Repeatable Read can forbid P2 yet allow P3.</p>
+  </div>
+
+  <!-- ===== FLASHCARDS ===== -->
+  <h2>Active recall</h2>
+  <div class="flashcard">
+    <div class="fc-front">State the test for conflict serializability in one sentence.</div>
+    <div class="fc-back">Build the precedence graph (edge Ti to Tj on each conflicting, ordered operation pair); the
+    schedule is conflict-serializable if and only if the graph is acyclic, and a topological sort gives an
+    equivalent serial order.</div>
+  </div>
+
+  <div class="flashcard">
+    <div class="fc-front">Why is snapshot isolation incomparable with Repeatable Read rather than stronger?</div>
+    <div class="fc-back">SI forbids phantoms that ANSI Repeatable Read permits, so it is not weaker; but SI permits
+    write skew, which Serializable forbids, so it is not as strong as Serializable. Forbidding more in one place and
+    less in another makes it incomparable, not ranked.</div>
+  </div>
+
+  <div class="flashcard">
+    <div class="fc-front">Plain 2PL guarantees conflict serializability. What does it still allow, and what fixes it?</div>
+    <div class="fc-back">Plain 2PL still allows dirty reads and cascading aborts, because it can release a write lock
+    before commit. Strict 2PL (hold all write locks until commit or abort) produces strict, cascadeless schedules.</div>
+  </div>
+
+  <!-- ===== PRIMARY SOURCE ===== -->
+  <div class="source-box">
+    <div class="src-tag">Primary source</div>
+    <div class="src-title">Read this next: <a href="https://www.cs.cmu.edu/~15721-f24/papers/Critique_of_ANSI_Isolation_Levels.pdf">A Critique of ANSI SQL Isolation Levels (Berenson, Bernstein, Gray, Melton, O'Neil, O'Neil, SIGMOD 1995)</a></div>
+    <p class="muted">The source for P0 dirty write, the phenomenon-based level definitions and their original
+    ambiguity, snapshot isolation with First-Committer-Wins, write skew (A5B), and the argument that SI is
+    incomparable with Repeatable Read. Focus on sections 3 and 4 and the level-comparison figure.</p>
+  </div>
+
+  <!-- ===== ASK YOUR TEACHER ===== -->
+  <div class="ask-teacher">
+    <div class="at-tag">Ask your teacher</div>
+    <p>Want me to walk a specific schedule through the precedence graph by hand, derive the 2PL lock-point argument
+    more slowly, or show the exact PostgreSQL error string a serialization failure raises? Ask me to go deeper, draw
+    it differently, or quiz you harder. I am your teacher for this course, not just a document.</p>
+  </div>
+
+  <!-- ===== NAV ===== -->
+  <nav class="lesson-nav">
+    <a class="prev" href="0011-query-optimization.html">
+      <span class="nav-dir">Previous</span>
+      <span class="nav-title">Week 11 · Query optimization: cost, selectivity, and join ordering</span>
+    </a>
+    <a class="next" href="0013-concurrency-mvcc.html">
+      <span class="nav-dir">Next</span>
+      <span class="nav-title">Week 13 · Concurrency: strict 2PL, deadlock, and MVCC</span>
+    </a>
+  </nav>
+
+  </div><!-- /.col -->
+</main>
+</body>
+</html>

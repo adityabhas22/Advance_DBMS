@@ -196,7 +196,7 @@ Content to include: ${r.spec}
 READ these research notes first as ground truth: ${r.refs.map(x=>`${REPO}/${x}`).join(', ')}
 Return per schema.`,
   { label: `ref:${r.name}`, phase: 'Reference', agentType: 'general-purpose', effort: 'high', schema: REF_RETURN }
-))).filter(Boolean)
+)))).filter(Boolean)
 
 log(`reference docs built: ${refResults.length}/${REFS.length}`)
 

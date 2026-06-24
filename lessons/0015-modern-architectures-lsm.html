@@ -1,0 +1,915 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lesson 15 · Modern architectures: LSM trees, columnar storage, DuckDB · Field Guide to the Database Engine</title>
+<link rel="stylesheet" href="../assets/course.css">
+<script defer src="../assets/components.js"></script>
+</head>
+<body class="layer-modern">
+<main class="page">
+
+  <!-- ===== MASTHEAD ===== -->
+  <header class="masthead col">
+    <div class="crumbs">
+      <a href="../index.html">Field Guide</a> <span>/</span>
+      <span>Part VIII · Modern and distributed</span> <span>/</span>
+      <span>Week 15</span>
+    </div>
+    <span class="week-badge">Modern architectures</span>
+    <h1>Modern architectures: LSM trees, columnar storage, DuckDB</h1>
+    <p class="lede">For fourteen weeks we built one engine: a B+tree over a buffer pool over slotted pages,
+    write-ahead logged and MVCC concurrent. This week we put that engine under two pressures it was not
+    built for, write-heavy ingest and column-wide analytic scans, and watch the comfortable design lose
+    to two others.</p>
+  </header>
+
+  <div class="col">
+
+  <!-- ===== OBJECTIVES ===== -->
+  <div class="objectives">
+    <h4>By the end you can</h4>
+    <ul>
+      <li>Explain write amplification on an update-in-place B+tree and why the LSM tree turns random writes into sequential ones.</li>
+      <li>Walk the LSM read and write paths, and reason about the read, write, and space amplification trade-off (the RUM conjecture) when you switch compaction policy.</li>
+      <li>Say why a Bloom filter is safe for skipping SSTables, and exactly what it can and cannot get wrong.</li>
+      <li>Contrast row (NSM) and column (DSM) layout and explain why columnar plus vectorized execution wins OLAP, and DuckDB as a concrete embedded example.</li>
+      <li>Defend the Bigtable write path in a viva, and pick out the false statement an MCQ will hide.</li>
+    </ul>
+  </div>
+
+  <!-- ===== WHERE THIS SITS (connective tissue) ===== -->
+  <p>This is the first of two weeks that do not add a new layer. They revisit the whole stack under new
+  pressure. Recall the two journeys. The read journey took
+  <code>SELECT name FROM emp WHERE salary &gt; 75000 ORDER BY name</code> down through the parser
+  (<a href="0008-query-parsing.html">week 8</a>), the optimizer (<a href="0011-query-optimization.html">week 11</a>),
+  the Volcano executor (<a href="0009-query-execution-volcano.html">weeks 9</a> and
+  <a href="0010-query-execution-joins.html">10</a>), the B+tree index (<a href="0006-btree-search-insert.html">weeks 6</a>
+  and <a href="0007-btree-delete-hash.html">7</a>), the buffer pool (<a href="0004-buffer-pool-design.html">weeks 4</a>
+  and <a href="0005-buffer-pool-lru-k.html">5</a>), and the slotted heap pages
+  (<a href="0002-storage-engine-disk-pages.html">weeks 2</a> and <a href="0003-storage-engine-heap-files.html">3</a>).
+  The write journey ran an <code>UPDATE</code> through MVCC (<a href="0013-concurrency-mvcc.html">week 13</a>) and
+  the ARIES write-ahead log (<a href="0014-logging-recovery-aries.html">week 14</a>).</p>
+
+  <p>Nothing new is handed in from above and nothing new is handed down. Instead three subsystems get
+  replaced. The update-in-place storage and index layers (weeks 2, 3, 6, 7) give way to a log-structured
+  design: a memtable plus a write-ahead log plus immutable sorted files plus background compaction. The
+  row-oriented slotted page gives way to a column layout for analytic scans. And the pull-based Volcano
+  iterator of week 9 gives way to vectorized, push-based execution. The buffer pool, the WAL durability
+  idea, and MVCC all reappear, in new clothes. Next week, <a href="0016-distributed-databases.html">week 16</a>,
+  takes this same machinery and spreads it across machines, using the same paper (Bigtable) as the bridge.</p>
+
+  <div class="callout intuition">
+    <div class="callout-title">Intuition</div>
+    <p>A B+tree edits the disk in place: to add one row you find its leaf, read that page, change a few
+    bytes, write the page back. When writes pour in faster than the working set fits in cache, the leaf you
+    need is almost never the leaf in memory, so each small insert becomes a random read followed by a random
+    write. The LSM tree refuses to edit in place. It collects writes in memory, then dumps them to disk in
+    one big sorted file, sequentially, and cleans up later in the background. Many tiny random writes become
+    a few large sequential ones. You pay for that on reads, because the newest copy of a key could be in any
+    of those files.</p>
+  </div>
+
+  <!-- ===== THE THREE PRESSURES ===== -->
+  <h2>Three pressures on the comfortable design</h2>
+
+  <p>The single-node engine we built is read-optimized and row-oriented. Three workloads break it, and each
+  one points to a different fix.</p>
+
+  <div class="callout why">
+    <div class="callout-title">Why the B+tree loses on write-heavy ingest</div>
+    <p>A single logical insert of a small row into a B+tree can force a page read, an in-memory
+    modification, a page write, a WAL record, and eventual checkpoint flushing. Under a write-heavy load
+    the leaf you need is rarely cached, so inserts become random reads followed by random writes. On
+    spinning disks random writes are the worst case; even on flash they burn endurance and trigger the
+    device's own garbage collection. The B+tree cannot turn those random writes into sequential ones,
+    because its whole correctness story is keeping the on-disk tree sorted and balanced at all times. The
+    fix is to stop keeping the on-disk structure perfectly sorted at all times and instead batch and defer.
+    That is the log-structured merge tree
+    [<a href="https://link.springer.com/article/10.1007/s002360050048">O'Neil, Cheng, Gawlick, O'Neil 1996</a>].</p>
+  </div>
+
+  <p>The second pressure is the analytic scan. A row-store keeps a tuple's columns contiguous, which is
+  ideal when a query reads whole rows: fetch this order, update this account. An analytic query does the
+  opposite. It touches two or three columns of a billion-row table and aggregates them. A row layout drags
+  every other column through the memory hierarchy to reach the two it needs, wasting bandwidth and cache
+  lines. The fix is to lay data out by column, which makes column projection free at the storage layer and
+  unlocks far better compression.</p>
+
+  <p>The third pressure is that one machine has finite disk, finite memory, and a single failure domain.
+  That is next week. For now the lesson is that no amount of tuning the buffer pool or the B+tree addresses
+  the first two pressures. They are the wrong shape.</p>
+
+  <!-- ===== FIGURE: LSM write path ===== -->
+  <figure class="diagram">
+    <svg viewBox="0 0 620 230" role="img" aria-label="LSM tree write and read paths">
+      <!-- write side -->
+      <text x="14" y="22" class="svg-label" style="font-weight:600">write path (all sequential)</text>
+      <rect x="14" y="34" width="120" height="44" rx="6" fill="var(--modern-bg)" stroke="var(--modern)"/>
+      <text x="74" y="54" text-anchor="middle" class="svg-mono">WAL</text>
+      <text x="74" y="70" text-anchor="middle" class="svg-label sm">append-only</text>
+      <rect x="150" y="34" width="120" height="44" rx="6" fill="var(--modern-bg)" stroke="var(--modern)"/>
+      <text x="210" y="54" text-anchor="middle" class="svg-mono">memtable</text>
+      <text x="210" y="70" text-anchor="middle" class="svg-label sm">sorted, in RAM</text>
+      <line x1="134" y1="56" x2="150" y2="56" stroke="var(--ink-soft)" marker-end="url(#arr15)"/>
+      <text x="305" y="40" class="svg-label sm">flush when full</text>
+      <line x1="210" y1="78" x2="210" y2="108" stroke="var(--ink-soft)" marker-end="url(#arr15)"/>
+      <!-- SSTables -->
+      <rect x="150" y="112" width="120" height="34" rx="5" fill="#fffefb" stroke="var(--modern)"/>
+      <text x="210" y="133" text-anchor="middle" class="svg-mono">SSTable (immutable)</text>
+      <rect x="158" y="120" width="120" height="34" rx="5" fill="#fffefb" stroke="var(--rule)"/>
+      <rect x="166" y="128" width="120" height="34" rx="5" fill="#fffefb" stroke="var(--rule)"/>
+      <text x="180" y="186" class="svg-label sm">compaction merges sorted files in the background</text>
+      <line x1="210" y1="162" x2="210" y2="190" stroke="var(--rule)" stroke-dasharray="3 3"/>
+      <rect x="150" y="194" width="180" height="28" rx="5" fill="var(--good-bg)" stroke="var(--good)"/>
+      <text x="240" y="212" text-anchor="middle" class="svg-mono">fewer, larger sorted runs</text>
+      <!-- read side -->
+      <text x="380" y="22" class="svg-label" style="font-weight:600">read path (the price)</text>
+      <rect x="380" y="34" width="220" height="44" rx="6" fill="#fffefb" stroke="var(--ink-soft)"/>
+      <text x="490" y="50" text-anchor="middle" class="svg-mono">get(key)</text>
+      <text x="490" y="68" text-anchor="middle" class="svg-label sm">check memtable, then SSTables newest first</text>
+      <rect x="380" y="92" width="220" height="38" rx="6" fill="var(--modern-bg)" stroke="var(--modern)"/>
+      <text x="490" y="108" text-anchor="middle" class="svg-mono">Bloom filter per SSTable</text>
+      <text x="490" y="124" text-anchor="middle" class="svg-label sm">"definitely not" skips a file with zero I/O</text>
+      <text x="380" y="156" class="svg-label sm">newest copy of a key wins; tombstones mark deletes</text>
+      <defs>
+        <marker id="arr15" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto">
+          <path d="M0,0 L7,3 L0,6 Z" fill="var(--ink-soft)"/>
+        </marker>
+      </defs>
+    </svg>
+    <figcaption><b>Figure 1.</b> The LSM split. Writes only ever append (to the WAL and the in-memory
+    memtable) and flush whole sorted files; nothing is edited in place. Reads pay for that by potentially
+    consulting many files, which Bloom filters and compaction keep bounded.</figcaption>
+  </figure>
+
+  <!-- ===== LSM MECHANISM ===== -->
+  <h2>The log-structured merge tree</h2>
+
+  <p>The LSM tree was introduced by O'Neil, Cheng, Gawlick, and O'Neil in 1996 as a multi-component
+  structure: a memory-resident component and one or more disk-resident components, with a rolling merge
+  that continuously migrates entries from the smaller component to the larger one
+  [<a href="https://link.springer.com/article/10.1007/s002360050048">Acta Informatica 1996</a>]. The
+  point is to defer and batch index changes so that many logical inserts are amortized into one large
+  sequential disk pass. Modern implementations (RocksDB, LevelDB, Cassandra, Bigtable) settled on four
+  concrete pieces.</p>
+
+  <ul>
+    <li><b>Memtable.</b> An in-memory sorted structure, commonly a skip list, that absorbs all writes. A
+    write is an append to the memtable plus an append to the log. Both are cheap and sequential.</li>
+    <li><b>Write-ahead log.</b> An on-disk append-only log written before or alongside the memtable update,
+    so the volatile memtable can be recovered after a crash. This is the same durability idea as the
+    relational WAL from <a href="0014-logging-recovery-aries.html">week 14</a>, used here only to protect
+    the in-memory memtable, not to undo or redo pages.</li>
+    <li><b>Immutable SSTables.</b> When the memtable fills, it is frozen, a fresh memtable takes over, and
+    the frozen one is flushed to disk as a sorted string table: a persistent, ordered, immutable map from
+    key to value, the exact definition from the Bigtable paper
+    [<a href="https://research.google.com/archive/bigtable-osdi06.pdf">Chang et al. 2006, Section 4</a>].
+    Immutability is the whole trick. Files are written once, sequentially, and never updated in place.
+    Updates and deletes are new entries in newer SSTables; a delete writes a tombstone marker.</li>
+    <li><b>Compaction.</b> A background process that merges SSTables, drops superseded versions and
+    tombstones, and keeps the number of files (and so the read cost) bounded.</li>
+  </ul>
+
+  <p>The write path is therefore append to the WAL, insert into the memtable, and occasionally flush an
+  SSTable. All sequential. The cost is paid on reads and on compaction. A point lookup must check the
+  memtable, then potentially several SSTables from newest to oldest, because the key could live in any of
+  them and the newest copy wins. Without help, a read touches one file per sorted run. Two mechanisms cut
+  that down: a per-SSTable block index turns a within-file lookup into a binary search, and a per-SSTable
+  Bloom filter lets a read skip files that cannot contain the key without any I/O.</p>
+
+  <div class="callout keyidea">
+    <div class="callout-title">Keep this one thing</div>
+    <p>A B+tree does roughly one logarithmic-depth random write per insert and one random read per lookup:
+    balanced, update-in-place, read-optimized. An LSM tree makes writes cheap and sequential but pays in
+    read amplification and space amplification, plus background compaction I/O. Neither is strictly better.
+    The choice is the workload.</p>
+  </div>
+
+  <!-- ===== RUM trade-off ===== -->
+  <h3>The three amplifications and the RUM conjecture</h3>
+
+  <p>An LSM tree pays its write debt in three different currencies, and you cannot minimize all three at
+  once.</p>
+
+  <table>
+    <caption>The three amplifications, what each measures, and which compaction policy each favors.</caption>
+    <thead><tr><th>Amplification</th><th>What it measures</th><th>Pushed up by</th></tr></thead>
+    <tbody>
+      <tr><td>Write</td><td>bytes physically written / bytes logically inserted</td><td>leveled compaction (often &gt;10 in RocksDB)</td></tr>
+      <tr><td>Read</td><td>files or pages read to answer one lookup</td><td>tiered compaction (many runs to probe)</td></tr>
+      <tr><td>Space</td><td>bytes on disk / bytes of live data</td><td>tiered compaction (dead data lingers, transient copies)</td></tr>
+    </tbody>
+  </table>
+
+  <p>This is the read-update-memory (RUM) conjecture in practice: you optimize at most two of read, update
+  (write), and memory (space). RocksDB states the policies as direct trade-offs. Leveled compaction
+  "minimizes space amplification at the cost of read and write amplification"; universal (tiered)
+  compaction "minimizes write amplification at the cost of read and space amplification"
+  [<a href="https://github.com/facebook/rocksdb/wiki/Compaction">RocksDB wiki, Compaction</a>].</p>
+
+  <div class="callout why">
+    <div class="callout-title">Why leveled and tiered sit at opposite ends</div>
+    <p><b>Tiered (size-tiered, RocksDB's "universal")</b> groups SSTables of similar size. When enough runs
+    of one size accumulate, they merge into one larger run at the next tier, so each level holds several
+    sorted runs. Few rewrites per byte means low write amplification, but a read may have to check many
+    runs (high read amplification), and two copies of a large run can coexist during a merge (high
+    transient space amplification). <b>Leveled</b> organizes data into levels L0, L1, L2, and so on, where
+    every non-zero level is a single sorted run, range-partitioned across fixed-size files with
+    non-overlapping key ranges. Each level has a size target a fixed multiplier larger than the one above
+    it (the default multiplier is 10, giving roughly 16 KB, 160 KB, 1.6 MB, 16 MB targets from a 16 KB
+    base) [<a href="https://github.com/facebook/rocksdb/wiki/Leveled-Compaction">RocksDB wiki, Leveled
+    Compaction</a>]. A read checks at most one file per level (low read amplification) and dead data is
+    bounded (low space amplification), but a byte is rewritten roughly once per level it descends, so
+    write amplification grows with the number of levels. One line: tiered favors write-heavy workloads and
+    accepts slower reads; leveled favors read-heavy workloads and accepts more write churn.</p>
+  </div>
+
+  <!-- ===== SIMULATOR 1: LSM ===== -->
+  <figure class="sim" id="lsm-sim">
+    <div class="sim-head">
+      <span class="sim-title">LSM write and compaction visualizer</span>
+      <span class="sim-sub">stream writes, flush SSTables, compact, and watch the three amplifications move</span>
+    </div>
+    <div class="sim-body">
+      <div class="sim-stage"><svg id="lsm-svg" viewBox="0 0 600 260" width="100%"></svg></div>
+      <div class="sim-controls" id="lsm-controls"></div>
+      <div class="sim-readout" id="lsm-readout"></div>
+    </div>
+  </figure>
+  <figcaption class="muted" style="margin-top:-1rem">Experiment: hold the same write stream and flip
+  compaction policy. Tiered keeps many runs per level (cheap writes, expensive reads). Leveled keeps one
+  run per non-zero level (cheap reads, more rewrites). Then drag bits-per-key on the Bloom filter and run a
+  negative lookup: watch the number of SSTables actually probed collapse.</figcaption>
+
+  <script>
+  // ===== LSM write/compaction visualizer =====
+  (function () {
+    const svg = document.getElementById("lsm-svg");
+    const readout = document.getElementById("lsm-readout");
+    const controls = document.getElementById("lsm-controls");
+
+    const MEMCAP = 4;           // writes per memtable before a flush
+    const FANOUT = 3;           // level size multiplier (tiered: runs per level; leveled: size target)
+    const state = {
+      policy: "tiered",         // "tiered" | "leveled"
+      bpk: 10,                  // Bloom bits per key
+      mem: 0,                   // entries currently in memtable
+      written: 0,               // logical writes issued
+      bytesWritten: 0,          // physical bytes written (proxy: 1 per entry move)
+      bytesInserted: 0,         // logical bytes inserted
+      levels: [[], []],         // each level is a list of "runs"; each run = entry count
+    };
+
+    function flush() {
+      if (state.mem === 0) return;
+      state.bytesWritten += state.mem;      // flush writes the memtable once
+      state.levels[0].push(state.mem);      // a new run lands in L0
+      state.mem = 0;
+      compact();
+    }
+
+    function compact() {
+      // Tiered: when a level accumulates FANOUT runs, merge them into one run at the next level.
+      // Leveled: keep one run per non-zero level; a new L0 run is merged into L1's single run.
+      if (state.policy === "tiered") {
+        for (let L = 0; L < state.levels.length; L++) {
+          while (state.levels[L].length >= FANOUT) {
+            const taken = state.levels[L].splice(0, FANOUT);
+            const merged = taken.reduce((a, b) => a + b, 0);
+            state.bytesWritten += merged;         // merge rewrites the merged bytes once
+            if (!state.levels[L + 1]) state.levels[L + 1] = [];
+            state.levels[L + 1].push(merged);
+          }
+        }
+      } else {
+        // leveled: collapse all L0 runs into L1's single run on every flush
+        while (state.levels[0].length > 0) {
+          const run = state.levels[0].shift();
+          if (!state.levels[1]) state.levels[1] = [];
+          const existing = state.levels[1].length ? state.levels[1][0] : 0;
+          const merged = existing + run;
+          state.bytesWritten += merged;           // rewrite L1 entirely (worst case, by design)
+          state.levels[1] = [merged];
+          // cascade if L1 exceeds its size target (FANOUT * base)
+          let L = 1;
+          while (state.levels[L] && state.levels[L][0] > MEMCAP * Math.pow(FANOUT, L)) {
+            const carry = state.levels[L][0];
+            if (!state.levels[L + 1]) state.levels[L + 1] = [];
+            const ex = state.levels[L + 1].length ? state.levels[L + 1][0] : 0;
+            const m = ex + carry;
+            state.bytesWritten += m;
+            state.levels[L + 1] = [m];
+            state.levels[L] = [];
+            L++;
+          }
+        }
+      }
+    }
+
+    function write() {
+      state.written++;
+      state.bytesInserted++;
+      state.mem++;
+      if (state.mem >= MEMCAP) flush();
+    }
+
+    function runCount() {
+      return state.levels.reduce((a, lvl) => a + lvl.length, 0) + (state.mem > 0 ? 1 : 0);
+    }
+
+    function bloomFP() {
+      // (0.6185)^(m/n) at the optimal hash count
+      return Math.pow(0.6185, state.bpk);
+    }
+
+    function negativeLookup() {
+      // a read probes the memtable plus every SSTable run, minus those a Bloom filter skips.
+      const runs = state.levels.reduce((a, lvl) => a + lvl.length, 0);
+      const fp = bloomFP();
+      // each run is skipped unless the filter false-positives
+      const probed = runs * fp;            // expected SSTable I/Os on a missing key
+      state.lastLookup = { runs: runs, probed: probed, fp: fp };
+      draw();
+    }
+
+    function draw() {
+      svg.innerHTML = "";
+      // memtable
+      svg.appendChild(DBMS.svg("text", { x: 12, y: 18, class: "svg-label", style: "font-weight:600" }, "memtable"));
+      for (let i = 0; i < MEMCAP; i++) {
+        svg.appendChild(DBMS.svg("rect", {
+          x: 12 + i * 24, y: 26, width: 20, height: 20, rx: 3,
+          fill: i < state.mem ? "var(--modern-bg)" : "#fffefb",
+          stroke: i < state.mem ? "var(--modern)" : "var(--rule)"
+        }));
+      }
+      // levels of SSTable runs
+      let y = 70;
+      for (let L = 0; L < state.levels.length; L++) {
+        svg.appendChild(DBMS.svg("text", { x: 12, y: y + 16, class: "svg-mono" }, "L" + L));
+        let x = 50;
+        state.levels[L].forEach(function (run) {
+          const w = Math.max(26, Math.min(120, run * 9));
+          svg.appendChild(DBMS.svg("rect", { x: x, y: y, width: w, height: 24, rx: 4, fill: "#fffefb", stroke: "var(--modern)" }));
+          svg.appendChild(DBMS.svg("text", { x: x + w / 2, y: y + 16, "text-anchor": "middle", class: "svg-label sm" }, run + ""));
+          x += w + 8;
+        });
+        if (state.levels[L].length === 0) {
+          svg.appendChild(DBMS.svg("text", { x: 50, y: y + 16, class: "svg-label sm svg-faint" }, "(empty)"));
+        }
+        y += 34;
+      }
+      // amplification readout
+      const wamp = state.bytesInserted ? (state.bytesWritten / state.bytesInserted) : 0;
+      const runs = runCount();
+      let line = "policy: " + state.policy + "   writes: " + state.written +
+        "   sorted runs: " + runs + "\n" +
+        "write amplification = bytesWritten/bytesInserted = " + state.bytesWritten + "/" + state.bytesInserted +
+        " = " + wamp.toFixed(2) + "x\n" +
+        "read amp (runs to probe on a hit, worst case): " + runs +
+        "   Bloom bits/key: " + state.bpk + "  -> false-positive ~ " + (bloomFP() * 100).toFixed(2) + "%";
+      if (state.lastLookup) {
+        line += "\nnegative lookup over " + state.lastLookup.runs + " SSTables: expected ~ " +
+          state.lastLookup.probed.toFixed(2) + " probed (rest skipped by Bloom)";
+      }
+      readout.textContent = line;
+    }
+
+    // controls
+    const wBtn = DBMS.el("button", { text: "Write", onclick: function () { state.lastLookup = null; write(); draw(); } });
+    const fBtn = DBMS.el("button", { class: "ghost", text: "Force flush", onclick: function () { state.lastLookup = null; flush(); draw(); } });
+    const nBtn = DBMS.el("button", { text: "Negative lookup", onclick: negativeLookup });
+    const rBtn = DBMS.el("button", { class: "ghost", text: "Reset", onclick: function () {
+      state.policy = polSel.value; state.mem = 0; state.written = 0; state.bytesWritten = 0;
+      state.bytesInserted = 0; state.levels = [[], []]; state.lastLookup = null; draw();
+    } });
+
+    const polSel = DBMS.el("select");
+    polSel.append(DBMS.el("option", { value: "tiered", text: "tiered" }), DBMS.el("option", { value: "leveled", text: "leveled" }));
+    polSel.addEventListener("change", function () {
+      state.policy = polSel.value; state.mem = 0; state.written = 0; state.bytesWritten = 0;
+      state.bytesInserted = 0; state.levels = [[], []]; state.lastLookup = null; draw();
+    });
+    const polWrap = DBMS.el("label", null, ["compaction ", polSel]);
+
+    const bOut = DBMS.el("span", { class: "pill" });
+    const bInp = DBMS.el("input", { type: "range", min: 2, max: 20, step: 1, value: state.bpk });
+    bInp.addEventListener("input", function () { state.bpk = Number(bInp.value); draw(); });
+    const bWrap = DBMS.el("label", null, ["Bloom bits/key ", bInp, " ", bOut]);
+    DBMS.bindRange(bInp, bOut, function (v) { return v; });
+
+    controls.append(wBtn, fBtn, polWrap, bWrap, nBtn, rBtn);
+    draw();
+  })();
+  </script>
+
+  <div class="callout gotcha">
+    <div class="callout-title">Exam trap</div>
+    <p>"Leveled compaction has lower write amplification than tiered" is false, and it is the reverse of
+    the truth. Leveled minimizes space and read amplification at the cost of higher write amplification
+    (the &gt;10 figure in RocksDB); tiered minimizes write amplification at the cost of higher read and
+    space amplification [<a href="https://github.com/facebook/rocksdb/wiki/Compaction">RocksDB wiki</a>].
+    A second trap: "LSM trees are strictly faster than B-trees." Also false. LSM optimizes writes and pays
+    on reads and space, and compaction consumes background I/O and CPU. The honest answer is
+    workload-dependent.</p>
+  </div>
+
+  <!-- ===== BLOOM FILTERS ===== -->
+  <h2>Bloom filters: the asymmetry that makes them safe</h2>
+
+  <p>A Bloom filter answers one question about an SSTable: is key X possibly in this file? It answers either
+  "definitely not" or "maybe". It never produces a false negative, only a false positive. That asymmetry is
+  exactly what an LSM read needs. A "definitely not" lets the reader skip an entire SSTable with zero I/O,
+  and a false positive only costs a wasted lookup that returns nothing.</p>
+
+  <p>The mechanics are a bit array of m bits and k independent hash functions. To insert a key, hash it k
+  ways and set those k bits. To test a key, hash it k ways and check those k bits. If any is 0 the key is
+  absent; if all are 1 the key is probably present. The false-positive probability after inserting n keys
+  is approximately (1 - e^(-kn/m))^k, minimized at k = (m/n) ln 2, and at that optimum the false-positive
+  rate is about (0.6185)^(m/n)
+  [<a href="https://courses.e-ce.uth.gr/ECE216/lectures/BloomFilter_FalsePositiveRate.pdf">Bloom filter
+  false-positive derivation</a>]. RocksDB's common configuration is about 10 bits per key, which gives a
+  false-positive rate near 1 percent.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 560 150" role="img" aria-label="Bloom filter membership test">
+      <text x="12" y="20" class="svg-label" style="font-weight:600">bit array (m bits), k hashes</text>
+      <g font-family="var(--mono)">
+        <!-- bit cells -->
+        <g>
+          <rect x="12" y="30" width="28" height="28" fill="var(--modern-bg)" stroke="var(--modern)"/>
+          <rect x="40" y="30" width="28" height="28" fill="#fffefb" stroke="var(--rule)"/>
+          <rect x="68" y="30" width="28" height="28" fill="var(--modern-bg)" stroke="var(--modern)"/>
+          <rect x="96" y="30" width="28" height="28" fill="var(--modern-bg)" stroke="var(--modern)"/>
+          <rect x="124" y="30" width="28" height="28" fill="#fffefb" stroke="var(--rule)"/>
+          <rect x="152" y="30" width="28" height="28" fill="var(--modern-bg)" stroke="var(--modern)"/>
+          <rect x="180" y="30" width="28" height="28" fill="#fffefb" stroke="var(--rule)"/>
+          <rect x="208" y="30" width="28" height="28" fill="var(--modern-bg)" stroke="var(--modern)"/>
+        </g>
+        <text x="26" y="49" text-anchor="middle" class="svg-mono">1</text>
+        <text x="54" y="49" text-anchor="middle" class="svg-mono">0</text>
+        <text x="82" y="49" text-anchor="middle" class="svg-mono">1</text>
+        <text x="110" y="49" text-anchor="middle" class="svg-mono">1</text>
+        <text x="138" y="49" text-anchor="middle" class="svg-mono">0</text>
+        <text x="166" y="49" text-anchor="middle" class="svg-mono">1</text>
+        <text x="194" y="49" text-anchor="middle" class="svg-mono">0</text>
+        <text x="222" y="49" text-anchor="middle" class="svg-mono">1</text>
+      </g>
+      <text x="270" y="40" class="svg-label">test key Y -&gt; hashes hit a 0 bit</text>
+      <rect x="270" y="48" width="180" height="26" rx="5" fill="var(--good-bg)" stroke="var(--good)"/>
+      <text x="360" y="65" text-anchor="middle" class="svg-mono">definitely NOT here</text>
+      <text x="270" y="100" class="svg-label">test key Z -&gt; all k bits are 1</text>
+      <rect x="270" y="108" width="180" height="26" rx="5" fill="var(--modern-bg)" stroke="var(--modern)"/>
+      <text x="360" y="125" text-anchor="middle" class="svg-mono">MAYBE here (verify)</text>
+      <text x="12" y="92" class="svg-label sm">no false negatives ever; only false positives, tuned by m/n</text>
+      <text x="12" y="112" class="svg-label sm">cannot delete a key by clearing bits (a bit may be shared)</text>
+    </svg>
+    <figcaption><b>Figure 2.</b> The one-sided guarantee. A 0 bit proves absence, so "definitely not" is
+    always correct and safe for skipping a file. All bits set only means "maybe," so a match must still be
+    verified by reading the SSTable.</figcaption>
+  </figure>
+
+  <div class="callout gotcha">
+    <div class="callout-title">Exam trap</div>
+    <p>"Bloom filters can give false negatives" is false. A 0 bit means at least one of the key's hash
+    positions was never set, which is impossible if the key were present, so absence is certain. They give
+    only false positives. A related trap: you cannot delete a key from a standard Bloom filter by clearing
+    its bits, because a bit might be shared with another key, which would introduce false negatives.
+    Deletion needs a counting Bloom filter, not the standard one.</p>
+  </div>
+
+  <!-- ===== COLUMNAR ===== -->
+  <h2>Columnar storage: transpose the table</h2>
+
+  <p>A row-store (the n-ary storage model, NSM) stores the columns of one tuple contiguously: row 1's a, b,
+  c, then row 2's a, b, c. This is the slotted page from <a href="0002-storage-engine-disk-pages.html">week
+  2</a>. A column-store (the decomposition storage model, DSM) stores all values of column a contiguously,
+  then all of column b, then all of column c. The same logical table, physically transposed. For the
+  running example <code>SELECT name FROM emp WHERE salary &gt; 75000</code>, an analytic version over a
+  fifty-column <code>emp</code> table touches only <code>name</code> and <code>salary</code>. Under DSM the
+  scan reads two column segments and ignores forty-eight. Under NSM it must read every page, because each
+  page carries all fifty columns, to extract the two.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 560 180" role="img" aria-label="Row store versus column store layout">
+      <text x="12" y="18" class="svg-label" style="font-weight:600">NSM (row-store): tuples contiguous</text>
+      <g>
+        <rect x="12" y="26" width="40" height="22" fill="var(--modern-bg)" stroke="var(--modern)"/>
+        <rect x="52" y="26" width="40" height="22" fill="var(--good-bg)" stroke="var(--good)"/>
+        <rect x="92" y="26" width="40" height="22" fill="#fffefb" stroke="var(--rule)"/>
+        <rect x="132" y="26" width="40" height="22" fill="#fffefb" stroke="var(--rule)"/>
+        <rect x="172" y="26" width="40" height="22" fill="var(--modern-bg)" stroke="var(--modern)"/>
+        <rect x="212" y="26" width="40" height="22" fill="var(--good-bg)" stroke="var(--good)"/>
+        <rect x="252" y="26" width="40" height="22" fill="#fffefb" stroke="var(--rule)"/>
+        <rect x="292" y="26" width="40" height="22" fill="#fffefb" stroke="var(--rule)"/>
+      </g>
+      <text x="32" y="41" text-anchor="middle" class="svg-label sm">name</text>
+      <text x="72" y="41" text-anchor="middle" class="svg-label sm">sal</text>
+      <text x="112" y="41" text-anchor="middle" class="svg-label sm">dept</text>
+      <text x="152" y="41" text-anchor="middle" class="svg-label sm">hire</text>
+      <text x="12" y="68" class="svg-label sm">a 2-column scan still drags dept, hire through cache</text>
+
+      <text x="12" y="100" class="svg-label" style="font-weight:600">DSM (column-store): columns contiguous</text>
+      <g>
+        <rect x="12" y="108" width="40" height="22" fill="var(--modern-bg)" stroke="var(--modern)"/>
+        <rect x="52" y="108" width="40" height="22" fill="var(--modern-bg)" stroke="var(--modern)"/>
+        <rect x="100" y="108" width="40" height="22" fill="var(--good-bg)" stroke="var(--good)"/>
+        <rect x="140" y="108" width="40" height="22" fill="var(--good-bg)" stroke="var(--good)"/>
+        <rect x="188" y="108" width="40" height="22" fill="#fffefb" stroke="var(--rule)"/>
+        <rect x="228" y="108" width="40" height="22" fill="#fffefb" stroke="var(--rule)"/>
+        <rect x="276" y="108" width="40" height="22" fill="#fffefb" stroke="var(--rule)"/>
+        <rect x="316" y="108" width="40" height="22" fill="#fffefb" stroke="var(--rule)"/>
+      </g>
+      <text x="32" y="123" text-anchor="middle" class="svg-label sm">name</text>
+      <text x="120" y="123" text-anchor="middle" class="svg-label sm">salary</text>
+      <text x="208" y="123" text-anchor="middle" class="svg-label sm">dept</text>
+      <text x="296" y="123" text-anchor="middle" class="svg-label sm">hire</text>
+      <text x="12" y="150" class="svg-label sm">the scan reads only the two highlighted segments; each column compresses well (one type)</text>
+    </svg>
+    <figcaption><b>Figure 3.</b> The same table laid out two ways. Column projection becomes free at the
+    storage layer under DSM, and a single-type segment compresses far better (run-length, dictionary,
+    bit-packing) than a heterogeneous row.</figcaption>
+  </figure>
+
+  <p>Columnar wins OLAP for three reasons that compound. First, I/O and bandwidth: a query reading 2 of 50
+  columns reads only those 2 segments. Second, compression: a column holds one type and often low
+  cardinality or sortedness, so run-length encoding, dictionary encoding, bit-packing, and
+  frame-of-reference all work far better than on a heterogeneous row, which means fewer bytes moved and
+  more data per cache line. Third, vectorized scans: with one type laid out contiguously, the engine
+  processes a batch of values in a tight loop the CPU can keep in registers and SIMD lanes.</p>
+
+  <div class="callout gotcha">
+    <div class="callout-title">Exam trap</div>
+    <p>"Columnar storage is always better" is false. Row-stores still win OLTP. A point insert, update, or
+    delete of a whole tuple touches one contiguous place in NSM, whereas a column-store would scatter that
+    one row across many column segments. The row-versus-column choice maps onto the OLTP-versus-OLAP split,
+    which is why hybrid (HTAP) systems keep both layouts.</p>
+  </div>
+
+  <!-- ===== VECTORIZED EXECUTION + DUCKDB ===== -->
+  <h2>Vectorized, push-based execution and DuckDB</h2>
+
+  <p>Recall the Volcano model from <a href="0009-query-execution-volcano.html">week 9</a>: every operator
+  is an iterator with open, next, close, and the root pulls one tuple at a time up the tree. The cost is
+  one virtual call per operator per tuple. For an analytic scan over a billion rows, that per-tuple
+  interpreter overhead dominates. Vectorized execution amortizes it. Instead of one tuple per next call,
+  an operator processes a whole vector (a batch) of values in one call, so the interpreter dispatch is paid
+  once per batch, not once per row.</p>
+
+  <p>DuckDB is the concrete embedded example. It is an in-process analytical database, deliberately "SQLite
+  for analytics": it "does not run as a separate process, but completely embedded within a host process,"
+  and its engine is a "columnar-vectorized query execution engine, where queries are still interpreted, but
+  a large batch of values (a vector) are processed in one operation"
+  [<a href="https://duckdb.org/why_duckdb">DuckDB, why_duckdb</a>]. The unit of work is a Vector (one
+  column's values) and a DataChunk (a set of vectors forming a horizontal slice of columns), with a default
+  vector size of 2048 tuples
+  [<a href="https://duckdb.org/docs/stable/internals/vector">DuckDB docs, Execution Format</a>]. DuckDB
+  carries several physical vector encodings through execution: flat (uncompressed), constant (one repeated
+  value), dictionary (a child vector plus a selection vector of indices), and sequence (offset plus
+  increment, for row ids). Keeping data dictionary-encoded inside the engine is late materialization in
+  action: a filter runs over the compressed column directly, producing a selection vector of qualifying
+  positions, and full rows are only stitched together at the very end.</p>
+
+  <p>DuckDB also moved from the pull-based Volcano model (which it used before 2021) to a push-based model,
+  where source operators push chunks up into the pipeline. Push makes it easier to add operators and to run
+  several pipelines concurrently, and it pairs with morsel-driven parallelism, where work is split into
+  small morsels of a pipeline's input that worker threads grab dynamically. And despite being columnar and
+  analytic, DuckDB is still transactional: it uses a bulk-optimized, HyPer-style MVCC for ACID, the same
+  multi-version idea from <a href="0013-concurrency-mvcc.html">week 13</a> in new clothes.</p>
+
+  <div class="callout gotcha">
+    <div class="callout-title">Exam trap</div>
+    <p>"Vectorized execution means compiling the query to machine code" is false, at least for DuckDB.
+    DuckDB queries are still interpreted. Vectorization means processing a batch (a vector, default 2048
+    values) per operator call to amortize interpreter overhead, which is distinct from query compilation
+    [<a href="https://duckdb.org/why_duckdb">DuckDB, why_duckdb</a>]. Two different techniques attack the
+    same per-tuple-overhead problem; do not conflate them.</p>
+  </div>
+
+  <!-- ===== SIMULATOR 2: row vs column scan ===== -->
+  <figure class="sim" id="col-sim">
+    <div class="sim-head">
+      <span class="sim-title">Row versus column scan race</span>
+      <span class="sim-sub">pick how many columns a query touches and watch the bytes actually read</span>
+    </div>
+    <div class="sim-body">
+      <div class="sim-stage"><svg id="col-svg" viewBox="0 0 560 150" width="100%"></svg></div>
+      <div class="sim-controls" id="col-controls"></div>
+      <div class="sim-readout" id="col-readout"></div>
+    </div>
+  </figure>
+  <figcaption class="muted" style="margin-top:-1rem">Experiment: drop the number of touched columns toward
+  2 and watch the column-store bar shrink while the row-store bar stays full (it must read every column on
+  every page). Then add compression to the column segments and watch only the column bar shrink further.</figcaption>
+
+  <script>
+  // ===== Row vs column scan race =====
+  (function () {
+    const svg = document.getElementById("col-svg");
+    const readout = document.getElementById("col-readout");
+    const controls = document.getElementById("col-controls");
+
+    const state = { totalCols: 50, rows: 1000000, touched: 2, compress: 1.0 };
+
+    function draw() {
+      const colBytes = state.rows * 4;                 // bytes per column segment (4 bytes/value)
+      const rowTotal = state.totalCols * colBytes;     // a row scan reads every column
+      const colRead = state.touched * colBytes / state.compress;
+      const maxB = rowTotal;
+
+      svg.innerHTML = "";
+      const rows = [
+        { name: "row-store (NSM): reads all " + state.totalCols + " columns", b: rowTotal, fill: "var(--bad)" },
+        { name: "column-store (DSM): reads " + state.touched + " columns", b: colRead, fill: "var(--good)" }
+      ];
+      rows.forEach(function (r, i) {
+        const y = 20 + i * 56;
+        const w = 360 * (r.b / maxB);
+        svg.appendChild(DBMS.svg("text", { x: 8, y: y + 12, class: "svg-label" }, r.name));
+        svg.appendChild(DBMS.svg("rect", { x: 8, y: y + 18, width: 360, height: 20, rx: 3, fill: "var(--paper-2)", stroke: "var(--rule)" }));
+        svg.appendChild(DBMS.svg("rect", { x: 8, y: y + 18, width: Math.max(2, w), height: 20, rx: 3, fill: r.fill }));
+        svg.appendChild(DBMS.svg("text", { x: 376, y: y + 33, class: "svg-mono" }, (r.b / 1e6).toFixed(1) + " MB"));
+      });
+      const ratio = rowTotal / Math.max(1, colRead);
+      readout.textContent = "table: " + state.rows.toLocaleString() + " rows x " + state.totalCols +
+        " columns   query touches: " + state.touched + " columns   compression: " + state.compress.toFixed(1) + "x\n" +
+        "row-store reads " + (rowTotal / 1e6).toFixed(1) + " MB, column-store reads " +
+        (colRead / 1e6).toFixed(1) + " MB   column-store is ~ " + ratio.toFixed(1) + "x less I/O here";
+    }
+
+    function mkSlider(label, key, min, max, step, fmt) {
+      const out = DBMS.el("span", { class: "pill" });
+      const inp = DBMS.el("input", { type: "range", min: min, max: max, step: step, value: state[key] });
+      inp.addEventListener("input", function () { state[key] = Number(inp.value); draw(); });
+      const wrap = DBMS.el("label", null, [label + " ", inp, " ", out]);
+      DBMS.bindRange(inp, out, fmt || function (v) { return v; });
+      controls.appendChild(wrap);
+    }
+
+    mkSlider("columns touched", "touched", 1, 50, 1);
+    mkSlider("compression on column segments", "compress", 1, 8, 1, function (v) { return v + "x"; });
+    draw();
+  })();
+  </script>
+
+  <!-- ===== REAL SYSTEMS ===== -->
+  <div class="callout realworld">
+    <div class="callout-title">In real systems</div>
+    <p>Core PostgreSQL is a row-store with an update-in-place heap and a B+tree (nbtree), not an LSM tree;
+    its MVCC keeps old row versions in the heap rather than in stacked SSTables, which is exactly why it
+    needs VACUUM (<a href="0003-storage-engine-heap-files.html">week 3</a>). Columnar and LSM behavior in
+    the PostgreSQL world come from extensions and forks (column-store extensions, OrioleDB), a useful
+    contrast: PostgreSQL chose read-optimized update-in-place and pays the VACUUM cost, rather than the LSM
+    write-optimized path. SQLite is the embedded OLTP row-store baseline that DuckDB consciously mirrors for
+    OLAP, and SQLite's WAL mode maps cleanly onto the LSM append idea even though SQLite is a B-tree store:
+    in WAL mode a COMMIT appends a commit record to a separate WAL file, and a checkpoint later moves those
+    pages into the main database file [<a href="https://www.sqlite.org/wal.html">SQLite, Write-Ahead
+    Logging</a>]. The mnemonic: SQLite is embedded row-store OLTP, DuckDB is embedded column-store OLAP.</p>
+  </div>
+
+  <!-- ===== ALGORITHM STEPS ===== -->
+  <h3>The LSM write and read paths, step by step</h3>
+  <ol class="steps">
+    <li>Write: append the mutation to the WAL, then insert it into the sorted in-memory memtable. Both are sequential. The write is durable once the log write commits.</li>
+    <li>Flush: when the memtable hits its size threshold, freeze it, start a fresh memtable, and write the frozen one to disk as a new immutable SSTable. This is Bigtable's minor compaction.</li>
+    <li>Compact: a background pass merges several SSTables (and the memtable) into one, dropping superseded versions and tombstones, bounding the number of files a read must merge.</li>
+    <li>Read: merge the memtable with the SSTables from newest to oldest; the newest copy of the key wins. A per-SSTable Bloom filter skips files that cannot hold the key, and a block index turns the within-file search into a binary search.</li>
+    <li>Delete: write a tombstone into a new SSTable that suppresses older live values during the merge. The data physically disappears only when a major compaction rewrites everything into one file with no tombstones.</li>
+  </ol>
+
+  <pre><code><span class="tok-com"># LSM put and get, the shape RocksDB and Bigtable share</span>
+<span class="tok-kw">def</span> <span class="tok-fn">put</span>(key, value):
+    wal.append(key, value)            <span class="tok-com"># sequential, durable</span>
+    memtable.insert(key, value)       <span class="tok-com"># sorted, in memory</span>
+    <span class="tok-kw">if</span> memtable.size &gt;= THRESHOLD:
+        flush(memtable)               <span class="tok-com"># freeze -&gt; new immutable SSTable</span>
+
+<span class="tok-kw">def</span> <span class="tok-fn">get</span>(key):
+    <span class="tok-kw">if</span> key <span class="tok-kw">in</span> memtable: <span class="tok-kw">return</span> memtable[key]
+    <span class="tok-kw">for</span> sst <span class="tok-kw">in</span> sstables_newest_first():
+        <span class="tok-kw">if</span> <span class="tok-kw">not</span> sst.bloom.might_contain(key): <span class="tok-kw">continue</span>   <span class="tok-com"># zero I/O skip</span>
+        v = sst.lookup(key)           <span class="tok-com"># binary search via block index</span>
+        <span class="tok-kw">if</span> v <span class="tok-kw">is</span> <span class="tok-num">TOMBSTONE</span>: <span class="tok-kw">return</span> <span class="tok-num">NOT_FOUND</span>
+        <span class="tok-kw">if</span> v <span class="tok-kw">is</span> <span class="tok-kw">not</span> <span class="tok-num">None</span>: <span class="tok-kw">return</span> v
+    <span class="tok-kw">return</span> <span class="tok-num">NOT_FOUND</span></code></pre>
+
+  <!-- ===== DEEP DIVE ===== -->
+  <details class="deepdive">
+    <summary>Deeper: why immutability is the load-bearing property</summary>
+    <div>
+      <p>Everything good about the LSM read and write paths follows from SSTables never being edited in
+      place. Because SSTables are immutable, reads need no file-system synchronization, so concurrency
+      control on stored data is nearly free; the only mutable structure read and written together is the
+      memtable, which Bigtable makes copy-on-write so reads and writes run in parallel
+      [<a href="https://research.google.com/archive/bigtable-osdi06.pdf">Chang et al. 2006, Section 6</a>].
+      Deletion becomes garbage collection of obsolete SSTables, done as mark-and-sweep. And a range split
+      is cheap because the two children share the parent's SSTables instead of rewriting them. The price of
+      immutability is precisely the read and space amplification we have been measuring: you cannot
+      overwrite a stale value, so it lingers in an old file until compaction removes it, and a read may
+      have to look past several stale copies to find the live one.</p>
+    </div>
+  </details>
+
+  <!-- ===== VIVA (paper week) ===== -->
+  <h2>Paper viva: Bigtable</h2>
+
+  <p>This week's assigned paper is "Bigtable: A Distributed Storage System for Structured Data" (Chang et
+  al., OSDI 2006). It is the canonical production LSM write path and the bridge to next week's distributed
+  material. The examiner will not ask you to recite it. They will ask you to walk its mechanism and defend
+  why it is shaped that way. Try each before opening the model answer.</p>
+
+  <div class="callout viva">
+    <div class="callout-title">Viva prompt 1</div>
+    <p>Walk the Bigtable write path and the read path. Why is the read a cheap merge, and what keeps the
+    number of files a read must touch bounded?</p>
+  </div>
+  <details class="deepdive">
+    <summary>Model answer</summary>
+    <div>
+      <p>On a write, the tablet server first checks the mutation is well-formed and the sender is authorized
+      (reading the permitted-writers list from a Chubby file, almost always a cache hit), writes the
+      mutation to the per-server commit log using group commit, and only after that commit inserts it into
+      the in-memory sorted memtable [<a href="https://research.google.com/archive/bigtable-osdi06.pdf">Chang
+      et al. 2006, Section 5.3</a>]. The data is durable once the log write commits; the memtable insert
+      just makes it readable. A read executes over a merged view of the memtable plus the tablet's sequence
+      of SSTables. Both the memtable and every SSTable are lexicographically sorted, so the read is an
+      efficient merge of sorted streams rather than a scan of unsorted files. What keeps the file count
+      bounded is compaction (Section 5.4): minor compaction flushes a full memtable to a new SSTable;
+      merging compaction folds a few SSTables plus the memtable into one; major compaction rewrites all
+      SSTables into exactly one. Per-locality-group Bloom filters and the block and scan caches further cut
+      how many SSTables a read actually touches (Section 6).</p>
+    </div>
+  </details>
+
+  <div class="callout viva">
+    <div class="callout-title">Viva prompt 2</div>
+    <p>SSTables are immutable. Define the three compaction types, and explain how Bigtable deletes data
+    given that nothing is ever overwritten in place.</p>
+  </div>
+  <details class="deepdive">
+    <summary>Model answer</summary>
+    <div>
+      <p>Minor compaction freezes a full memtable and writes it to GFS as a new SSTable, shrinking
+      tablet-server memory and the commit-log replay needed on recovery. Merging compaction reads a few
+      SSTables plus the memtable and writes one new SSTable, bounding how many files a read must merge.
+      Major compaction is a merging compaction that rewrites all of a tablet's SSTables into exactly one
+      with no deletion entries and no deleted data
+      [<a href="https://research.google.com/archive/bigtable-osdi06.pdf">Chang et al. 2006, Section 5.4</a>].
+      A delete cannot overwrite, so it writes a deletion entry (a tombstone) into a newer SSTable that
+      suppresses older live values during the merged read. The data is physically removed only when a major
+      compaction produces an SSTable without any deletion entries. Bigtable cycles major compactions over
+      all tablets so deleted data disappears in bounded time, which matters for sensitive data. This is the
+      direct ancestor of RocksDB tombstones and full compaction.</p>
+    </div>
+  </details>
+
+  <div class="callout viva">
+    <div class="callout-title">Viva prompt 3</div>
+    <p>The paper says its design is "analogous to" the log-structured merge tree. Make that connection
+    precise, and name what immutability buys beyond cheap writes.</p>
+  </div>
+  <details class="deepdive">
+    <summary>Model answer</summary>
+    <div>
+      <p>Bigtable's memtable-plus-immutable-SSTable design with compaction is an LSM-tree storage engine:
+      writes buffer in a sorted in-memory structure, flush to immutable sorted files, and reads merge memory
+      and disk. Section 10 of the paper states explicitly that this is "analogous to the way that the
+      Log-Structured Merge Tree stores updates," citing O'Neil et al. 1996
+      [<a href="https://research.google.com/archive/bigtable-osdi06.pdf">Chang et al. 2006, Section 10</a>].
+      Immutability buys three things beyond cheap sequential writes (Section 6). Reads need no file-system
+      synchronization, so row concurrency control is cheap, the only mutable shared structure being the
+      copy-on-write memtable. Permanent deletion becomes mark-and-sweep garbage collection of obsolete
+      SSTables. And tablet splits are cheap because the child tablets share the parent's SSTables instead of
+      rewriting them. The cost is read amplification and space amplification, the same trade-off the RUM
+      conjecture describes: a read may have to merge many SSTables, and a small random read that ships a
+      full 64 KB block to return a 1 KB value is Bigtable's worst case (Section 7).</p>
+    </div>
+  </details>
+
+  <!-- ===== MCQs ===== -->
+  <h2>Check yourself</h2>
+
+  <div class="mcq" data-answer="2">
+    <p class="mcq-q">Which statement about LSM trees versus B+trees is false?</p>
+    <button class="mcq-opt">An LSM tree turns many small random writes into a few large sequential writes.</button>
+    <button class="mcq-opt">A B+tree edits leaves in place, which can mean a random read then a random write.</button>
+    <button class="mcq-opt">An LSM tree is strictly faster than a B+tree because its writes are sequential.</button>
+    <button class="mcq-opt">An LSM read may consult several files because the newest copy of a key wins.</button>
+    <p class="mcq-explain">The false one is the strict-faster claim. The LSM tree buys cheap writes at the
+    cost of read amplification and space amplification, plus background compaction I/O; B+trees win
+    read-heavy and point-lookup workloads. The right answer is workload-dependent, not a blanket ordering.
+    The other three describe the write batching, the in-place B+tree cost, and the merged read correctly.</p>
+  </div>
+
+  <div class="mcq" data-answer="1">
+    <p class="mcq-q">Which statement about a Bloom filter on an SSTable is false?</p>
+    <button class="mcq-opt">A "definitely not" answer lets the reader skip the SSTable with zero I/O.</button>
+    <button class="mcq-opt">It can answer "not present" for a key that is actually in the SSTable.</button>
+    <button class="mcq-opt">More bits per key lowers the false-positive rate at the cost of memory.</button>
+    <button class="mcq-opt">You cannot delete a key safely by clearing its bits in a standard filter.</button>
+    <p class="mcq-explain">A Bloom filter never gives false negatives. A 0 bit at any of the key's hash
+    positions proves the key was never inserted, so absence is certain; the structure errs only by false
+    positives. That one-sided guarantee is exactly why "definitely not" is safe for skipping files. The
+    other three statements are all true.</p>
+  </div>
+
+  <div class="mcq" data-answer="3">
+    <p class="mcq-q">Which statement about leveled and tiered compaction is false?</p>
+    <button class="mcq-opt">Tiered keeps several sorted runs per level and rewrites bytes fewer times.</button>
+    <button class="mcq-opt">Leveled keeps one sorted run per non-zero level and bounds dead data.</button>
+    <button class="mcq-opt">Tiered accepts higher read and space amplification to lower write amplification.</button>
+    <button class="mcq-opt">Leveled has lower write amplification than tiered for the same workload.</button>
+    <p class="mcq-explain">The false one reverses the trade-off. Leveled minimizes space and read
+    amplification at the cost of higher write amplification (often over ten in RocksDB), because a byte is
+    rewritten roughly once per level it descends. Tiered minimizes write amplification at the cost of read
+    and space amplification. The first three statements are correct.</p>
+  </div>
+
+  <div class="mcq" data-answer="0">
+    <p class="mcq-q">Which statement about row versus column storage is false?</p>
+    <button class="mcq-opt">A column-store is the better layout for a single-row insert, update, or delete.</button>
+    <button class="mcq-opt">A column-store reads only the segments for the columns a query touches.</button>
+    <button class="mcq-opt">A single-type column compresses better than a heterogeneous row.</button>
+    <button class="mcq-opt">A row-store keeps one tuple's columns contiguous, which suits whole-row access.</button>
+    <p class="mcq-explain">The false one is the OLTP claim. A single-row write under a column-store scatters
+    that one row across many column segments, so the row-store wins there. Column-stores win scan-and-
+    aggregate OLAP over a few columns. The other three statements correctly describe projection, compression,
+    and the row layout.</p>
+  </div>
+
+  <div class="mcq" data-answer="2">
+    <p class="mcq-q">Which statement about DuckDB's vectorized execution is false?</p>
+    <button class="mcq-opt">It processes a batch of values (default 2048) per operator call to amortize overhead.</button>
+    <button class="mcq-opt">It is push-based, with source operators pushing chunks up the pipeline.</button>
+    <button class="mcq-opt">Vectorized execution means DuckDB compiles each query to native machine code.</button>
+    <button class="mcq-opt">It is still transactional, using a bulk-optimized MVCC for ACID guarantees.</button>
+    <p class="mcq-explain">The false one is the compilation claim. DuckDB queries are still interpreted;
+    vectorization amortizes per-tuple interpreter overhead by working on a 2048-value vector per call,
+    which is a different technique from compiling the query to machine code. The other three statements are
+    accurate.</p>
+  </div>
+
+  <div class="mcq" data-answer="1">
+    <p class="mcq-q">In Bigtable, what happens at the instant a write is durable?</p>
+    <button class="mcq-opt">When the mutation is inserted into the in-memory memtable.</button>
+    <button class="mcq-opt">When the mutation is committed to the per-server commit log.</button>
+    <button class="mcq-opt">When the memtable is flushed to a new immutable SSTable.</button>
+    <button class="mcq-opt">When a major compaction folds the write into the single SSTable.</button>
+    <p class="mcq-explain">Durability comes from the commit log. The tablet server writes the mutation to
+    the commit log (with group commit) and only after that commit inserts it into the memtable, which is an
+    in-memory structure and would be lost on a crash without the log. The flush and the major compaction
+    happen much later and are about read cost and space, not durability.</p>
+  </div>
+
+  <!-- ===== FLASHCARDS ===== -->
+  <div class="flashcard">
+    <div class="fc-front">State the RUM conjecture in one sentence, and place leveled and tiered compaction on it.</div>
+    <div class="fc-back">You can optimize at most two of read, update (write), and memory (space) amplification.
+    Leveled minimizes read and space amplification at the cost of write amplification; tiered minimizes
+    write amplification at the cost of read and space amplification.</div>
+  </div>
+
+  <div class="flashcard">
+    <div class="fc-front">Why is a Bloom filter's "definitely not" answer always safe, but its "maybe" not?</div>
+    <div class="fc-back">A 0 bit at any of the key's hash positions could only happen if the key was never
+    inserted, so a negative is certain (no false negatives). All bits being 1 can happen by collision with
+    other keys, so a positive is only "maybe" and must be verified by reading the file.</div>
+  </div>
+
+  <!-- ===== PRIMARY SOURCE ===== -->
+  <div class="source-box">
+    <div class="src-tag">Primary source</div>
+    <div class="src-title">Read this next: Bigtable: A Distributed Storage System for Structured Data (Chang et al., OSDI 2006)</div>
+    <p class="muted">The canonical production LSM write path: commit log plus memtable plus immutable
+    SSTables, with minor, merging, and major compaction and tombstones. Focus on Section 5.3 (the write and
+    read paths), Section 5.4 (the three compactions), and Section 6 (Bloom filters and exploiting
+    immutability). It is also next week's bridge into the distributed world.
+    <a href="https://research.google.com/archive/bigtable-osdi06.pdf">research.google.com/archive/bigtable-osdi06.pdf</a></p>
+  </div>
+
+  <!-- ===== ASK YOUR TEACHER ===== -->
+  <div class="ask-teacher">
+    <div class="at-tag">Ask your teacher</div>
+    <p>Want to push harder? Ask me to derive the (0.6185)^(m/n) Bloom-filter optimum, to walk a concrete
+    leveled compaction cascade with the multiplier of 10, or to trace our running query through a DuckDB
+    vectorized pipeline with a selection vector. I am your teacher for this course, not just a document.</p>
+  </div>
+
+  <!-- ===== NAV ===== -->
+  <nav class="lesson-nav">
+    <a class="prev" href="0014-logging-recovery-aries.html">
+      <span class="nav-dir">Previous</span>
+      <span class="nav-title">Week 14 · Logging and recovery: WAL and ARIES</span>
+    </a>
+    <a class="next" href="0016-distributed-databases.html">
+      <span class="nav-dir">Next</span>
+      <span class="nav-title">Week 16 · Distributed databases: partitioning, replication, 2PC, CAP</span>
+    </a>
+  </nav>
+
+  </div><!-- /.col -->
+</main>
+</body>
+</html>

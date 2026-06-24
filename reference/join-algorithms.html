@@ -1,0 +1,309 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Join algorithms and costs · Field Guide to the Database Engine</title>
+<link rel="stylesheet" href="../assets/course.css">
+<style>
+  /* tighten the reference sheet for density and print */
+  .page { padding-top: 1.4rem; }
+  .ref-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem 1.4rem; }
+  .ref-grid > * { max-width: 100%; }
+  table { margin: .8rem 0; }
+  table td, table th { padding: .38rem .6rem; }
+  h2 { margin: 1.8rem 0 .3rem; font-size: 1.4rem; }
+  h3 { margin: 1.3rem 0 .2rem; }
+  .callout { margin: 1rem 0; }
+  .formula { font-family: var(--mono); font-size: .82rem; background: #fffdf8; border: 1px solid var(--rule); border-radius: 5px; padding: .12em .4em; white-space: nowrap; }
+  .legend { font-family: var(--sans); font-size: .8rem; color: var(--ink-soft); background: var(--paper-2); border: 1px solid var(--rule); border-radius: var(--radius); padding: .7rem 1rem; margin: 1rem 0; }
+  .legend code { font-size: .82em; }
+  .yes { color: var(--good); font-weight: 600; }
+  .no { color: var(--bad); font-weight: 600; }
+  .ref-footer { margin-top: 2.4rem; padding-top: 1.1rem; border-top: 2px solid var(--ink); font-family: var(--sans); font-size: .85rem; color: var(--ink-soft); }
+  .ref-footer a { font-weight: 600; }
+  @media (max-width: 720px) { .ref-grid { grid-template-columns: 1fr; } }
+  @media print { .ref-grid { grid-template-columns: 1fr 1fr; } table tbody tr:hover { background: none; } }
+</style>
+</head>
+<body class="layer-query">
+<main class="page">
+
+  <!-- ===== MASTHEAD ===== -->
+  <header class="masthead col">
+    <div class="crumbs">
+      <a href="../index.html">Field Guide</a> <span>/</span>
+      <span>Reference</span> <span>/</span>
+      <span>Query execution</span>
+    </div>
+    <span class="week-badge">Query layer</span>
+    <h1>Join algorithms and costs</h1>
+    <p class="lede">One-page cheat sheet for the three join families, external merge sort, and aggregation:
+    when each wins, its IO cost, how much memory it needs, and whether its output comes out sorted.</p>
+  </header>
+
+  <div class="col">
+
+  <!-- ===== NOTATION ===== -->
+  <div class="legend">
+    <strong>Notation.</strong>
+    <code>M</code>, <code>N</code> = pages of outer R, inner S.
+    <code>m</code>, <code>n</code> = tuples in R, S.
+    <code>B</code> = buffer frames available.
+    <code>C</code> = cost of one index probe (constant).
+    Build on the smaller relation, probe with the larger. Costs are IO (page reads + writes); they
+    ignore the cost of writing the final output, which is the same for every algorithm.
+  </div>
+
+  <!-- ===== MASTER COMPARISON TABLE ===== -->
+  <h2>The five joins at a glance</h2>
+  <table>
+    <caption>Equi-join unless noted. CMU 15-445 example (M=1000, m=100000, N=500, B=100, 0.1 ms/IO) timings shown for scale.</caption>
+    <thead>
+      <tr><th>Algorithm</th><th>IO cost</th><th>Memory</th><th>Output sorted?</th><th>Any predicate?</th><th>Example time</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>Naive nested loop</strong></td>
+        <td><span class="formula">M + (m &middot; N)</span></td>
+        <td>3 frames (outer page, inner page, output)</td>
+        <td class="no">no</td>
+        <td class="yes">yes (any &theta;)</td>
+        <td>~1.4 hours</td>
+      </tr>
+      <tr>
+        <td><strong>Block nested loop</strong></td>
+        <td><span class="formula">M + (&lceil;M/(B-2)&rceil; &middot; N)</span></td>
+        <td><span class="formula">B</span>: B-2 for outer block, 1 inner, 1 output</td>
+        <td class="no">no</td>
+        <td class="yes">yes (any &theta;)</td>
+        <td>~6.5 s</td>
+      </tr>
+      <tr>
+        <td><strong>Index nested loop</strong></td>
+        <td><span class="formula">M + (m &middot; C)</span></td>
+        <td>small; needs an index on S join key</td>
+        <td class="no">no (unless index gives order)</td>
+        <td>equi / range that index supports</td>
+        <td>fast when selective</td>
+      </tr>
+      <tr>
+        <td><strong>Sort-merge</strong></td>
+        <td><span class="formula">sort(R) + sort(S) + (M + N)</span></td>
+        <td><span class="formula">B</span> for the sorts; merge needs few frames</td>
+        <td class="yes">yes (on join key)</td>
+        <td>equi and band/range joins</td>
+        <td>~0.75 s</td>
+      </tr>
+      <tr>
+        <td><strong>Grace / hash</strong></td>
+        <td><span class="formula">3 &middot; (M + N)</span> (in-memory: M + N)</td>
+        <td>build side must fit in B (else partition)</td>
+        <td class="no">no</td>
+        <td class="no">equi-join on full key only</td>
+        <td>~0.45 s</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="callout keyidea">
+    <div class="callout-title">Keep this one thing</div>
+    <p>The whole point of join algorithms is to avoid the Cartesian product (|R| &times; |S| comparisons).
+    Naive nested loop pays it (quadratic <span class="formula">m &middot; N</span> reread of S). Sortedness, a hash table,
+    or an index each turn that quadratic into roughly linear work.</p>
+  </div>
+
+  <!-- ===== DECISION FLOWCHART ===== -->
+  <h2>Picking a join</h2>
+  <figure class="diagram">
+    <svg viewBox="0 0 560 430" role="img" aria-label="Join algorithm decision flowchart">
+      <defs>
+        <marker id="ar" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto">
+          <path d="M0,0 L7,3 L0,6 Z" fill="var(--ink-soft)"/>
+        </marker>
+      </defs>
+      <!-- start -->
+      <rect x="200" y="8" width="160" height="34" rx="17" fill="var(--query-bg)" stroke="var(--query)"/>
+      <text x="280" y="30" text-anchor="middle" class="svg-label">join R and S</text>
+      <line x1="280" y1="42" x2="280" y2="62" stroke="var(--ink-soft)" marker-end="url(#ar)"/>
+
+      <!-- Q1 equi-join? -->
+      <polygon points="280,64 392,98 280,132 168,98" fill="#fffdf8" stroke="var(--ink-soft)"/>
+      <text x="280" y="94" text-anchor="middle" class="svg-label">equi-join on</text>
+      <text x="280" y="108" text-anchor="middle" class="svg-label">full key?</text>
+
+      <!-- no branch from Q1 -> Q-sorted/range -->
+      <line x1="392" y1="98" x2="470" y2="98" stroke="var(--ink-soft)" marker-end="url(#ar)"/>
+      <text x="430" y="90" text-anchor="middle" class="svg-label sm">no</text>
+      <rect x="470" y="78" width="84" height="40" rx="6" fill="var(--query-bg)" stroke="var(--query)"/>
+      <text x="512" y="95" text-anchor="middle" class="svg-label">sort-merge</text>
+      <text x="512" y="109" text-anchor="middle" class="svg-label sm">or block NL</text>
+
+      <!-- yes branch down -->
+      <line x1="280" y1="132" x2="280" y2="156" stroke="var(--ink-soft)" marker-end="url(#ar)"/>
+      <text x="292" y="148" class="svg-label sm">yes</text>
+
+      <!-- Q2 index on inner join key & selective? -->
+      <polygon points="280,158 400,196 280,234 160,196" fill="#fffdf8" stroke="var(--ink-soft)"/>
+      <text x="280" y="190" text-anchor="middle" class="svg-label">index on S key,</text>
+      <text x="280" y="204" text-anchor="middle" class="svg-label">join selective?</text>
+
+      <line x1="400" y1="196" x2="470" y2="196" stroke="var(--ink-soft)" marker-end="url(#ar)"/>
+      <text x="435" y="188" text-anchor="middle" class="svg-label sm">yes</text>
+      <rect x="470" y="176" width="84" height="40" rx="6" fill="var(--query-bg)" stroke="var(--query)"/>
+      <text x="512" y="193" text-anchor="middle" class="svg-label">index</text>
+      <text x="512" y="207" text-anchor="middle" class="svg-label">nested loop</text>
+
+      <line x1="280" y1="234" x2="280" y2="258" stroke="var(--ink-soft)" marker-end="url(#ar)"/>
+      <text x="292" y="250" class="svg-label sm">no</text>
+
+      <!-- Q3 build side fits in memory? -->
+      <polygon points="280,260 400,298 280,336 160,298" fill="#fffdf8" stroke="var(--ink-soft)"/>
+      <text x="280" y="292" text-anchor="middle" class="svg-label">build side</text>
+      <text x="280" y="306" text-anchor="middle" class="svg-label">fits in B?</text>
+
+      <line x1="400" y1="298" x2="470" y2="298" stroke="var(--ink-soft)" marker-end="url(#ar)"/>
+      <text x="435" y="290" text-anchor="middle" class="svg-label sm">yes</text>
+      <rect x="470" y="278" width="84" height="40" rx="6" fill="var(--query-bg)" stroke="var(--query)"/>
+      <text x="512" y="295" text-anchor="middle" class="svg-label">in-memory</text>
+      <text x="512" y="309" text-anchor="middle" class="svg-label">hash join</text>
+
+      <line x1="280" y1="336" x2="280" y2="360" stroke="var(--ink-soft)" marker-end="url(#ar)"/>
+      <text x="292" y="352" class="svg-label sm">no</text>
+
+      <!-- terminal: grace, or need sorted output? -->
+      <rect x="120" y="362" width="150" height="44" rx="6" fill="var(--query-bg)" stroke="var(--query)"/>
+      <text x="195" y="380" text-anchor="middle" class="svg-label">grace / hybrid</text>
+      <text x="195" y="394" text-anchor="middle" class="svg-label">hash join</text>
+
+      <rect x="300" y="362" width="180" height="44" rx="6" fill="#fffdf8" stroke="var(--ink-soft)"/>
+      <text x="390" y="380" text-anchor="middle" class="svg-label">need output sorted on key?</text>
+      <text x="390" y="394" text-anchor="middle" class="svg-label">then prefer sort-merge</text>
+    </svg>
+    <figcaption><b>Figure 1.</b> Walk top to bottom. The first "no" at the top (not an equi-join on the full key) forces
+    sort-merge or nested loop, because no hash turns <span class="formula">R.a &lt; S.b</span> into bucket equality. If you
+    need the result ordered on the join key, sort-merge can be worth choosing even when hash is cheaper, since it hands the
+    sort order to the next operator for free.</figcaption>
+  </figure>
+
+  <!-- ===== PER-ALGORITHM DETAIL ===== -->
+  <h2>Each join in detail</h2>
+
+  <h3>Nested loop (naive / block / index)</h3>
+  <table>
+    <thead><tr><th>Variant</th><th>IO cost</th><th>When to use</th></tr></thead>
+    <tbody>
+      <tr>
+        <td>Naive</td>
+        <td><span class="formula">M + (m &middot; N)</span></td>
+        <td>Almost never. Rereads all of S once per outer <em>tuple</em>; effectively quadratic. The killer is the <span class="formula">m &middot; N</span> term.</td>
+      </tr>
+      <tr>
+        <td>Block</td>
+        <td><span class="formula">M + (&lceil;M/(B-2)&rceil; &middot; N)</span></td>
+        <td>Small inner table, no index, no equi-join (any &theta; predicate works). Rereads S once per outer <em>block</em>, so more buffers cut the cost directly.</td>
+      </tr>
+      <tr>
+        <td>Index</td>
+        <td><span class="formula">M + (m &middot; C)</span></td>
+        <td>S has an index on the join key and R is small or the join is selective. PostgreSQL flags nested loop as good "if the right relation can be scanned with an index scan".</td>
+      </tr>
+    </tbody>
+  </table>
+  <p><strong>Memory:</strong> naive needs only 3 frames; block uses all B (B-2 hold the outer block). <strong>Output sorted:</strong> no.</p>
+
+  <h3>Sort-merge</h3>
+  <p>Sort both inputs on the join key, then walk two cursors forward in lockstep emitting matches, like the merge step of merge sort.</p>
+  <ul>
+    <li><strong>Cost:</strong> <span class="formula">sort(R) + sort(S) + (M + N)</span>. Per-input sort cost <span class="formula">2K &middot; (1 + &lceil;log<sub>B-1</sub>(K/B)&rceil;)</span> for K pages.</li>
+    <li><strong>Worst case:</strong> if every tuple shares one join value the merge degrades to <span class="formula">M &middot; N</span> (each outer page rescans all of S for that value).</li>
+    <li><strong>When to use:</strong> an input already arrives sorted on the key (clustered index, prior sort or ORDER BY), so its sort cost is zero and only the <span class="formula">M + N</span> merge remains; or the query needs output sorted on the join key. Also handles band/range joins, which hash cannot.</li>
+    <li><strong>Memory:</strong> B frames for the external sorts. <strong>Output sorted:</strong> <span class="yes">yes</span>, on the join key, handed free to the next operator.</li>
+  </ul>
+
+  <h3>Hash (build / probe, grace, hybrid)</h3>
+  <p><strong>Build:</strong> scan the smaller input, insert each tuple into a hash table keyed on the join attribute.
+  <strong>Probe:</strong> scan the larger input, hash each tuple, look up matches, and recheck actual values (buckets collide).</p>
+  <table>
+    <thead><tr><th>Form</th><th>IO cost</th><th>Note</th></tr></thead>
+    <tbody>
+      <tr><td>In-memory</td><td><span class="formula">M + N</span></td><td>Build side fits in B. Fastest of the lot on the CMU example.</td></tr>
+      <tr><td>Grace / partitioned</td><td><span class="formula">3 &middot; (M + N)</span></td><td>Partition phase <span class="formula">2(M+N)</span> (read+write) plus probe phase <span class="formula">M+N</span>. Recursively repartition with a new hash h2 if a partition still overflows.</td></tr>
+      <tr><td>Hybrid</td><td>between the two</td><td>PostgreSQL's form: keep one partition resident and probe it directly instead of spilling it.</td></tr>
+    </tbody>
+  </table>
+  <ul>
+    <li><strong>Hard limits:</strong> equi-join on the <em>full</em> key only; build on the <em>smaller</em> input so the table fits.</li>
+    <li><strong>Memory:</strong> the build-side hash table (PostgreSQL grants <span class="formula">work_mem &times; hash_mem_multiplier</span>). <strong>Output sorted:</strong> <span class="no">no</span>.</li>
+    <li><strong>Skew trap:</strong> if one key has so many matches they overflow memory, no repartition helps (they hash identically); fall back to block nested loop for that key.</li>
+  </ul>
+
+  <div class="callout gotcha">
+    <div class="callout-title">Exam traps</div>
+    <p>Grace hash is <span class="formula">3(M+N)</span>, linear, not "the same as nested loop because both spill" (naive is quadratic).
+    You build on the smaller relation, not the larger. Hash join cannot do range or inequality joins. Sort-merge does not always
+    sort both inputs if one already arrives sorted. Block NL rereads S once per <em>block</em>, not per tuple.</p>
+  </div>
+
+  <!-- ===== EXTERNAL MERGE SORT ===== -->
+  <h2>External merge sort (the cost behind sort-merge)</h2>
+  <p>When data to sort exceeds memory you cannot sort in place. Two parts:</p>
+  <ol class="steps">
+    <li><strong>Run generation (pass 0):</strong> read B pages, sort in memory, write a sorted run. Produces <span class="formula">&lceil;N/B&rceil;</span> runs.</li>
+    <li><strong>Multi-way merge:</strong> merge <span class="formula">B-1</span> runs at a time (one input buffer per run, one output buffer), repeatedly, until one run remains. Each pass cuts the run count by a factor of <span class="formula">B-1</span>.</li>
+  </ol>
+  <div class="callout why">
+    <div class="callout-title">Pass count and total IO</div>
+    <p><span class="formula">passes = 1 + &lceil;log<sub>B-1</sub>(&lceil;N/B&rceil;)&rceil;</span> &nbsp; and &nbsp;
+    <span class="formula">total IO = 2N &middot; passes</span> (every pass reads and writes all N pages).</p>
+    <p>The "1 +" is run generation; the log term is the merge passes. More buffers cut passes logarithmically (bigger merge fan-in).
+    One pass only when the data already fits in B pages. Two passes is the common case and works whenever the initial run count is at most <span class="formula">B-1</span>.</p>
+  </div>
+
+  <!-- ===== AGGREGATION ===== -->
+  <h2>Hash versus sort aggregation</h2>
+  <p>To compute GROUP BY or DISTINCT you must bring equal keys together. Two ways:</p>
+  <table>
+    <caption>Both are pipeline breakers: the last input tuple may belong to the first group.</caption>
+    <thead><tr><th></th><th>Sort-based</th><th>Hash-based</th></tr></thead>
+    <tbody>
+      <tr><td><strong>How</strong></td><td>Sort on the group key, scan once, break into a new group when the key changes.</td><td>Hash table keyed on the group; each tuple updates its group's running aggregate in place.</td></tr>
+      <tr><td><strong>State</strong></td><td>One running group at a time.</td><td>One entry per distinct group.</td></tr>
+      <tr><td><strong>Output order</strong></td><td class="yes">Sorted on the group key (free if the next operator wants it).</td><td class="no">No particular order.</td></tr>
+      <tr><td><strong>Cost driver</strong></td><td>Dominated by the external sort.</td><td>Cheap when few distinct groups; spills (per-partition files, extra passes) when many.</td></tr>
+      <tr><td><strong>Wins when</strong></td><td>Input already sorted on the key, or output needs to be sorted.</td><td>Number of distinct groups is small relative to the input.</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout realworld">
+    <div class="callout-title">In real systems</div>
+    <p>PostgreSQL exposes <code>GroupAggregate</code> (sort-based, input pre-sorted) and <code>HashAggregate</code> (hash table);
+    since v13 hash aggregation spills to disk when groups exceed the hash memory limit
+    [<a href="https://www.postgresql.org/docs/current/runtime-config-resource.html">work_mem docs</a>].
+    SQLite has neither hash nor merge join: it implements joins only as nested loops and makes them fast with indexes and join
+    ordering, and it does sort-based grouping for free when an index already supplies order
+    [<a href="https://sqlite.org/optoverview.html">SQLite optimizer overview</a>].</p>
+  </div>
+
+  <!-- ===== PRIMARY SOURCE ===== -->
+  <div class="source-box">
+    <div class="src-tag">Primary sources</div>
+    <div class="src-title">CMU 15-445 Lecture 12 (Join Algorithms) and Graefe, "Volcano" (IEEE TKDE 6(1), 1994)</div>
+    <p class="muted">CMU 15-445 is the source of the exact IO cost formulas and the worked timing example.
+    Volcano is the origin of the open/next/close iterator model in which join is the one-to-one match operator
+    with hybrid-hash and sort-merge variants, where setting both overflow thresholds to zero gives Grace-style behavior.</p>
+  </div>
+
+  <!-- ===== FOOTER ===== -->
+  <footer class="ref-footer">
+    Back to the lessons:
+    <a href="../lessons/0009-query-execution-volcano.html">Lesson 09 &middot; Query execution: the Volcano iterator model</a>
+    &nbsp;and&nbsp;
+    <a href="../lessons/0010-query-execution-joins.html">Lesson 10 &middot; Joins, external sort, and aggregation</a>.
+    &nbsp;&middot;&nbsp; <a href="../index.html">Field Guide home</a>
+  </footer>
+
+  </div><!-- /.col -->
+</main>
+</body>
+</html>

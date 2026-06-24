@@ -1,0 +1,267 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Slotted page layout, on one page · Field Guide to the Database Engine</title>
+<link rel="stylesheet" href="../assets/course.css">
+<style>
+  /* Scoped to this cheat sheet: tighten for print density. */
+  .ref-grid { display: grid; grid-template-columns: 1fr; gap: 0; }
+  @media (min-width: 760px) { .ref-grid { grid-template-columns: 1fr 1fr; gap: 0 1.6rem; } }
+  .ref-grid > * { min-width: 0; }
+  .ref-grid table { margin: .6rem 0 1.1rem; font-size: .82rem; }
+  h2.ref-h { font-size: 1.05rem; margin: 1.3rem 0 .3rem; border-bottom: 1px solid var(--rule); padding-bottom: .2rem; }
+  .ref-page .callout { margin: .7rem 0; }
+  .ref-page table { font-size: .84rem; }
+  .ref-page td code, .ref-page th code { font-size: .85em; }
+  .b { font-weight: 600; }
+  @media print { .ref-page { font-size: .9rem; } }
+</style>
+</head>
+<body class="layer-storage">
+<main class="page ref-page">
+
+  <!-- ===== MASTHEAD ===== -->
+  <header class="masthead col">
+    <div class="crumbs">
+      <a href="../index.html">Field Guide</a> <span>/</span>
+      <span>Reference</span> <span>/</span>
+      <span>Storage</span>
+    </div>
+    <span class="week-badge">Cheat sheet</span>
+    <h1>Slotted page layout, on one page</h1>
+    <p class="lede">The within-page layout that turns a fixed-size block of bytes into addressable,
+    variable-length rows: header, line-pointer array growing down, tuple data growing up, free space closing in the middle.</p>
+  </header>
+
+  <div class="col">
+
+  <!-- ===== BYTE MAP SVG ===== -->
+  <figure class="diagram">
+    <svg viewBox="0 0 560 380" role="img" aria-label="Byte map of a slotted page: header at top, line-pointer array growing down, free space in the middle, tuple data growing up from the bottom">
+      <!-- page outline -->
+      <rect x="40" y="20" width="380" height="340" rx="4" fill="#fffdf8" stroke="var(--storage)" stroke-width="1.5"/>
+
+      <!-- header -->
+      <rect x="40" y="20" width="380" height="46" fill="var(--storage-bg)" stroke="var(--storage)"/>
+      <text x="230" y="40" text-anchor="middle" class="svg-mono">page header</text>
+      <text x="230" y="56" text-anchor="middle" class="svg-label sm">slot count, pd_lower, pd_upper, lsn, flags</text>
+
+      <!-- line pointer / slot array -->
+      <rect x="40" y="66" width="55" height="22" fill="#eadfce" stroke="var(--storage)"/>
+      <rect x="95" y="66" width="55" height="22" fill="#eadfce" stroke="var(--storage)"/>
+      <rect x="150" y="66" width="55" height="22" fill="#eadfce" stroke="var(--storage)"/>
+      <rect x="205" y="66" width="55" height="22" fill="#f6efe2" stroke="var(--rule)" stroke-dasharray="3 3"/>
+      <text x="67" y="81" text-anchor="middle" class="svg-label sm">slot0</text>
+      <text x="122" y="81" text-anchor="middle" class="svg-label sm">slot1</text>
+      <text x="177" y="81" text-anchor="middle" class="svg-label sm">slot2</text>
+      <text x="232" y="81" text-anchor="middle" class="svg-faint svg-label sm">...</text>
+
+      <!-- free space -->
+      <rect x="40" y="88" width="380" height="190" fill="#fffefb"/>
+      <text x="230" y="186" text-anchor="middle" class="svg-label">free space</text>
+      <text x="230" y="202" text-anchor="middle" class="svg-faint svg-label sm">pd_upper minus pd_lower bytes</text>
+
+      <!-- tuple data -->
+      <rect x="40" y="278" width="380" height="82" fill="var(--storage-bg)" stroke="var(--storage)"/>
+      <rect x="290" y="278" width="130" height="82" fill="#f0e2d2" stroke="var(--storage)"/>
+      <rect x="200" y="306" width="90" height="54" fill="#f0e2d2" stroke="var(--storage)"/>
+      <rect x="120" y="278" width="80" height="82" fill="#f0e2d2" stroke="var(--storage)"/>
+      <text x="355" y="322" text-anchor="middle" class="svg-mono">tuple0</text>
+      <text x="245" y="336" text-anchor="middle" class="svg-mono">tuple1</text>
+      <text x="160" y="322" text-anchor="middle" class="svg-mono">tuple2</text>
+
+      <!-- pd_lower line + arrow down -->
+      <line x1="40" y1="88" x2="490" y2="88" stroke="var(--accent)" stroke-width="1" stroke-dasharray="4 3"/>
+      <text x="498" y="86" class="svg-label sm" fill="var(--accent)">pd_lower</text>
+      <line x1="470" y1="92" x2="470" y2="140" stroke="var(--accent)" marker-end="url(#arr)"/>
+      <text x="498" y="120" class="svg-label sm" fill="var(--accent)">array</text>
+      <text x="498" y="133" class="svg-label sm" fill="var(--accent)">grows down</text>
+
+      <!-- pd_upper line + arrow up -->
+      <line x1="40" y1="278" x2="490" y2="278" stroke="var(--accent)" stroke-width="1" stroke-dasharray="4 3"/>
+      <text x="498" y="276" class="svg-label sm" fill="var(--accent)">pd_upper</text>
+      <line x1="470" y1="274" x2="470" y2="226" stroke="var(--accent)" marker-end="url(#arr)"/>
+      <text x="498" y="244" class="svg-label sm" fill="var(--accent)">data</text>
+      <text x="498" y="257" class="svg-label sm" fill="var(--accent)">grows up</text>
+
+      <!-- slot0 -> tuple0 indirection -->
+      <path d="M67,88 C67,140 360,200 355,278" fill="none" stroke="var(--ink-faint)" stroke-width="1" stroke-dasharray="2 3" marker-end="url(#arr2)"/>
+
+      <!-- byte offsets -->
+      <text x="30" y="26" text-anchor="end" class="svg-faint svg-label sm">0</text>
+      <text x="30" y="360" text-anchor="end" class="svg-faint svg-label sm">N-1</text>
+
+      <defs>
+        <marker id="arr" markerWidth="9" markerHeight="9" refX="6" refY="3" orient="auto">
+          <path d="M0,0 L7,3 L0,6 Z" fill="var(--accent)"/>
+        </marker>
+        <marker id="arr2" markerWidth="9" markerHeight="9" refX="6" refY="3" orient="auto">
+          <path d="M0,0 L7,3 L0,6 Z" fill="var(--ink-faint)"/>
+        </marker>
+      </defs>
+    </svg>
+    <figcaption><b>Figure 1.</b> The two ends close on a shrinking free space. The slot array (offsets 0 upward) grows down as
+    <code>pd_lower</code> rises; tuple data grows up as <code>pd_upper</code> falls. The page is full when they meet. Each slot
+    indirects to a tuple offset (dashed arrow), so a tuple can move during compaction while its record id stays fixed.</figcaption>
+  </figure>
+
+  <div class="callout keyidea">
+    <div class="callout-title">Keep this one thing</div>
+    <p>A record id is <code>(page id, slot number)</code>, never a raw byte offset. The slot indirects to the in-page offset, so the
+    engine can compact and move tuples while the id an index holds never changes.</p>
+  </div>
+
+  <!-- ===== GENERIC HEADER FIELDS ===== -->
+  <h2 class="ref-h">Slotted page header (generic)</h2>
+  <table>
+    <caption>The minimum a slotted page header must record to drive insert, lookup, and the full-page check.</caption>
+    <thead><tr><th>Field</th><th>Purpose</th></tr></thead>
+    <tbody>
+      <tr><td class="b">slot count</td><td>number of slots in the line-pointer array; index 0 to count-1.</td></tr>
+      <tr><td class="b">free-space pointer(s)</td><td>boundary between used and free space; in PostgreSQL the pair <code>pd_lower</code> / <code>pd_upper</code>.</td></tr>
+      <tr><td class="b">free-space start</td><td>offset where the array ends and free space begins (data side grows from the page end inward).</td></tr>
+      <tr><td class="b">page lsn</td><td>WAL position of the last change; page is not flushed until WAL up to this lsn is durable.</td></tr>
+      <tr><td class="b">flags / checksum</td><td>page state bits and an optional integrity checksum.</td></tr>
+      <tr><td class="b">special space ptr</td><td>start of access-method-private trailer; empty for an ordinary heap page.</td></tr>
+    </tbody>
+  </table>
+
+  <!-- ===== TWO-COLUMN: PG header structs ===== -->
+  <div class="ref-grid">
+    <div>
+      <h2 class="ref-h">PostgreSQL PageHeaderData (24 B)</h2>
+      <table>
+        <caption>Header at offset 0 of every 8 KB heap page.</caption>
+        <thead><tr><th>Field</th><th>Size</th><th>Meaning</th></tr></thead>
+        <tbody>
+          <tr><td><code>pd_lsn</code></td><td>8 B</td><td>WAL lsn of last change (write-ahead rule).</td></tr>
+          <tr><td><code>pd_checksum</code></td><td>2 B</td><td>page checksum.</td></tr>
+          <tr><td><code>pd_flags</code></td><td>2 B</td><td>page state flags.</td></tr>
+          <tr><td><code>pd_lower</code></td><td>2 B</td><td>offset to start of free space (end of ItemId array). Grows up.</td></tr>
+          <tr><td><code>pd_upper</code></td><td>2 B</td><td>offset to end of free space (start of tuples). Grows down.</td></tr>
+          <tr><td><code>pd_special</code></td><td>2 B</td><td>offset to special space.</td></tr>
+          <tr><td><code>pd_pagesize_version</code></td><td>2 B</td><td>page size and layout version.</td></tr>
+          <tr><td><code>pd_prune_xid</code></td><td>4 B</td><td>oldest unpruned xmax, or 0.</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div>
+      <h2 class="ref-h">ItemId / line pointer (4 B)</h2>
+      <table>
+        <caption><code>ItemIdData</code> bitfields, <code>storage/itemid.h</code>. One per slot.</caption>
+        <thead><tr><th>Field</th><th>Bits</th><th>Meaning</th></tr></thead>
+        <tbody>
+          <tr><td><code>lp_off</code></td><td>15</td><td>offset to tuple from page start. 2^15 caps a page at 32 KB.</td></tr>
+          <tr><td><code>lp_flags</code></td><td>2</td><td>line-pointer state (below).</td></tr>
+          <tr><td><code>lp_len</code></td><td>15</td><td>byte length of the tuple.</td></tr>
+        </tbody>
+      </table>
+      <table>
+        <caption><code>lp_flags</code> states.</caption>
+        <thead><tr><th>Value</th><th>State</th><th>Note</th></tr></thead>
+        <tbody>
+          <tr><td>0</td><td><code>LP_UNUSED</code></td><td>free slot, <code>lp_len=0</code>.</td></tr>
+          <tr><td>1</td><td><code>LP_NORMAL</code></td><td>live, <code>lp_len&gt;0</code>.</td></tr>
+          <tr><td>2</td><td><code>LP_REDIRECT</code></td><td>HOT redirect to newer version on same page.</td></tr>
+          <tr><td>3</td><td><code>LP_DEAD</code></td><td>dead, reclaimable by VACUUM.</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- ===== HeapTupleHeader ===== -->
+  <h2 class="ref-h">PostgreSQL HeapTupleHeaderData</h2>
+  <table>
+    <caption>Per-row header, <code>access/htup_details.h</code>. Documented minimum 23 B before user data; <code>t_hoff</code> rounds it to MAXALIGN.</caption>
+    <thead><tr><th>Field</th><th>Size</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td><code>t_xmin</code></td><td>4 B</td><td>inserting transaction id.</td></tr>
+      <tr><td><code>t_xmax</code></td><td>4 B</td><td>deleting transaction id; 0 if live. The tombstone marker.</td></tr>
+      <tr><td><code>t_cid</code> / <code>t_xvac</code></td><td>4 B</td><td>command id or vacuum xid (overlaid).</td></tr>
+      <tr><td><code>t_ctid</code></td><td>6 B</td><td>tid of this or a newer version; the update-chain pointer.</td></tr>
+      <tr><td><code>t_infomask2</code></td><td>2 B</td><td>attribute count plus flag bits.</td></tr>
+      <tr><td><code>t_infomask</code></td><td>2 B</td><td>flag bits, including <code>HEAP_HASNULL</code>.</td></tr>
+      <tr><td><code>t_hoff</code></td><td>1 B</td><td>offset to user data; multiple of MAXALIGN (typically 8).</td></tr>
+      <tr><td><code>null bitmap</code></td><td>var</td><td>present only if <code>HEAP_HASNULL</code>; 1 bit per column.</td></tr>
+    </tbody>
+  </table>
+
+  <!-- ===== VARLEN + NULL bitmap ===== -->
+  <h2 class="ref-h">Variable-length records and the NULL bitmap</h2>
+  <div class="callout why">
+    <div class="callout-title">Why these two mechanisms exist</div>
+    <p>Fixed-length attributes sit at a computable offset. A <code>varchar</code>/<code>text</code>/<code>bytea</code> breaks that: you cannot find
+    column N+1 without knowing the length of column N. So variable-length data carries a length prefix (or an in-tuple offset array). NULL gets a
+    bitmap, not a sentinel, because any sentinel byte could be a legal value.</p>
+  </div>
+  <table>
+    <thead><tr><th>Concern</th><th>Encoding</th></tr></thead>
+    <tbody>
+      <tr><td class="b">Fixed-length column</td><td>raw bytes at a precomputed offset; padded to its natural alignment.</td></tr>
+      <tr><td class="b">Variable-length column</td><td>length prefix then bytes; reader advances by the stored length to reach the next column.</td></tr>
+      <tr><td class="b">NULL bitmap</td><td>after the fixed header, only if <code>HEAP_HASNULL</code>. One bit per column: 1 = present, 0 = null. A null column stores zero data bytes.</td></tr>
+      <tr><td class="b">Alignment (MAXALIGN)</td><td>fields padded to natural boundaries; user data starts at <code>t_hoff</code>. Column order changes row size because of pad gaps (put wide types before narrow ones).</td></tr>
+      <tr><td class="b">Oversized value (TOAST)</td><td>a tuple cannot span pages; values past ~2 KB are compressed and/or moved out of line, leaving an 18 B pointer in the tuple. Up to 1 GB per field.</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout gotcha">
+    <div class="callout-title">Exam traps</div>
+    <p>The slot array and tuple data grow in <span class="b">opposite</span> directions. A NULL is <span class="b">not</span> a zero or sentinel in the
+    column bytes; it is a 0 bit in the header bitmap and occupies no data area. A tid is <span class="b">not</span> an arithmetic disk address; it is
+    <code>(page, slot)</code> and the slot can move on compaction.</p>
+  </div>
+
+  <!-- ===== INSERT / DELETE / UPDATE rules ===== -->
+  <h2 class="ref-h">Quick rules: insert, delete, update within a page</h2>
+  <table>
+    <caption>What each operation does to the slot array, the data area, and the free-space pointers.</caption>
+    <thead><tr><th>Op</th><th>Steps and invariant</th></tr></thead>
+    <tbody>
+      <tr>
+        <td class="b">Insert</td>
+        <td>Check fit: free space = <code>pd_upper - pd_lower</code> must hold <code>tuple_len + slot_size</code>; else need a new page (see the FSM).
+        Write tuple at <code>pd_upper - tuple_len</code> (data grows down toward the array); lower <code>pd_upper</code>. Allocate a slot at the front, set
+        <code>lp_off</code>/<code>lp_len</code>, raise <code>pd_lower</code> by 4 B. O(1). A free <code>LP_UNUSED</code> slot may be reused instead of extending the array.</td>
+      </tr>
+      <tr>
+        <td class="b">Delete</td>
+        <td>Do not physically erase under MVCC. Stamp <code>t_xmax</code> with the deleting xid (tombstone). The line pointer becomes <code>LP_DEAD</code> on
+        pruning; VACUUM later reclaims the slot and data. Old readers still see the row until the horizon passes. Cheap and non-blocking, at the cost of bloat.</td>
+      </tr>
+      <tr>
+        <td class="b">Update</td>
+        <td>Insert the new version, set the old tuple's <code>t_ctid</code> to point at it (update chain). If the new version fits on the same page and no
+        indexed column changed, use HOT: keep an <code>LP_REDIRECT</code> line pointer so indexes need not be touched. Otherwise the new version may land on
+        another page and indexes get a new entry.</td>
+      </tr>
+      <tr>
+        <td class="b">Compact</td>
+        <td>Slide live tuples up to close gaps left by deletes, rewriting each slot's <code>lp_off</code>. Record ids stay stable because indexes hold the slot
+        number, not the offset. Raises usable free space; done lazily, not on every delete.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="callout realworld">
+    <div class="callout-title">In real systems</div>
+    <p>PostgreSQL fixes the page at 8 KB and uses the <code>pd_lower</code> / <code>pd_upper</code> pair as its free-space pointers
+    [<a href="https://www.postgresql.org/docs/current/storage-page-layout.html">PG: Database Page Layout</a>]. SQLite uses the same slotted idea inside each
+    B-tree page (cell pointer array growing down, cell content growing up) and reclaims intra-page gaps with chained freeblocks rather than a VACUUM process
+    [<a href="https://www.sqlite.org/fileformat2.html">SQLite file format</a>].</p>
+  </div>
+
+  <hr>
+  <footer class="muted" style="font-family:var(--sans); font-size:.8rem;">
+    <p>Back to <a href="../index.html">Field Guide index</a>. Lessons:
+    <a href="../lessons/0002-storage-engine-disk-pages.html">0002 Storage engine: disk and pages</a> and
+    <a href="../lessons/0003-storage-engine-heap-files.html">0003 Storage engine: heap files and free space</a>.</p>
+  </footer>
+
+  </div><!-- /.col -->
+</main>
+</body>
+</html>

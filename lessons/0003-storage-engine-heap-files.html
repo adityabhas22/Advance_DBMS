@@ -1,0 +1,649 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lesson 03. Heap files, free space, and deleting tuples · Field Guide to the Database Engine</title>
+<link rel="stylesheet" href="../assets/course.css">
+<script defer src="../assets/components.js"></script>
+</head>
+<body class="layer-storage">
+<main class="page">
+
+  <!-- ===== MASTHEAD ===== -->
+  <header class="masthead col">
+    <div class="crumbs">
+      <a href="../index.html">Field Guide</a> <span>/</span>
+      <span>Part II · Storage</span> <span>/</span>
+      <span>Week 03</span>
+    </div>
+    <span class="week-badge">Storage engine</span>
+    <h1>Heap files, free space, and deleting tuples</h1>
+    <p class="lede">Last week we packed rows into one page. A real table is thousands of pages.
+    Where does a new row go without reading all of them, and what happens to the space when a row is deleted?</p>
+  </header>
+
+  <div class="col">
+
+  <!-- ===== OBJECTIVES ===== -->
+  <div class="objectives">
+    <h4>By the end you can</h4>
+    <ul>
+      <li>Explain why a heap file needs free-space tracking and why a linear page walk does not scale.</li>
+      <li>Describe the free space map as a tree that turns "find a page with N free bytes" into a logarithmic lookup.</li>
+      <li>Say exactly what DELETE does (mark dead, do not erase) and why immediate erasure is the wrong default under MVCC.</li>
+      <li>List the four jobs of VACUUM and tell plain VACUUM apart from VACUUM FULL.</li>
+      <li>Explain how a value too wide for a page is stored out of line by TOAST rather than spanning pages.</li>
+    </ul>
+  </div>
+
+  <!-- ===== WHERE THIS SITS ===== -->
+  <p>Stay on the course's running query, <code>SELECT name FROM emp WHERE salary &gt; 75000 ORDER BY name</code>.
+  When the executor wants the rows of <code>emp</code>, the access method asks the buffer pool
+  (<a href="0004-buffer-pool-design.html">week 4</a>) for heap pages by page id, and the buffer pool asks
+  the storage manager to read them off disk. <a href="0002-storage-engine-disk-pages.html">Last week</a> we
+  saw the layout inside one of those pages: a header, a slot array growing down, tuple data growing up.
+  This week zooms out one level. A table is not one page; it is a heap file of many pages. Two new questions
+  appear that a single page never raised. On the write path of the second journey
+  (<code>UPDATE account SET balance = balance - 100</code>), the engine must find a page with room for the
+  new row version. On any path, when a row dies, the engine must decide what to do with the hole.</p>
+
+  <p>So this layer takes a request for a page by id from the buffer pool above, and below it owns the file:
+  which pages exist, how much free space each one has, and which tuples in them are still alive. It hands
+  decoded tuples back up. The dead-tuple story here is also the bottom half of MVCC, which you meet properly
+  in <a href="0013-concurrency-mvcc.html">week 13</a>: the reason DELETE leaves a tombstone is that a reader
+  on an older snapshot may still need the old row.</p>
+
+  <div class="callout intuition">
+    <div class="callout-title">Intuition</div>
+    <p>A heap file is a pile of pages with no order. Inserting a row is like finding an unfilled box in a
+    warehouse: you do not want to open every box to check. Deleting a row is like crossing a name off a
+    ledger rather than tearing out the page, because someone might still be reading the old entry, and tearing
+    pages out mid-shift is slow. A janitor (VACUUM) comes through later to actually reclaim the crossed-out space.</p>
+  </div>
+
+  <!-- ===== PROBLEM: insert ===== -->
+  <h2>Problem one: where does an inserted row go?</h2>
+
+  <p>A heap file is, in the words of the CMU storage notes, "an unordered collection of pages where tuples
+  are stored in random order"
+  [<a href="https://15445.courses.cs.cmu.edu/fall2023/notes/03-storage1.pdf">CMU 15-445 L03</a>].
+  Unordered is deliberate: it makes insertion cheap because a new row can go anywhere there is room. But
+  "anywhere there is room" hides a search. The engine has to locate a page whose free space is at least the
+  size of the row plus its slot.</p>
+
+  <div class="callout why">
+    <div class="callout-title">Why a list walk does not scale</div>
+    <p>The naive heap organization is a linked list of pages: a header page points at a chain of data pages,
+    each page links to the next. To insert, you walk the chain asking each page "do you have room?" until one
+    says yes. On a cold table that is fine. On a large table where most pages are full, you may touch hundreds
+    of pages, each a potential disk read, to place one row. The cost is linear in the number of pages. The fix
+    is to keep a compact summary of per-page free space that you can search without reading the pages
+    themselves.</p>
+  </div>
+
+  <p>The first improvement is a page directory: special directory pages map each page id to its location and
+  record how much free space it holds, so a lookup is a directory probe instead of a chain walk
+  [<a href="https://15445.courses.cs.cmu.edu/fall2023/notes/03-storage1.pdf">CMU 15-445 L03</a>]. PostgreSQL
+  goes further and keeps the free-space summary in its own structure, a tree, so the search is logarithmic
+  rather than a scan of even the directory.</p>
+
+  <!-- ===== FSM diagram ===== -->
+  <figure class="diagram">
+    <svg viewBox="0 0 560 250" role="img" aria-label="Heap file pages with a separate free space map tree">
+      <!-- heap pages row -->
+      <text x="10" y="20" class="svg-label" style="font-weight:600">Heap file (the _main fork): pages 0..5</text>
+      <g>
+        <rect x="10" y="30" width="70" height="40" rx="4" fill="var(--storage-bg)" stroke="var(--storage)"/>
+        <text x="45" y="48" text-anchor="middle" class="svg-mono">pg0</text>
+        <text x="45" y="62" text-anchor="middle" class="svg-label">free 12</text>
+        <rect x="90" y="30" width="70" height="40" rx="4" fill="var(--storage-bg)" stroke="var(--storage)"/>
+        <text x="125" y="48" text-anchor="middle" class="svg-mono">pg1</text>
+        <text x="125" y="62" text-anchor="middle" class="svg-label">free 200</text>
+        <rect x="170" y="30" width="70" height="40" rx="4" fill="var(--storage-bg)" stroke="var(--storage)"/>
+        <text x="205" y="48" text-anchor="middle" class="svg-mono">pg2</text>
+        <text x="205" y="62" text-anchor="middle" class="svg-label">free 40</text>
+        <rect x="250" y="30" width="70" height="40" rx="4" fill="var(--storage-bg)" stroke="var(--storage)"/>
+        <text x="285" y="48" text-anchor="middle" class="svg-mono">pg3</text>
+        <text x="285" y="62" text-anchor="middle" class="svg-label">free 8</text>
+      </g>
+      <!-- fsm tree -->
+      <text x="10" y="115" class="svg-label" style="font-weight:600">Free space map (the _fsm fork): each node holds the max of its children</text>
+      <line x1="285" y1="150" x2="155" y2="195" stroke="var(--ink-soft)"/>
+      <line x1="285" y1="150" x2="415" y2="195" stroke="var(--ink-soft)"/>
+      <rect x="245" y="130" width="80" height="32" rx="4" fill="#fffdf8" stroke="var(--storage)"/>
+      <text x="285" y="151" text-anchor="middle" class="svg-mono">root 200</text>
+      <line x1="155" y1="207" x2="95" y2="240" stroke="var(--ink-soft)"/>
+      <line x1="155" y1="207" x2="215" y2="240" stroke="var(--ink-soft)"/>
+      <line x1="415" y1="207" x2="355" y2="240" stroke="var(--ink-soft)"/>
+      <line x1="415" y1="207" x2="475" y2="240" stroke="var(--ink-soft)"/>
+      <rect x="120" y="190" width="70" height="28" rx="4" fill="#fffdf8" stroke="var(--ink-soft)"/>
+      <text x="155" y="208" text-anchor="middle" class="svg-mono">200</text>
+      <rect x="380" y="190" width="70" height="28" rx="4" fill="#fffdf8" stroke="var(--ink-soft)"/>
+      <text x="415" y="208" text-anchor="middle" class="svg-mono">40</text>
+      <text x="95" y="245" text-anchor="middle" class="svg-label">12</text>
+      <text x="215" y="245" text-anchor="middle" class="svg-label">200</text>
+      <text x="355" y="245" text-anchor="middle" class="svg-label">40</text>
+      <text x="475" y="245" text-anchor="middle" class="svg-label">8</text>
+    </svg>
+    <figcaption><b>Figure 1.</b> Each leaf of the FSM stores one page's free space (quantized to a byte).
+    Every internal node holds the larger of its children, so the root holds the maximum free space anywhere.
+    To place a 150-byte row you descend the tree, always toward a child whose value is at least 150, and reach
+    a fitting page without reading any heap page. PostgreSQL builds this in a separate
+    <code>_fsm</code> fork [<a href="https://www.postgresql.org/docs/current/storage-fsm.html">PG Free Space Map</a>].</figcaption>
+  </figure>
+
+  <div class="callout realworld">
+    <div class="callout-title">In real systems</div>
+    <p>PostgreSQL stores the free space map as a separate fork file named <code>&lt;filenode&gt;_fsm</code>.
+    The bottom level keeps one byte of free-space information per heap page (256 levels, so it is approximate,
+    not exact). Within each FSM page is a binary tree where each non-leaf node holds the larger of its
+    children, and upper FSM levels aggregate the lower ones, so a search for "a page with at least N free
+    bytes" walks down the tree rather than scanning a list
+    [<a href="https://www.postgresql.org/docs/current/storage-fsm.html">PG Free Space Map</a>]. The detail
+    lives in <code>src/backend/storage/freespace/README</code>.</p>
+  </div>
+
+  <!-- ===== Problem two: delete ===== -->
+  <h2>Problem two: what happens to a deleted row?</h2>
+
+  <p>The obvious answer, erase the bytes and slide the survivors up to close the hole, is the wrong default,
+  for two reasons. First, under multi-version concurrency control another transaction running on an older
+  snapshot may still need to see the row you just deleted; erasing it would break that reader. Second,
+  immediate compaction is expensive and conflicts with anyone reading the page right now. So PostgreSQL marks
+  the row dead instead of erasing it. It sets the deleting transaction id in the tuple header field
+  <code>t_xmax</code>, and only later does the line pointer move to a dead state and the space become reusable
+  [<a href="https://www.postgresql.org/docs/current/routine-vacuuming.html">PG Routine Vacuuming</a>].</p>
+
+  <p>This is the tombstone idea. The deletion is recorded, the readers that still need the old version can
+  find it, and a separate maintenance pass reclaims the space once no live transaction can see it. The trade
+  is explicit: deletes and updates are cheap and do not block, at the price of bloat that something else must
+  clean up, and at the price of readers skipping dead versions until then. An UPDATE is delete-plus-insert
+  under the hood: it writes a new version and stamps the old one's <code>t_xmax</code>, which is why heavy
+  update workloads bloat tables [<a href="https://www.postgresql.org/docs/current/routine-vacuuming.html">PG Routine Vacuuming</a>].
+  You will see the snapshot machinery that depends on this in <a href="0013-concurrency-mvcc.html">week 13</a>.</p>
+
+  <!-- ===== tuple lifecycle diagram ===== -->
+  <figure class="diagram">
+    <svg viewBox="0 0 580 130" role="img" aria-label="The lifecycle of a tuple from live to reclaimed">
+      <rect x="10" y="40" width="110" height="48" rx="6" fill="var(--storage-bg)" stroke="var(--storage)"/>
+      <text x="65" y="60" text-anchor="middle" class="svg-label" style="font-weight:600">live</text>
+      <text x="65" y="76" text-anchor="middle" class="svg-mono">xmax = 0</text>
+      <line x1="120" y1="64" x2="160" y2="64" stroke="var(--ink-soft)" marker-end="url(#a3)"/>
+      <text x="140" y="34" text-anchor="middle" class="svg-label">DELETE</text>
+      <rect x="160" y="40" width="120" height="48" rx="6" fill="#fff6f0" stroke="var(--storage)"/>
+      <text x="220" y="60" text-anchor="middle" class="svg-label" style="font-weight:600">deleted</text>
+      <text x="220" y="76" text-anchor="middle" class="svg-mono">xmax set, kept</text>
+      <line x1="280" y1="64" x2="320" y2="64" stroke="var(--ink-soft)" marker-end="url(#a3)"/>
+      <text x="300" y="34" text-anchor="middle" class="svg-label">prune</text>
+      <rect x="320" y="40" width="120" height="48" rx="6" fill="#fdeee6" stroke="var(--ink-soft)"/>
+      <text x="380" y="60" text-anchor="middle" class="svg-label" style="font-weight:600">dead pointer</text>
+      <text x="380" y="76" text-anchor="middle" class="svg-mono">LP_DEAD</text>
+      <line x1="440" y1="64" x2="480" y2="64" stroke="var(--ink-soft)" marker-end="url(#a3)"/>
+      <text x="460" y="34" text-anchor="middle" class="svg-label">VACUUM</text>
+      <rect x="480" y="40" width="90" height="48" rx="6" fill="#fffefb" stroke="var(--rule)" stroke-dasharray="3 3"/>
+      <text x="525" y="60" text-anchor="middle" class="svg-label" style="font-weight:600">reusable</text>
+      <text x="525" y="76" text-anchor="middle" class="svg-mono">free again</text>
+      <defs>
+        <marker id="a3" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto">
+          <path d="M0,0 L7,3 L0,6 Z" fill="var(--ink-soft)"/>
+        </marker>
+      </defs>
+    </svg>
+    <figcaption><b>Figure 2.</b> A row does not vanish on DELETE. It becomes a tombstone (xmax set), then a
+    dead line pointer once no snapshot needs it, and only VACUUM returns the space to the page's free pool.
+    The bytes can sit dead for a while; that gap is what the term "bloat" names.</figcaption>
+  </figure>
+
+  <!-- ===== SIMULATOR ===== -->
+  <h2>Simulator: the heap insert router with FSM and VACUUM</h2>
+
+  <p>Run two experiments. First, watch the cost of finding a page. Switch routing between a linked-list walk
+  and an FSM tree jump and insert rows; the I/O counter tells the story. Second, watch bloat appear and get
+  cleaned: delete rows to create dead tuples, then press VACUUM to reclaim them and possibly free a trailing
+  page back to the file.</p>
+
+  <figure class="sim" id="hf-sim">
+    <div class="sim-head">
+      <span class="sim-title">Heap insert router with FSM and VACUUM</span>
+      <span class="sim-sub">insert and delete rows, switch routing, then vacuum the bloat</span>
+    </div>
+    <div class="sim-body">
+      <div class="sim-stage"><svg id="hf-svg" viewBox="0 0 620 220" width="100%"></svg></div>
+      <div class="sim-controls" id="hf-controls"></div>
+      <div class="sim-readout" id="hf-readout"></div>
+    </div>
+  </figure>
+  <figcaption class="muted" style="margin-top:-1rem">Experiment: insert several rows under linked-list
+  routing and note the pages touched per insert, then switch to FSM and insert again. Then delete a few rows
+  to grow dead space and press VACUUM.</figcaption>
+
+  <script>
+  // Heap insert router simulator. Self-contained, IIFE-wrapped, lesson-prefixed ids.
+  (function () {
+    const svg = document.getElementById("hf-svg");
+    const readout = document.getElementById("hf-readout");
+    const controls = document.getElementById("hf-controls");
+
+    const NPAGES = 6;
+    const CAP = 240;          // usable bytes per toy page
+    const ROW = 60;           // bytes per inserted row (slot + tuple, toy value)
+    const rand = DBMS.rng(7); // deterministic starting fill
+
+    let mode = "fsm";         // "list" or "fsm"
+    let pages, ioReads, lastTouched, lastTarget, message;
+
+    function fresh() {
+      // each page: used bytes (alive), dead bytes (tombstoned, reclaimable by vacuum), allocated flag
+      pages = [];
+      for (let p = 0; p < NPAGES; p++) {
+        const startUsed = Math.floor(rand() * 4) * ROW; // 0..3 rows preloaded
+        pages.push({ used: startUsed, dead: 0, alloc: true });
+      }
+      ioReads = 0; lastTouched = []; lastTarget = -1; message = "Fresh heap of 6 pages.";
+    }
+    fresh();
+
+    function freeOf(pg) { return pg.alloc ? CAP - pg.used - pg.dead : CAP; }
+
+    function findPageList() {            // walk pages in order, count each as one read
+      lastTouched = [];
+      for (let p = 0; p < NPAGES; p++) {
+        if (!pages[p].alloc) continue;
+        ioReads++; lastTouched.push(p);
+        if (freeOf(pages[p]) >= ROW) return p;
+      }
+      return -1;
+    }
+    function findPageFsm() {             // one probe of the summary, no per-page reads
+      lastTouched = [];
+      let best = -1, bestFree = -1;
+      for (let p = 0; p < NPAGES; p++) {  // the FSM already holds these maxima; the search is the tree descent
+        if (!pages[p].alloc) continue;
+        const f = freeOf(pages[p]);
+        if (f >= ROW && f > bestFree) { best = p; bestFree = f; }
+      }
+      ioReads += 1;                       // one logical FSM lookup, independent of page count
+      if (best >= 0) lastTouched.push(best);
+      return best;
+    }
+
+    function insert() {
+      const target = mode === "list" ? findPageList() : findPageFsm();
+      lastTarget = target;
+      if (target < 0) { message = "No page has room. A real heap would extend the file with a new page here."; }
+      else {
+        pages[target].used += ROW;
+        message = "Inserted a " + ROW + "-byte row into pg" + target +
+          (mode === "list" ? " after a list walk." : " via one FSM lookup.");
+      }
+      render();
+    }
+
+    function del() {
+      // delete one row from the most-filled allocated page: alive bytes become dead (tombstone)
+      let p = -1, max = 0;
+      for (let k = 0; k < NPAGES; k++) if (pages[k].alloc && pages[k].used >= ROW && pages[k].used > max) { max = pages[k].used; p = k; }
+      lastTouched = []; lastTarget = p;
+      if (p < 0) { message = "Nothing alive to delete."; render(); return; }
+      pages[p].used -= ROW; pages[p].dead += ROW;
+      message = "DELETE on pg" + p + ": a row is now a tombstone (dead, not erased). Free space is not yet reusable.";
+      render();
+    }
+
+    function vacuum() {
+      let reclaimed = 0, freedPage = -1;
+      for (let p = 0; p < NPAGES; p++) {
+        reclaimed += pages[p].dead;
+        pages[p].dead = 0;                // dead space made reusable in place
+      }
+      // if the last allocated page is now empty, return it to the OS (trailing-page truncation)
+      for (let p = NPAGES - 1; p >= 0; p--) {
+        if (pages[p].alloc && pages[p].used === 0) { pages[p].alloc = false; freedPage = p; break; }
+        if (pages[p].alloc && pages[p].used > 0) break;
+      }
+      lastTouched = []; lastTarget = -1;
+      message = "VACUUM reclaimed " + reclaimed + " dead bytes in place" +
+        (freedPage >= 0 ? ", and truncated empty trailing pg" + freedPage + " back to the OS." : ". The file did not shrink (no empty trailing page).");
+      render();
+    }
+
+    function bar(x, y, w, h, frac, fill) {
+      svg.appendChild(DBMS.svg("rect", { x: x, y: y, width: w, height: h, rx: 3, fill: "#fffefb", stroke: "var(--rule)" }));
+      if (frac > 0) svg.appendChild(DBMS.svg("rect", { x: x, y: y, width: Math.max(1, w * frac), height: h, rx: 3, fill: fill }));
+    }
+
+    function render() {
+      svg.innerHTML = "";
+      const x0 = 14, gap = 14, w = (620 - x0 * 2 - gap * (NPAGES - 1)) / NPAGES;
+      for (let p = 0; p < NPAGES; p++) {
+        const x = x0 + p * (w + gap);
+        const pg = pages[p];
+        const highlight = lastTouched.indexOf(p) >= 0;
+        const isTarget = p === lastTarget;
+        // page frame
+        svg.appendChild(DBMS.svg("rect", {
+          x: x - 2, y: 28, width: w + 4, height: 150, rx: 6,
+          fill: pg.alloc ? "#fffdf8" : "#f3efe7",
+          stroke: isTarget ? "var(--storage)" : (highlight ? "var(--storage)" : "var(--rule)"),
+          "stroke-width": isTarget ? 3 : (highlight ? 2 : 1),
+          "stroke-dasharray": pg.alloc ? "0" : "4 4"
+        }));
+        svg.appendChild(DBMS.svg("text", { x: x + w / 2, y: 22, "text-anchor": "middle", class: "svg-mono" }, "pg" + p));
+        if (!pg.alloc) {
+          svg.appendChild(DBMS.svg("text", { x: x + w / 2, y: 108, "text-anchor": "middle", class: "svg-label" }, "freed"));
+          continue;
+        }
+        // stacked bar: used (storage), dead (warm), free (empty), bottom to top
+        const bx = x + w / 2 - 13, bw = 26, bh = 130, by = 40;
+        const usedH = bh * (pg.used / CAP), deadH = bh * (pg.dead / CAP);
+        const freeH = bh - usedH - deadH;
+        svg.appendChild(DBMS.svg("rect", { x: bx, y: by, width: bw, height: freeH, fill: "#fffefb", stroke: "var(--rule)" }));
+        svg.appendChild(DBMS.svg("rect", { x: bx, y: by + freeH, width: bw, height: deadH, fill: "#e7b59a" }));
+        svg.appendChild(DBMS.svg("rect", { x: bx, y: by + freeH + deadH, width: bw, height: usedH, fill: "var(--storage)" }));
+        svg.appendChild(DBMS.svg("text", { x: x + w / 2, y: 188, "text-anchor": "middle", class: "svg-label" }, "free " + freeOf(pg)));
+      }
+      // legend
+      svg.appendChild(DBMS.svg("rect", { x: 14, y: 200, width: 12, height: 12, fill: "var(--storage)" }));
+      svg.appendChild(DBMS.svg("text", { x: 30, y: 210, class: "svg-label" }, "alive"));
+      svg.appendChild(DBMS.svg("rect", { x: 90, y: 200, width: 12, height: 12, fill: "#e7b59a" }));
+      svg.appendChild(DBMS.svg("text", { x: 106, y: 210, class: "svg-label" }, "dead (bloat)"));
+      svg.appendChild(DBMS.svg("rect", { x: 210, y: 200, width: 12, height: 12, fill: "#fffefb", stroke: "var(--rule)" }));
+      svg.appendChild(DBMS.svg("text", { x: 226, y: 210, class: "svg-label" }, "free"));
+
+      const deadTotal = pages.reduce((a, p) => a + (p.alloc ? p.dead : 0), 0);
+      readout.textContent =
+        "routing: " + (mode === "list" ? "linked-list walk" : "FSM tree") +
+        "   |   page reads to find space: " + ioReads +
+        "   |   dead bytes (bloat): " + deadTotal +
+        "\n" + message;
+    }
+
+    // controls
+    const btnInsert = DBMS.el("button", { text: "Insert row", onclick: insert });
+    const btnDelete = DBMS.el("button", { class: "ghost", text: "Delete row", onclick: del });
+    const btnVacuum = DBMS.el("button", { text: "VACUUM", onclick: vacuum });
+    const btnReset = DBMS.el("button", { class: "ghost", text: "Reset", onclick: function () { fresh(); render(); } });
+    const btnMode = DBMS.el("button", { class: "ghost", text: "Routing: FSM", onclick: function () {
+      mode = mode === "fsm" ? "list" : "fsm";
+      btnMode.textContent = "Routing: " + (mode === "fsm" ? "FSM" : "list");
+      ioReads = 0; lastTouched = []; message = "Switched routing to " + (mode === "fsm" ? "FSM tree" : "linked-list") + ". Page-read counter reset.";
+      render();
+    }});
+    controls.append(btnInsert, btnDelete, btnVacuum, btnMode, btnReset);
+
+    render();
+  })();
+  </script>
+
+  <div class="callout keyidea">
+    <div class="callout-title">Keep this one thing</div>
+    <p>Inserting a row is a search for free space, and the free space map makes that search logarithmic
+    instead of linear. Deleting a row is a mark, not an erase, and VACUUM is the only thing that turns the
+    marked space back into usable space.</p>
+  </div>
+
+  <!-- ===== VACUUM ===== -->
+  <h2>VACUUM does four jobs, not one</h2>
+
+  <p>It is tempting to read VACUUM as "the disk-space cleaner," but the PostgreSQL documentation lists four
+  purposes, and three of them have nothing to do with shrinking files
+  [<a href="https://www.postgresql.org/docs/current/routine-vacuuming.html">PG Routine Vacuuming</a>].</p>
+
+  <table>
+    <caption>The four jobs of VACUUM.</caption>
+    <thead><tr><th>Job</th><th>What it does</th><th>Why it matters</th></tr></thead>
+    <tbody>
+      <tr><td>Reclaim dead space</td><td>Marks space from dead row versions reusable</td><td>Bounds table bloat from UPDATE and DELETE</td></tr>
+      <tr><td>Update statistics</td><td>Refreshes planner stats (via ANALYZE)</td><td>The optimizer needs current row counts and distributions (week 11)</td></tr>
+      <tr><td>Maintain the visibility map</td><td>Flags pages where all tuples are visible to everyone</td><td>Lets later vacuums skip clean pages and lets index-only scans avoid heap fetches</td></tr>
+      <tr><td>Freeze old XIDs</td><td>Marks sufficiently old rows as frozen</td><td>Prevents 32-bit transaction id wraparound, which would otherwise make old rows appear to be in the future</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout why">
+    <div class="callout-title">Why freezing exists at all</div>
+    <p>Transaction ids in PostgreSQL are 32 bits, and they are compared modulo 2^32: for every normal XID,
+    two billion XIDs count as older and two billion as newer. Let the counter lap without maintenance and old
+    committed rows suddenly compare as "in the future" and become invisible, which is silent data loss. The
+    defense is to mark old, all-visible rows as frozen with a special XID that always compares as older than
+    every normal one, so wraparound cannot touch them. The hard rule: every table must be vacuumed at least
+    once every roughly two billion transactions
+    [<a href="https://www.postgresql.org/docs/current/routine-vacuuming.html">PG Routine Vacuuming</a>].</p>
+  </div>
+
+  <p>Plain VACUUM and VACUUM FULL are not two settings of the same operation. Plain VACUUM marks dead space
+  reusable in place, takes a SHARE UPDATE EXCLUSIVE lock so it runs alongside queries, and generally does not
+  return space to the operating system. It only shrinks the file when whole trailing pages happen to be empty,
+  which is exactly the truncation step the simulator shows. VACUUM FULL rewrites the entire table into a new
+  file, does return space to the OS, but takes an ACCESS EXCLUSIVE lock that blocks all access to the table
+  while it runs. The documentation recommends against VACUUM FULL in routine operation
+  [<a href="https://www.postgresql.org/docs/current/routine-vacuuming.html">PG Routine Vacuuming</a>].</p>
+
+  <table>
+    <caption>Plain VACUUM versus VACUUM FULL.</caption>
+    <thead><tr><th>Property</th><th>Plain VACUUM</th><th>VACUUM FULL</th></tr></thead>
+    <tbody>
+      <tr><td>How it reclaims</td><td>Marks dead space reusable in place</td><td>Rewrites the whole table into a new file</td></tr>
+      <tr><td>Returns space to OS</td><td>Rarely (only empty trailing pages)</td><td>Yes, the old file is dropped</td></tr>
+      <tr><td>Lock held</td><td>SHARE UPDATE EXCLUSIVE (queries continue)</td><td>ACCESS EXCLUSIVE (blocks all access)</td></tr>
+      <tr><td>Routine use</td><td>Yes, this is the normal path</td><td>No, the docs advise avoiding it</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout gotcha">
+    <div class="callout-title">Exam trap</div>
+    <p>"DELETE frees disk space immediately" is false, and so is "VACUUM FULL is the normal, non-blocking way
+    to reclaim space." DELETE only tombstones the row. Plain VACUUM reclaims in place and usually does not
+    shrink the file. VACUUM FULL does shrink it but locks the whole table. Mixing these up is the most common
+    storage-layer mistake.</p>
+  </div>
+
+  <!-- ===== TOAST ===== -->
+  <h2>When a value is too big for a page</h2>
+
+  <p>A tuple cannot span pages. So what happens to a 5 KB <code>text</code> value when the page is 8 KB and a
+  row also carries other columns? PostgreSQL uses TOAST, The Oversized-Attribute Storage Technique. A row
+  wider than about 2 KB (the page divided by four) triggers it. The wide value is compressed, and if still too
+  big it is pushed out of line into a separate TOAST table whose rows are chunks of about 2000 bytes, sized so
+  four chunks fit on a page. What stays in the original row is an 18-byte pointer datum recording the TOAST
+  table, the value id, and its sizes. A TOAST-able field can hold up to 1 GB this way
+  [<a href="https://www.postgresql.org/docs/current/storage-toast.html">PG TOAST</a>].</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 560 170" role="img" aria-label="A wide value moved out of line by TOAST">
+      <text x="10" y="20" class="svg-label" style="font-weight:600">heap row in emp</text>
+      <rect x="10" y="30" width="60" height="34" rx="4" fill="var(--storage-bg)" stroke="var(--storage)"/>
+      <text x="40" y="51" text-anchor="middle" class="svg-mono">id</text>
+      <rect x="74" y="30" width="90" height="34" rx="4" fill="var(--storage-bg)" stroke="var(--storage)"/>
+      <text x="119" y="51" text-anchor="middle" class="svg-mono">name</text>
+      <rect x="168" y="30" width="140" height="34" rx="4" fill="#fff6f0" stroke="var(--storage)"/>
+      <text x="238" y="46" text-anchor="middle" class="svg-label">bio (18-byte</text>
+      <text x="238" y="59" text-anchor="middle" class="svg-label">TOAST pointer)</text>
+      <line x1="238" y1="64" x2="238" y2="96" stroke="var(--ink-soft)" marker-end="url(#a4)"/>
+      <text x="10" y="116" class="svg-label" style="font-weight:600">emp_toast table: chunks of ~2000 bytes</text>
+      <rect x="168" y="120" width="80" height="34" rx="4" fill="#fdeee6" stroke="var(--ink-soft)"/>
+      <text x="208" y="141" text-anchor="middle" class="svg-mono">chunk 0</text>
+      <rect x="252" y="120" width="80" height="34" rx="4" fill="#fdeee6" stroke="var(--ink-soft)"/>
+      <text x="292" y="141" text-anchor="middle" class="svg-mono">chunk 1</text>
+      <rect x="336" y="120" width="80" height="34" rx="4" fill="#fdeee6" stroke="var(--ink-soft)"/>
+      <text x="376" y="141" text-anchor="middle" class="svg-mono">chunk 2</text>
+      <defs>
+        <marker id="a4" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto">
+          <path d="M0,0 L7,3 L0,6 Z" fill="var(--ink-soft)"/>
+        </marker>
+      </defs>
+    </svg>
+    <figcaption><b>Figure 3.</b> The row keeps a small fixed pointer; the bulky value lives elsewhere in
+    chunks. Reading <code>name</code> never drags the wide <code>bio</code> through the buffer pool, and the
+    row still fits on one page. This is why a value too large for a page does not make a row span pages.</figcaption>
+  </figure>
+
+  <!-- ===== algorithm ===== -->
+  <h3>The insert algorithm, end to end</h3>
+  <ol class="steps">
+    <li>Compute the bytes the new row needs, including its slot and any alignment pad.</li>
+    <li>If the row is wider than the TOAST threshold, compress and move oversized columns out of line first, leaving an 18-byte pointer.</li>
+    <li>Ask the free space map for a page with at least that many free bytes; descend the tree to a fitting page in logarithmic time.</li>
+    <li>If no page fits, extend the heap file with a fresh page at the end.</li>
+    <li>Pin the chosen page in the buffer pool, allocate a slot, write the tuple, and update <code>pd_lower</code> and <code>pd_upper</code>.</li>
+    <li>Update the page's free-space entry in the FSM so the next search sees the new value.</li>
+  </ol>
+
+  <pre><code><span class="tok-com"># insert into a heap file, FSM-routed (grounded in PostgreSQL behavior)</span>
+<span class="tok-kw">def</span> <span class="tok-fn">heap_insert</span>(rel, row):
+    row = toast_if_oversized(rel, row)        <span class="tok-com"># wide columns go out of line</span>
+    need = len(row) + SLOT_SIZE
+    page_id = fsm_find_page(rel, need)        <span class="tok-com"># logarithmic, not a list walk</span>
+    <span class="tok-kw">if</span> page_id <span class="tok-kw">is</span> <span class="tok-num">None</span>:
+        page_id = rel.extend()                <span class="tok-com"># add a page at the end of the file</span>
+    page = buffer_pool.pin(page_id)
+    slot = page.alloc_slot(row)               <span class="tok-com"># pd_lower up, pd_upper down</span>
+    fsm_update(rel, page_id, page.free_bytes())
+    <span class="tok-kw">return</span> (page_id, slot)                     <span class="tok-com"># the stable record id</span>
+
+<span class="tok-kw">def</span> <span class="tok-fn">heap_delete</span>(page, slot, xid):
+    tup = page.tuple(slot)
+    tup.t_xmax = xid                          <span class="tok-com"># tombstone: mark dead, do not erase</span>
+    <span class="tok-com"># space becomes reusable only later, in VACUUM</span></code></pre>
+
+  <details class="deepdive">
+    <summary>Deeper: why the FSM is approximate, and what HOT does</summary>
+    <div>
+      <p>The FSM stores free space as one byte per page, so it tracks 256 levels rather than exact byte
+      counts. That is a deliberate space-for-precision trade: an approximate map is small enough to cache and
+      walk cheaply, and the cost of being slightly wrong is that a search may occasionally land on a page that
+      turns out a little too small, in which case the insert retries. Exact per-page free byte counts would
+      bloat the map for little benefit.</p>
+      <p>Heap-only tuple (HOT) updates are a related optimization. When an UPDATE does not change any indexed
+      column and the new version fits on the same page, PostgreSQL chains the new version to the old one
+      through the line pointer (the <code>LP_REDIRECT</code> state) so the indexes do not need new entries.
+      The index still points at the original line pointer, which redirects to the current version on the same
+      page. This keeps index maintenance and bloat down on update-heavy tables. The four line-pointer states
+      (<code>LP_UNUSED</code>, <code>LP_NORMAL</code>, <code>LP_REDIRECT</code>, <code>LP_DEAD</code>) are
+      defined in <code>src/include/storage/itemid.h</code>.</p>
+    </div>
+  </details>
+
+  <!-- ===== MCQs ===== -->
+  <h2>Check yourself</h2>
+
+  <div class="mcq" data-answer="2">
+    <p class="mcq-q">Which statement about DELETE in a PostgreSQL heap file is false?</p>
+    <button class="mcq-opt">The deleting transaction id is recorded in the tuple's xmax field.</button>
+    <button class="mcq-opt">Other transactions on an older snapshot may still read the deleted row.</button>
+    <button class="mcq-opt">DELETE immediately erases the bytes and returns the freed space to the OS.</button>
+    <button class="mcq-opt">The space becomes reusable only after a later VACUUM pass, not at delete time.</button>
+    <p class="mcq-explain">DELETE marks the row dead by setting xmax; it does not erase the bytes or free
+    disk. Under MVCC older readers may still need the version, and reclaiming space is VACUUM's job. The other
+    three statements are accurate.</p>
+  </div>
+
+  <div class="mcq" data-answer="1">
+    <p class="mcq-q">How does the free space map make "find a page with N free bytes" cheap?</p>
+    <button class="mcq-opt">It keeps every page pinned in memory so each check avoids a disk read entirely.</button>
+    <button class="mcq-opt">It stores per-page free space in a tree whose nodes hold the max of their children.</button>
+    <button class="mcq-opt">It sorts the heap file by free space so the first page always has the most room.</button>
+    <button class="mcq-opt">It rewrites the row to fit whatever page the linked-list walk happens to reach.</button>
+    <p class="mcq-explain">The FSM is a tree where each internal node holds the larger of its children, so the
+    root holds the maximum free space and a descent toward a child whose value is at least N reaches a fitting
+    page in logarithmic time. The heap stays unordered; the FSM is a separate fork.</p>
+  </div>
+
+  <div class="mcq" data-answer="3">
+    <p class="mcq-q">Which claim about plain VACUUM versus VACUUM FULL is false?</p>
+    <button class="mcq-opt">Plain VACUUM marks dead space reusable in place and usually does not shrink the file.</button>
+    <button class="mcq-opt">VACUUM FULL rewrites the table into a new file and returns space to the OS.</button>
+    <button class="mcq-opt">Plain VACUUM takes a lighter lock so ordinary queries keep running alongside it.</button>
+    <button class="mcq-opt">VACUUM FULL is the recommended routine way to reclaim space without blocking.</button>
+    <button class="mcq-opt">Plain VACUUM can shrink the file only when whole trailing pages are empty.</button>
+    <p class="mcq-explain">VACUUM FULL takes an ACCESS EXCLUSIVE lock that blocks all access and rewrites the
+    table; the docs advise against using it routinely. Plain VACUUM is the normal path. The other statements
+    are correct.</p>
+  </div>
+
+  <div class="mcq" data-answer="0">
+    <p class="mcq-q">Beyond reclaiming dead space, which is something VACUUM does not do?</p>
+    <button class="mcq-opt">Rebalance the table's B+tree indexes to keep their height minimal.</button>
+    <button class="mcq-opt">Update planner statistics so the optimizer estimates row counts well.</button>
+    <button class="mcq-opt">Maintain the visibility map so index-only scans can skip heap fetches.</button>
+    <button class="mcq-opt">Freeze old transaction ids to prevent 32-bit XID wraparound data loss.</button>
+    <p class="mcq-explain">VACUUM's four jobs are reclaiming dead space, updating statistics, maintaining the
+    visibility map, and freezing old XIDs. It does not rebalance B+tree indexes; index structure maintenance
+    is the index access method's own concern.</p>
+  </div>
+
+  <div class="mcq" data-answer="2">
+    <p class="mcq-q">A row in <code>emp</code> has a 5 KB bio column on an 8 KB page. What happens on insert?</p>
+    <button class="mcq-opt">The row spans two heap pages, with a continuation pointer linking the halves.</button>
+    <button class="mcq-opt">The insert is rejected because no single column may exceed the page size.</button>
+    <button class="mcq-opt">TOAST compresses or moves the bio out of line, leaving an 18-byte pointer in the row.</button>
+    <button class="mcq-opt">The page size is raised to 16 KB just for this table so the whole row fits.</button>
+    <p class="mcq-explain">A tuple cannot span pages. TOAST compresses the wide value and, if needed, stores it
+    out of line in a TOAST table as ~2000-byte chunks, leaving an 18-byte pointer in the heap row. Page size is
+    fixed at compile time and is not changed per table.</p>
+  </div>
+
+  <div class="mcq" data-answer="1">
+    <p class="mcq-q">Why is a linked-list heap organization a poor way to find free space at scale?</p>
+    <button class="mcq-opt">The list cannot store more than a few thousand pages before pointers overflow.</button>
+    <button class="mcq-opt">Finding room may touch many pages, one read each, so the cost grows with table size.</button>
+    <button class="mcq-opt">A linked list forces tuples into key order, which conflicts with heap semantics.</button>
+    <button class="mcq-opt">The list must be re-sorted after every insert, which dominates the write cost.</button>
+    <p class="mcq-explain">A list walk asks each page in turn whether it has room, and each check can be a disk
+    read, so the worst case is linear in the number of pages. The FSM replaces that with a logarithmic tree
+    search. Heaps are unordered, so the key-order and re-sort options are wrong.</p>
+  </div>
+
+  <!-- ===== FLASHCARDS ===== -->
+  <div class="flashcard">
+    <div class="fc-front">In one sentence: what does DELETE actually do to a row, and when is the space reusable?</div>
+    <div class="fc-back">DELETE stamps the deleting transaction id in xmax to mark the row dead (a tombstone);
+    the space becomes reusable only when a later VACUUM reclaims it, because older snapshots may still need
+    the version.</div>
+  </div>
+
+  <div class="flashcard">
+    <div class="fc-front">State the structure and the guarantee of the free space map.</div>
+    <div class="fc-back">A separate fork storing one byte of free space per page in a tree where each internal
+    node holds the max of its children, so "find a page with N free bytes" is a logarithmic descent rather
+    than a linear page-list walk.</div>
+  </div>
+
+  <!-- ===== PRIMARY SOURCE ===== -->
+  <div class="source-box">
+    <div class="src-tag">Primary source</div>
+    <div class="src-title">Read this next:
+      <a href="https://www.postgresql.org/docs/current/routine-vacuuming.html">PostgreSQL documentation, Routine Vacuuming</a></div>
+    <p class="muted">The authoritative account of the four purposes of VACUUM, the roughly two-billion
+    transaction XID wraparound bound and freezing, and the difference between plain VACUUM (in place,
+    SHARE UPDATE EXCLUSIVE) and VACUUM FULL (rewrite, ACCESS EXCLUSIVE). Pair it with the
+    <a href="https://www.postgresql.org/docs/current/storage-fsm.html">Free Space Map</a> and
+    <a href="https://www.postgresql.org/docs/current/storage-toast.html">TOAST</a> pages for the insert and
+    wide-value mechanics.</p>
+  </div>
+
+  <!-- ===== ASK YOUR TEACHER ===== -->
+  <div class="ask-teacher">
+    <div class="at-tag">Ask your teacher</div>
+    <p>Want to see the FSM tree descent drawn step by step, or trace what happens to a row's xmin and xmax
+    across an UPDATE that becomes a HOT chain? Ask me to go deeper or quiz you harder. I am your teacher for
+    this course, not just a document.</p>
+  </div>
+
+  <!-- ===== NAV ===== -->
+  <nav class="lesson-nav">
+    <a class="prev" href="0002-storage-engine-disk-pages.html">
+      <span class="nav-dir">Previous</span>
+      <span class="nav-title">Week 02 · Storage engine: disk layout, pages, and slotted records</span>
+    </a>
+    <a class="next" href="0004-buffer-pool-design.html">
+      <span class="nav-dir">Next</span>
+      <span class="nav-title">Week 04 · Buffer pool design: frames, pins, dirty flags, replacement</span>
+    </a>
+  </nav>
+
+  </div><!-- /.col -->
+</main>
+</body>
+</html>

@@ -1,0 +1,696 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lesson 01 · DBMS architecture: the life of a query · Field Guide to the Database Engine</title>
+<link rel="stylesheet" href="../assets/course.css">
+<script defer src="../assets/components.js"></script>
+</head>
+<body class="layer-query">
+<main class="page">
+
+  <!-- ===== MASTHEAD ===== -->
+  <header class="masthead col">
+    <div class="crumbs">
+      <a href="../index.html">Field Guide</a> <span>/</span>
+      <span>Part I · Foundations</span> <span>/</span>
+      <span>Week 01</span>
+    </div>
+    <span class="week-badge">Query layer</span>
+    <h1>DBMS architecture: the life of a query</h1>
+    <p class="lede">You type one short SELECT and rows come back. In between, a multi-user server
+    has to decide who runs, turn a string into a plan, find bytes on a disk, and walk the answer back up.
+    This lesson is the map of that journey, and the map every later week points back to.</p>
+  </header>
+
+  <div class="col">
+
+  <!-- ===== OBJECTIVES ===== -->
+  <div class="objectives">
+    <h4>By the end you can</h4>
+    <ul>
+      <li>Name the five components of a relational engine and say what each one does for one query.</li>
+      <li>Trace the query processing pipeline from a SQL string down to disk and back up, naming the artifact each stage produces.</li>
+      <li>Explain why a database is a server, not a library: admission control, workers, and the process-versus-thread fork.</li>
+      <li>Contrast how PostgreSQL and SQLite execute the same query, and place every later week on this map.</li>
+    </ul>
+  </div>
+
+  <!-- ===== WHERE THIS SITS (connective tissue) ===== -->
+  <p>The whole course chases one query and one transaction through the engine. Here is the query, and it
+  will reappear in every lesson from here on:</p>
+
+  <pre><code><span class="tok-kw">SELECT</span> name <span class="tok-kw">FROM</span> emp <span class="tok-kw">WHERE</span> salary &gt; <span class="tok-num">75000</span> <span class="tok-kw">ORDER BY</span> name;</code></pre>
+
+  <p>This is week 1, the top of the stack. Nothing is handed to us from above: a raw SQL string arrives over a
+  socket from a client. What this layer hands down is also a string, but now to a specific worker process or
+  thread that has been admitted to run, with the relational query processor ready to compile it. Everything
+  below (parsing in <a href="0008-query-parsing.html">week 8</a>, optimization in
+  <a href="0011-query-optimization.html">week 11</a>, execution in
+  <a href="0009-query-execution-volcano.html">week 9</a>, indexes in <a href="0006-btree-search-insert.html">week 6</a>,
+  the buffer pool in <a href="0004-buffer-pool-design.html">week 4</a>, and storage in
+  <a href="0002-storage-engine-disk-pages.html">week 2</a>) is a layer this lesson names but does not yet open.
+  If at any point a later topic feels like an island, come back here and find it on the slab.</p>
+
+  <div class="callout intuition">
+    <div class="callout-title">Intuition</div>
+    <p>Think of an airport gate. A passenger asks for the flight manifest. A gate agent does not pull the wires
+    out of the terminal; the request flows through a counter that knows who you are, a supervisor who decides
+    whether there is staff free to handle it now, a clerk who reads the request and fetches the right records,
+    and the answer comes back the same way it went in. A database is built the same way: layered handlers, each
+    with one job, and the answer "unwinds the stack" back to you. The survey that grounds this lesson opens with
+    exactly this gate-agent story.</p>
+  </div>
+
+  <!-- ===== THE FIVE COMPONENTS ===== -->
+  <h2>The five components</h2>
+
+  <p>A naive picture says the engine is one black box that reads files. That picture cannot explain how a hundred
+  users share the machine, why a query can be told to wait, how rows get cached, or how a crash is survived. The
+  moment you ask any of those questions you are forced to break the box into parts. Hellerstein, Stonebraker, and
+  Hamilton break it into five
+  [<a href="https://dsf.berkeley.edu/papers/fntdb07-architecture.pdf">Architecture of a Database System, Fig. 1.1</a>].</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 720 300" role="img" aria-label="The five components of a relational database engine with a query path">
+      <defs>
+        <marker id="arch-arrow" markerWidth="10" markerHeight="10" refX="7" refY="3" orient="auto">
+          <path d="M0,0 L7,3 L0,6 Z" fill="var(--query)"/>
+        </marker>
+      </defs>
+
+      <!-- client -->
+      <rect x="20" y="20" width="150" height="44" rx="6" fill="var(--query-bg)" stroke="var(--query)"/>
+      <text x="95" y="40" text-anchor="middle" class="svg-label">Client (JDBC/ODBC)</text>
+      <text x="95" y="56" text-anchor="middle" class="svg-label sm">sends SQL string</text>
+
+      <!-- 1 comms -->
+      <rect x="20" y="96" width="430" height="44" rx="6" fill="#fffdf8" stroke="var(--query)"/>
+      <text x="235" y="116" text-anchor="middle" class="svg-mono">1. Client communications manager</text>
+      <text x="235" y="132" text-anchor="middle" class="svg-label sm">keeps connection state, ships results back</text>
+
+      <!-- 2 process -->
+      <rect x="20" y="156" width="430" height="44" rx="6" fill="#fffdf8" stroke="var(--query)"/>
+      <text x="235" y="176" text-anchor="middle" class="svg-mono">2. Process manager</text>
+      <text x="235" y="192" text-anchor="middle" class="svg-label sm">assigns a worker, runs admission control</text>
+
+      <!-- 3 query processor -->
+      <rect x="20" y="216" width="430" height="64" rx="6" fill="#fffdf8" stroke="var(--query)"/>
+      <text x="235" y="238" text-anchor="middle" class="svg-mono">3. Relational query processor</text>
+      <text x="235" y="256" text-anchor="middle" class="svg-label sm">authorize, parse, rewrite, optimize, execute</text>
+      <text x="235" y="271" text-anchor="middle" class="svg-label sm">(weeks 8, 11, 9, 10)</text>
+
+      <!-- 4 storage -->
+      <rect x="475" y="156" width="225" height="124" rx="6" fill="var(--storage-bg)" stroke="var(--storage)"/>
+      <text x="587" y="178" text-anchor="middle" class="svg-mono">4. Transactional</text>
+      <text x="587" y="194" text-anchor="middle" class="svg-mono">storage manager</text>
+      <text x="587" y="216" text-anchor="middle" class="svg-label sm">access methods (w6,7)</text>
+      <text x="587" y="232" text-anchor="middle" class="svg-label sm">buffer manager (w4,5)</text>
+      <text x="587" y="248" text-anchor="middle" class="svg-label sm">lock manager (w12,13)</text>
+      <text x="587" y="264" text-anchor="middle" class="svg-label sm">log manager (w14)</text>
+
+      <!-- 5 shared -->
+      <rect x="475" y="96" width="225" height="44" rx="6" fill="var(--query-bg)" stroke="var(--query)"/>
+      <text x="587" y="116" text-anchor="middle" class="svg-mono">5. Shared: catalog + memory</text>
+      <text x="587" y="132" text-anchor="middle" class="svg-label sm">used by almost every query</text>
+
+      <!-- arrows down -->
+      <line x1="95" y1="64" x2="95" y2="94" stroke="var(--query)" marker-end="url(#arch-arrow)"/>
+      <line x1="235" y1="140" x2="235" y2="154" stroke="var(--query)" marker-end="url(#arch-arrow)"/>
+      <line x1="235" y1="200" x2="235" y2="214" stroke="var(--query)" marker-end="url(#arch-arrow)"/>
+      <line x1="450" y1="248" x2="473" y2="248" stroke="var(--query)" marker-end="url(#arch-arrow)"/>
+    </svg>
+    <figcaption><b>Figure 1.</b> The five components, redrawn from the survey's Figure 1.1. A query enters at the
+    client, descends 1 to 4, and consults the shared catalog and memory (5) along the way. The labels in the
+    storage box name the weeks that open each sub-component, so you can already see where the course is going.</figcaption>
+  </figure>
+
+  <p>Component by component, for our SELECT:</p>
+
+  <ol class="steps">
+    <li><b>Client communications manager.</b> The connection already exists; this layer remembers who you are and
+    over which protocol you speak, accepts the SQL text, and later ships <code>name</code> values back. It must
+    speak many connectivity protocols because deployments are two-tier, three-tier, or four-tier
+    [<a href="https://dsf.berkeley.edu/papers/fntdb07-architecture.pdf">survey §1.1</a>].</li>
+    <li><b>Process manager.</b> It assigns a thread of computation, a <i>DBMS worker</i>, to your command, with a
+    1:1 mapping: one worker handles all the SQL from your one connection. Its sharpest decision is
+    <i>admission control</i>: run now, or defer until the machine has room. More on this below.</li>
+    <li><b>Relational query processor.</b> It checks that you are authorized, compiles the SQL into a query plan,
+    and runs that plan through a suite of operators (selection, projection, sort) plus operators that fetch
+    records from the layer below. This is weeks 8 through 11.</li>
+    <li><b>Transactional storage manager.</b> It owns every byte of data through four sub-managers: access methods
+    (heaps and indexes), the buffer manager, the lock manager (isolation), and the log manager (durability and
+    rollback). This is weeks 2 through 7 plus the transaction and recovery weeks.</li>
+    <li><b>Shared components and utilities.</b> The catalog manager (which tables and columns exist, with what
+    types) and the memory manager are consulted during almost every query: authentication, parsing,
+    optimization. Backup, replication, and monitoring run on the side.</li>
+  </ol>
+
+  <div class="callout why">
+    <div class="callout-title">Why split it into exactly these five</div>
+    <p>Two forces pull the box apart. First, a database is a <i>server</i>, shared by many callers, so something
+    must manage connections (component 1) and decide who runs (component 2) before any data work begins. Second,
+    SQL is <i>declarative</i>: it states what you want, not how to get it, so something must compile and run it
+    (component 3) on top of something that safely persists and shares bytes (component 4). The catalog and memory
+    (component 5) are pulled out because every other component needs them, so making them shared avoids
+    threading the same dependency through all four.</p>
+  </div>
+
+  <!-- ===== THE PIPELINE ===== -->
+  <h2>Inside component 3: the query processing pipeline</h2>
+
+  <p>Component 3 is itself a small pipeline. The survey describes it as taking "a declarative SQL statement,
+  validates it, optimizes it into a procedural dataflow execution plan, and (subject to admission control)
+  executes that dataflow program," after which the client pulls result tuples one at a time or in small batches
+  [<a href="https://dsf.berkeley.edu/papers/fntdb07-architecture.pdf">survey §4</a>]. Each stage produces a
+  distinct artifact, and naming the artifact is the whole trick to not getting lost.</p>
+
+  <table>
+    <caption>The pipeline for <code>SELECT name FROM emp WHERE salary &gt; 75000 ORDER BY name</code>, stage by artifact.</caption>
+    <thead><tr><th>Stage</th><th>What it does</th><th>Artifact it hands on</th><th>Week</th></tr></thead>
+    <tbody>
+      <tr><td>Parse</td><td>tokenize the string, apply grammar rules only</td><td>raw parse tree (names are still strings)</td><td>8</td></tr>
+      <tr><td>Bind / analyze</td><td>resolve <code>emp</code> and <code>salary</code> against the catalog, attach types, authorize</td><td>query tree (validated, typed)</td><td>8</td></tr>
+      <tr><td>Rewrite</td><td>expand views, fold constants, normalize predicates (query + catalog only, never data)</td><td>logical plan (relational algebra)</td><td>8, 11</td></tr>
+      <tr><td>Optimize</td><td>estimate selectivity, cost seq-scan versus index, pick the cheapest plan</td><td>physical plan (concrete operators)</td><td>11</td></tr>
+      <tr><td>Execute</td><td>run the operator tree pull-style, fetching tuples through access methods</td><td>result tuples</td><td>9, 10</td></tr>
+    </tbody>
+  </table>
+
+  <p>One subtlety worth pinning down now: parsing uses only syntactic rules and makes no catalog lookups. The
+  reason is concrete. A catalog lookup runs inside a transaction, and pure syntax checking needs no transaction,
+  so PostgreSQL splits "parse the string" from "bind the names" deliberately
+  [<a href="https://www.postgresql.org/docs/current/parser-stage.html">PG parser stage</a>]. Confusing parsing
+  with binding is one of the most common exam traps, and week 8 returns to it.</p>
+
+  <div class="callout keyidea">
+    <div class="callout-title">Keep this one thing</div>
+    <p>A query travels down: string to raw parse tree to query tree to logical plan to physical plan to tuples,
+    and then "unwinds the stack" back up. Each arrow is a layer with one job, and each layer is owned by a
+    specific week of this course.</p>
+  </div>
+
+  <!-- ===== SIMULATOR ===== -->
+  <h2>Simulator: trace the query stack</h2>
+
+  <p>Reading the pipeline is one thing; watching one query crawl down it and the rows crawl back up is another.
+  The simulator below animates the descent through the five components and the pipeline, then the unwind. Switch
+  between PostgreSQL and SQLite to see where the two engines agree (the front: tokenize, parse, build a tree) and
+  where they diverge (the back: PostgreSQL keeps named tree stages and a tree-walking executor; SQLite compiles to
+  VDBE bytecode). Raise the result-set size and step into execution to watch FETCH repeat.</p>
+
+  <figure class="sim" id="w1-sim">
+    <div class="sim-head">
+      <span class="sim-title">Query stack tracer</span>
+      <span class="sim-sub">step down, then watch it unwind</span>
+    </div>
+    <div class="sim-body">
+      <div class="sim-stage"><svg id="w1-svg" viewBox="0 0 720 360" width="100%"></svg></div>
+      <div class="sim-controls" id="w1-controls">
+        <label>Engine
+          <select id="w1-engine">
+            <option value="pg">PostgreSQL</option>
+            <option value="sqlite">SQLite</option>
+          </select>
+        </label>
+        <label>Result rows
+          <input type="range" id="w1-rows" min="1" max="5" value="2">
+          <span id="w1-rows-out" class="pill">2</span>
+        </label>
+      </div>
+      <div class="sim-readout" id="w1-readout"></div>
+    </div>
+  </figure>
+  <figcaption class="muted" style="margin-top:-1rem">Experiment: set engine to SQLite and step past the optimizer.
+  Notice the named "logical plan" and "physical plan" stages of PostgreSQL collapse into one "compile to VDBE
+  bytecode" stage. Then raise result rows and watch the execute stage repeat its FETCH.</figcaption>
+
+  <script>
+  (function () {
+    var svg = document.getElementById("w1-svg");
+    var readout = document.getElementById("w1-readout");
+    var engineSel = document.getElementById("w1-engine");
+    var rowsInput = document.getElementById("w1-rows");
+    var rowsOut = document.getElementById("w1-rows-out");
+
+    // Each stage: {id, label, side, note}. side: "down" or "up".
+    function buildStages(engine, rows) {
+      var s = [];
+      s.push({ lbl: "Client sends SQL", sub: "SELECT name FROM emp WHERE salary > 75000", comp: 1, dir: "down" });
+      s.push({ lbl: "Process manager: admission control", sub: "assign worker, decide run now or wait", comp: 2, dir: "down" });
+      s.push({ lbl: "Authorize", sub: "check SELECT privilege on emp", comp: 3, dir: "down" });
+      s.push({ lbl: "Parse (tokenize + grammar)", sub: "string to raw parse tree, no catalog", comp: 3, dir: "down" });
+      s.push({ lbl: "Bind / analyze", sub: "resolve emp.salary, attach types", comp: 3, dir: "down" });
+      if (engine === "pg") {
+        s.push({ lbl: "Rewrite to logical plan", sub: "proj(name) / sel(salary>75000) / scan(emp)", comp: 3, dir: "down" });
+        s.push({ lbl: "Optimize to physical plan", sub: "seq-scan vs index, add sort", comp: 3, dir: "down" });
+      } else {
+        s.push({ lbl: "Compile to VDBE bytecode", sub: "one pass: bind, rewrite, optimize, codegen", comp: 3, dir: "down" });
+      }
+      s.push({ lbl: "Access method asks for pages", sub: "request heap / index pages by page id", comp: 4, dir: "down" });
+      s.push({ lbl: "Buffer pool + storage", sub: "fetch page, decode slotted tuples", comp: 4, dir: "down" });
+      // unwind: one FETCH per result row
+      for (var r = 1; r <= rows; r++) {
+        s.push({ lbl: "Unwind: build result row " + r, sub: "tuple bubbles up through executor", comp: 3, dir: "up", fetch: r });
+      }
+      s.push({ lbl: "Ship rows to client", sub: rows + " name value(s) returned", comp: 1, dir: "up" });
+      return s;
+    }
+
+    var stages = buildStages("pg", 2);
+
+    // five component bands on the left as context
+    var comps = [
+      { n: 1, y: 18, h: 40, lbl: "1 Comms" },
+      { n: 2, y: 66, h: 40, lbl: "2 Process" },
+      { n: 3, y: 114, h: 110, lbl: "3 Query processor" },
+      { n: 4, y: 232, h: 70, lbl: "4 Storage" }
+    ];
+
+    function render(i) {
+      svg.innerHTML = "";
+      var defs = DBMS.svg("defs", {});
+      var m = DBMS.svg("marker", { id: "w1-arr", markerWidth: 10, markerHeight: 10, refX: 7, refY: 3, orient: "auto" });
+      m.appendChild(DBMS.svg("path", { d: "M0,0 L7,3 L0,6 Z", fill: "var(--query)" }));
+      defs.appendChild(m);
+      svg.appendChild(defs);
+
+      var cur = stages[i] || stages[stages.length - 1];
+
+      // component bands
+      comps.forEach(function (c) {
+        var active = cur && cur.comp === c.n;
+        svg.appendChild(DBMS.svg("rect", {
+          x: 14, y: c.y, width: 160, height: c.h, rx: 6,
+          fill: active ? "var(--query-bg)" : "#fffdf8",
+          stroke: active ? "var(--query)" : "var(--rule)",
+          "stroke-width": active ? 2 : 1
+        }));
+        svg.appendChild(DBMS.svg("text", { x: 24, y: c.y + 24, class: "svg-mono" }, c.lbl));
+      });
+
+      // the moving token, drawn on the right as a descending/ascending chip column
+      var colX = 210, colTop = 18, rowH = 30;
+      stages.forEach(function (st, k) {
+        var done = k < i;
+        var isCur = k === i;
+        var y = colTop + k * rowH;
+        if (y > 332) return; // clip overly long traces (rare)
+        var fill = isCur ? "var(--query)" : (done ? "var(--query-bg)" : "#fffdf8");
+        var stroke = isCur ? "var(--query)" : (done ? "var(--query)" : "var(--rule)");
+        svg.appendChild(DBMS.svg("rect", {
+          x: colX, y: y, width: 496, height: rowH - 6, rx: 4,
+          fill: fill, stroke: stroke,
+          "stroke-dasharray": st.dir === "up" ? "4 3" : "0"
+        }));
+        var arrow = st.dir === "down" ? "▼ " : "▲ ";
+        svg.appendChild(DBMS.svg("text", {
+          x: colX + 10, y: y + 16, class: "svg-label",
+          fill: isCur ? "#fff" : "var(--ink-soft)"
+        }, arrow + st.lbl));
+      });
+
+      var phase = cur.dir === "down" ? "descending" : "unwinding";
+      var note = cur.sub;
+      var extra = "";
+      if (cur.fetch) extra = "   FETCH " + cur.fetch + "/" + rowsInput.value;
+      readout.textContent = "step " + i + "/" + stages.length + "   phase: " + phase + "\n" +
+        cur.lbl + "  ->  " + note + extra;
+    }
+
+    function rebuild() {
+      rowsOut.textContent = rowsInput.value;
+      stages = buildStages(engineSel.value, parseInt(rowsInput.value, 10));
+      step.goto(0);
+    }
+
+    var step = DBMS.stepper({
+      controls: document.getElementById("w1-controls"),
+      steps: function () { return stages.length - 1; },
+      onRender: render,
+      labels: { step: "Step down", reset: "Restart" },
+      autoMs: 750
+    });
+
+    engineSel.addEventListener("change", rebuild);
+    rowsInput.addEventListener("input", rebuild);
+    rebuild();
+  })();
+  </script>
+
+  <!-- ===== A DATABASE IS A SERVER ===== -->
+  <h2>Why a database is a server, not a library</h2>
+
+  <p>A SELECT against a local CSV file is a function call. A SELECT against a real engine crosses into a process
+  that may be serving hundreds of other callers at the same instant. Two design questions fall out of that, and
+  both shape component 2.</p>
+
+  <h3>Workers: process per worker versus thread per worker</h3>
+
+  <p>The worker that runs your SQL has to be realized as something the operating system schedules. There are three
+  baseline models [<a href="https://dsf.berkeley.edu/papers/fntdb07-architecture.pdf">survey §2.1</a>]:</p>
+
+  <table>
+    <caption>How a DBMS worker is realized, and what each choice trades.</caption>
+    <thead><tr><th>Model</th><th>Realization</th><th>Wins</th><th>Used by</th></tr></thead>
+    <tbody>
+      <tr><td>Process per worker</td><td>one OS process per connection</td><td>OS isolation and tooling, simple to build</td><td>DB2, PostgreSQL, Oracle</td></tr>
+      <tr><td>Thread per worker</td><td>one thread per connection in one process</td><td>scales to many connections, less per-worker state</td><td>SQL Server, MySQL, Informix</td></tr>
+      <tr><td>Process pool</td><td>bounded pool of reused processes</td><td>memory efficient, bounds concurrency</td><td>Oracle, DB2 (option)</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout why">
+    <div class="callout-title">Why thread-per-worker scales better, and the catch</div>
+    <p>A process carries a private address space, OS resource handles, and a security context. Switching between
+    processes means switching all of that, which is heavier than switching between threads that share one address
+    space. So thread per worker scales to more concurrent connections. The catch is that threads share memory with
+    no protection, so one buggy operator can corrupt another worker's state, and race conditions are harder to
+    debug. The deeper catch undercuts the apparent isolation of process per worker too: the buffer pool and the
+    lock table must be <i>shared</i> across all workers, so even the process model puts them in OS shared memory.
+    Isolation is therefore partial in both designs.</p>
+  </div>
+
+  <h3>Admission control: stopping thrashing before it starts</h3>
+
+  <p>If every arriving query started immediately, throughput would climb to a peak and then collapse, because the
+  working set of pages would no longer fit in the buffer pool and the system would spend its time shuffling pages
+  to and from disk. That collapse is <i>thrashing</i>. Admission control prevents it by refusing or deferring work
+  when resources are tight, so the system <i>degrades gracefully</i>: latency rises with arrival rate while
+  throughput stays at its peak.</p>
+
+  <div class="callout realworld">
+    <div class="callout-title">In real systems</div>
+    <p>The survey describes admission control in two tiers
+    [<a href="https://dsf.berkeley.edu/papers/fntdb07-architecture.pdf">§2.4</a>]. A dispatcher-level check caps
+    the number of client connections. Then an <i>execution admission controller</i> inside the query processor
+    runs <i>after</i> parse and optimize, because only then does the optimizer know the query's estimated memory
+    footprint (including sort and hash space). Memory pressure in the buffer pool, driven by sorts and hash joins,
+    is the usual cause of thrashing; lock contention is the secondary cause. This is why admission control is keyed
+    mainly on estimated memory.</p>
+  </div>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 520 200" role="img" aria-label="Throughput versus load with and without admission control">
+      <line x1="50" y1="170" x2="500" y2="170" stroke="var(--ink-soft)"/>
+      <line x1="50" y1="170" x2="50" y2="20" stroke="var(--ink-soft)"/>
+      <text x="275" y="194" text-anchor="middle" class="svg-label">offered load (arrival rate)</text>
+      <text x="16" y="95" text-anchor="middle" class="svg-label" transform="rotate(-90 16 95)">throughput</text>
+      <!-- without admission control: rises then collapses -->
+      <path d="M50,170 C150,60 230,40 290,40 C340,40 380,120 500,165" fill="none" stroke="var(--storage)" stroke-width="2"/>
+      <text x="430" y="140" class="svg-label sm" fill="var(--storage)">no control: thrashes</text>
+      <!-- with admission control: rises then plateaus -->
+      <path d="M50,170 C150,60 230,42 290,42 L500,42" fill="none" stroke="var(--query)" stroke-width="2" stroke-dasharray="5 3"/>
+      <text x="360" y="34" class="svg-label sm" fill="var(--query)">with control: graceful plateau</text>
+    </svg>
+    <figcaption><b>Figure 2.</b> Without admission control, throughput peaks then collapses as the buffer pool
+    overflows. With it, throughput holds at the peak and only latency degrades. This is the curve component 2 is
+    built to flatten.</figcaption>
+  </figure>
+
+  <!-- ===== TWO ENGINES ===== -->
+  <h2>Two real engines, same front, different back</h2>
+
+  <p>Every relational engine starts a query the same way: tokenize, parse to a tree. They diverge on how they run
+  it. The contrast worth holding is between PostgreSQL and SQLite.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 720 220" role="img" aria-label="PostgreSQL named tree stages versus SQLite VDBE bytecode">
+      <defs>
+        <marker id="w1d-arr" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto">
+          <path d="M0,0 L7,3 L0,6 Z" fill="var(--ink-soft)"/>
+        </marker>
+      </defs>
+      <text x="180" y="24" text-anchor="middle" class="svg-mono" fill="var(--query)">PostgreSQL</text>
+      <text x="540" y="24" text-anchor="middle" class="svg-mono" fill="var(--storage)">SQLite</text>
+
+      <!-- PG chain -->
+      <g>
+        <rect x="40" y="40" width="280" height="28" rx="4" fill="var(--query-bg)" stroke="var(--query)"/>
+        <text x="180" y="58" text-anchor="middle" class="svg-label">string -> raw parse tree (flex + bison)</text>
+        <rect x="40" y="80" width="280" height="28" rx="4" fill="var(--query-bg)" stroke="var(--query)"/>
+        <text x="180" y="98" text-anchor="middle" class="svg-label">analyze -> Query tree (typed)</text>
+        <rect x="40" y="120" width="280" height="28" rx="4" fill="var(--query-bg)" stroke="var(--query)"/>
+        <text x="180" y="138" text-anchor="middle" class="svg-label">rewrite -> Query tree (views expanded)</text>
+        <rect x="40" y="160" width="280" height="28" rx="4" fill="var(--query-bg)" stroke="var(--query)"/>
+        <text x="180" y="178" text-anchor="middle" class="svg-label">plan -> Plan tree, tree-walking executor</text>
+        <line x1="180" y1="68" x2="180" y2="78" stroke="var(--ink-soft)" marker-end="url(#w1d-arr)"/>
+        <line x1="180" y1="108" x2="180" y2="118" stroke="var(--ink-soft)" marker-end="url(#w1d-arr)"/>
+        <line x1="180" y1="148" x2="180" y2="158" stroke="var(--ink-soft)" marker-end="url(#w1d-arr)"/>
+      </g>
+
+      <!-- SQLite chain -->
+      <g>
+        <rect x="400" y="40" width="280" height="28" rx="4" fill="var(--storage-bg)" stroke="var(--storage)"/>
+        <text x="540" y="58" text-anchor="middle" class="svg-label">string -> AST (tokenizer + Lemon LALR)</text>
+        <rect x="400" y="100" width="280" height="48" rx="4" fill="var(--storage-bg)" stroke="var(--storage)"/>
+        <text x="540" y="120" text-anchor="middle" class="svg-label">code generator: one pass does</text>
+        <text x="540" y="138" text-anchor="middle" class="svg-label sm">bind, rewrite, optimize, emit bytecode</text>
+        <rect x="400" y="160" width="280" height="28" rx="4" fill="var(--storage-bg)" stroke="var(--storage)"/>
+        <text x="540" y="178" text-anchor="middle" class="svg-label">VDBE bytecode, register VM runs it</text>
+        <line x1="540" y1="68" x2="540" y2="98" stroke="var(--ink-soft)" marker-end="url(#w1d-arr)"/>
+        <line x1="540" y1="148" x2="540" y2="158" stroke="var(--ink-soft)" marker-end="url(#w1d-arr)"/>
+      </g>
+    </svg>
+    <figcaption><b>Figure 3.</b> Both engines tokenize and parse to a tree. PostgreSQL keeps explicit, separately
+    named stages (raw parse tree, Query tree, Plan tree) and a tree-walking iterator executor. SQLite collapses
+    analysis through code generation into one pass and runs flat VDBE bytecode on a register virtual machine.</figcaption>
+  </figure>
+
+  <div class="callout realworld">
+    <div class="callout-title">In real systems</div>
+    <p>PostgreSQL's path of a query has five named stages: connection, parser, rewrite system, planner/optimizer,
+    executor [<a href="https://www.postgresql.org/docs/current/query-path.html">PG path of a query</a>]. Its lexer
+    lives in <code>scan.l</code> (compiled by flex) and its grammar in <code>gram.y</code> (compiled by bison)
+    [<a href="https://www.postgresql.org/docs/current/parser-stage.html">PG parser stage</a>]. SQLite instead
+    "translates the SQL into bytecode," which it calls analogous to converting a program into machine code, and you
+    can see that bytecode by typing <code>EXPLAIN</code> before a statement
+    [<a href="https://www.sqlite.org/howitworks.html">SQLite architecture</a>]. Same tokenizer-then-grammar front;
+    a tree executor versus a bytecode VM at the back.</p>
+  </div>
+
+  <!-- ===== THE COURSE MAP ===== -->
+  <h2>The slab: every week on the stack</h2>
+
+  <p>This is the figure to keep open in another tab for the rest of the course. Each later week owns one layer of
+  the engine. When a topic feels disconnected, find its slab here.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 520 300" role="img" aria-label="Course weeks mapped onto engine layers">
+      <g font-family="var(--sans)">
+        <rect x="60" y="20" width="400" height="34" rx="4" fill="var(--query-bg)" stroke="var(--query)"/>
+        <text x="80" y="41" class="svg-label">Query layer</text>
+        <text x="440" y="41" text-anchor="end" class="svg-mono">w1, 8, 9, 10, 11</text>
+
+        <rect x="60" y="62" width="400" height="34" rx="4" fill="#f3e6f8" stroke="#6b3bb0"/>
+        <text x="80" y="83" class="svg-label">Index structures</text>
+        <text x="440" y="83" text-anchor="end" class="svg-mono">w6, 7</text>
+
+        <rect x="60" y="104" width="400" height="34" rx="4" fill="#e6ebf1" stroke="#4a5b73"/>
+        <text x="80" y="125" class="svg-label">Buffer pool</text>
+        <text x="440" y="125" text-anchor="end" class="svg-mono">w4, 5</text>
+
+        <rect x="60" y="146" width="400" height="34" rx="4" fill="var(--storage-bg)" stroke="var(--storage)"/>
+        <text x="80" y="167" class="svg-label">Storage engine</text>
+        <text x="440" y="167" text-anchor="end" class="svg-mono">w2, 3</text>
+
+        <rect x="60" y="196" width="400" height="34" rx="4" fill="#efe6f8" stroke="#6b3bb0"/>
+        <text x="80" y="217" class="svg-label">Transactions and concurrency</text>
+        <text x="440" y="217" text-anchor="end" class="svg-mono">w12, 13</text>
+
+        <rect x="60" y="238" width="400" height="34" rx="4" fill="#e3f3ea" stroke="#2f7d5b"/>
+        <text x="80" y="259" class="svg-label">Logging and recovery</text>
+        <text x="440" y="259" text-anchor="end" class="svg-mono">w14</text>
+      </g>
+      <text x="260" y="290" text-anchor="middle" class="svg-label sm">Modern and distributed (w15, 16) recompose every layer above.</text>
+    </svg>
+    <figcaption><b>Figure 4.</b> The course walks the stack twice: a SELECT down the read path (weeks 1, 8, 11, 9,
+    10, 6, 7, 4, 5, 2, 3) and an UPDATE down the write path (weeks 12, 13, 14, back through 4, 5, 2, 3). Weeks 15
+    and 16 do not add a layer; they rebuild these layers under new pressure.</figcaption>
+  </figure>
+
+  <div class="callout gotcha">
+    <div class="callout-title">Exam trap</div>
+    <p>Two traps live in this lesson. First, do not put name and type checking in the parser: the parser is pure
+    syntax, and existence, types, and authorization are the <i>binding</i> step. Second, do not say thread per
+    worker gives perfect isolation between connections: threads share one address space with no memory protection,
+    and even the process model shares the buffer pool and lock table. The "which is false" questions below lean on
+    both.</p>
+  </div>
+
+  <!-- ===== ALGORITHM / SUMMARY ===== -->
+  <h3>The life of a query, in order</h3>
+  <ol class="steps">
+    <li>The client communications manager accepts the SQL string on an existing connection.</li>
+    <li>The process manager assigns a worker (1:1 with the client) and runs admission control: run now or defer.</li>
+    <li>The query processor authorizes, parses to a raw tree (syntax only), binds against the catalog (types, existence), rewrites, optimizes to a physical plan, then executes.</li>
+    <li>Execution drives access methods, which request pages from the buffer pool, which reads them from the storage manager on a miss.</li>
+    <li>Tuples unwind back up: storage to buffer to access method to executor to communications manager, one FETCH batch at a time, to the client.</li>
+  </ol>
+
+  <details class="deepdive">
+    <summary>Deeper: why large result sets cause repeated FETCH iterations</summary>
+    <div>
+    <p>The executor does not build the whole answer and hand it back in one shot. It produces tuples on demand, and
+    the client pulls them "one at a time or in small batches"
+    [<a href="https://dsf.berkeley.edu/papers/fntdb07-architecture.pdf">survey §4</a>]. A large result set therefore
+    causes repeated FETCH iterations that cycle through the communications manager, the executor, and the storage
+    manager. This is the same demand-driven, pull-based shape that the Volcano iterator model formalizes in week 9:
+    parents pull, children produce one tuple per call. The simulator's "result rows" control models exactly this
+    repeated unwind.</p>
+    </div>
+  </details>
+
+  <!-- ===== RETRIEVAL PRACTICE ===== -->
+  <h2>Check yourself</h2>
+
+  <div class="mcq" data-answer="2">
+    <p class="mcq-q">Deciding whether to begin a query now or defer it until memory is available belongs to which component?</p>
+    <button class="mcq-opt">The relational query processor, since it owns the whole plan.</button>
+    <button class="mcq-opt">The transactional storage manager, since memory is its concern.</button>
+    <button class="mcq-opt">The process manager, through its admission control policy.</button>
+    <button class="mcq-opt">The client communications manager, where the request arrives.</button>
+    <p class="mcq-explain">Admission control is a process-manager job, though the execution-tier admission check runs after the query processor has optimized and can estimate memory footprint. It is not the storage manager's call, and the communications manager only handles connection state and shipping results.</p>
+  </div>
+
+  <div class="mcq" data-answer="1">
+    <p class="mcq-q">Which statement about process-per-worker versus thread-per-worker is false?</p>
+    <button class="mcq-opt">Thread per worker scales to more connections because a thread carries less state.</button>
+    <button class="mcq-opt">Process per worker fully isolates workers because the buffer pool stays private to each.</button>
+    <button class="mcq-opt">Threads in one process share memory with no protection between them.</button>
+    <button class="mcq-opt">PostgreSQL uses process per worker while SQL Server multiplexes over a thread pool.</button>
+    <p class="mcq-explain">The false claim is that process per worker fully isolates workers. The buffer pool and lock table must be shared across all workers, so they live in OS shared memory even in the process model, which undercuts the isolation. The other three statements are accurate.</p>
+  </div>
+
+  <div class="mcq" data-answer="3">
+    <p class="mcq-q">In the pipeline, which stage first resolves the name <code>emp</code> to a real table and attaches a type to <code>salary</code>?</p>
+    <button class="mcq-opt">The parser, while it builds the raw parse tree from tokens.</button>
+    <button class="mcq-opt">The optimizer, while it costs sequential against index scans.</button>
+    <button class="mcq-opt">The rewriter, while it expands views and folds constants.</button>
+    <button class="mcq-opt">The binding step, which consults the catalog after parsing.</button>
+    <button class="mcq-opt">The executor, while it pulls tuples through access methods.</button>
+    <p class="mcq-explain">Name resolution, existence checks, type attachment, and authorization happen in binding (analysis), which runs after the parser. The parser applies only syntactic rules and makes no catalog lookups, because a catalog lookup needs a transaction. The rewriter and optimizer operate on the already-bound query tree.</p>
+  </div>
+
+  <div class="mcq" data-answer="0">
+    <p class="mcq-q">Which statement about admission control and thrashing is false?</p>
+    <button class="mcq-opt">Thrashing is caused only by lock contention, never by memory pressure.</button>
+    <button class="mcq-opt">Good admission control gives graceful degradation: latency rises but throughput holds.</button>
+    <button class="mcq-opt">The execution-tier check runs after optimize, when memory footprint is known.</button>
+    <button class="mcq-opt">Sorts and hash joins are the operators most likely to overflow the buffer pool.</button>
+    <p class="mcq-explain">The false statement names lock contention as the only cause. The survey identifies buffer-pool memory pressure (driven by sorts and hash joins) as the usual cause of thrashing, with lock contention secondary. That is exactly why admission control keys on the optimizer's estimated memory footprint.</p>
+  </div>
+
+  <div class="mcq" data-answer="2">
+    <p class="mcq-q">Comparing how PostgreSQL and SQLite execute the same SELECT, which statement is false?</p>
+    <button class="mcq-opt">Both tokenize the string and build a tree before doing anything engine-specific.</button>
+    <button class="mcq-opt">PostgreSQL keeps named tree stages and runs a tree-walking executor.</button>
+    <button class="mcq-opt">SQLite skips parsing entirely and interprets the SQL string directly.</button>
+    <button class="mcq-opt">SQLite compiles the statement to VDBE bytecode run on a register VM.</button>
+    <p class="mcq-explain">SQLite does not skip parsing. It tokenizes and parses to an AST with its Lemon LALR(1) parser, then a code generator compiles the AST to VDBE bytecode. The front of both engines is identical; only the back differs (tree executor versus bytecode VM).</p>
+  </div>
+
+  <!-- ===== FLASHCARDS ===== -->
+  <div class="flashcard">
+    <div class="fc-front">Name the five components of a relational engine and the one job of each.</div>
+    <div class="fc-back">Client communications manager (connection state, ship results), process manager (assign worker, admission control), relational query processor (authorize, compile, execute), transactional storage manager (access methods, buffer, lock, log), shared catalog and memory (consulted by almost every query).</div>
+  </div>
+
+  <div class="flashcard">
+    <div class="fc-front">In order, what artifact does each pipeline stage hand on?</div>
+    <div class="fc-back">Parse -> raw parse tree, bind -> typed query tree, rewrite -> logical plan (relational algebra), optimize -> physical plan (concrete operators), execute -> result tuples. Then the stack unwinds back to the client.</div>
+  </div>
+
+  <!-- ===== VIVA (paper week) ===== -->
+  <h2>Paper viva: Architecture of a Database System</h2>
+
+  <p>This week's assigned paper is Hellerstein, Stonebraker, and Hamilton's survey. Try each examiner question out
+  loud before opening the model answer.</p>
+
+  <div class="callout viva">
+    <div class="callout-title">Viva prompt 1</div>
+    <p>Name the five components of an RDBMS and say what each one does for a single query.</p>
+  </div>
+  <details class="deepdive">
+    <summary>Model answer</summary>
+    <div>
+    <p>The five components are the client communications manager (establishes and remembers connection state and
+    ships data and control messages back), the process manager (assigns a thread of computation, the DBMS worker,
+    and performs admission control), the relational query processor (checks authorization, compiles SQL into a
+    query plan, and runs it through the plan executor), the transactional storage manager (access methods, buffer
+    manager, lock manager for isolation, and log manager for durability and rollback), and the shared components
+    and utilities (catalog manager and memory manager, used during essentially every query, plus replication,
+    loaders, backup, and monitoring). They are introduced in Section 1.1 via the airport gate-agent query and
+    shown in Figure 1.1.</p>
+    </div>
+  </details>
+
+  <div class="callout viva">
+    <div class="callout-title">Viva prompt 2</div>
+    <p>What is the mapping between DBMS clients and DBMS workers, and why does it matter for the process models?</p>
+  </div>
+  <details class="deepdive">
+    <summary>Model answer</summary>
+    <div>
+    <p>The mapping is 1:1: one DBMS worker handles all the SQL from one DBMS client (Section 2). It matters because
+    the three process models differ only in how that worker is realized. Process per worker maps the worker onto an
+    OS process; thread per worker maps it onto an OS thread inside one shared process; process pool borrows a
+    process from a bounded pool for the duration of a statement and returns it. The choice changes memory footprint,
+    isolation, and scalability, but the 1:1 worker-to-client relationship is constant across all three.</p>
+    </div>
+  </details>
+
+  <div class="callout viva">
+    <div class="callout-title">Viva prompt 3</div>
+    <p>What is admission control, why is it needed, and where in the engine does it sit?</p>
+  </div>
+  <details class="deepdive">
+    <summary>Model answer</summary>
+    <div>
+    <p>Admission control refuses or defers new work unless resources are available, which prevents thrashing and
+    produces graceful degradation: as load rises, latency increases proportionally while throughput stays at its
+    peak instead of collapsing (Section 2.4). It is needed because, left unchecked, the working set of pages
+    eventually exceeds the buffer pool and the system spends its time shuffling pages to and from disk; sorting and
+    hash joins are the worst offenders, and lock contention is a secondary cause. It sits in two tiers: a simple
+    dispatcher-level check that caps the number of client connections, and an execution admission controller inside
+    the relational query processor that runs after parse and optimize and decides whether to postpone the query,
+    start it with fewer resources, or start it unconstrained. The second tier runs after optimization because only
+    then is the query's estimated memory footprint, including sort and hash space, known.</p>
+    </div>
+  </details>
+
+  <!-- ===== PRIMARY SOURCE ===== -->
+  <div class="source-box">
+    <div class="src-tag">Primary source</div>
+    <div class="src-title">Architecture of a Database System (Hellerstein, Stonebraker, Hamilton, 2007)</div>
+    <p class="muted">The canonical end-to-end picture of how a SQL statement traverses the engine. Read Section 1
+    and study Figure 1.1, the five components and the gate-agent walkthrough, then skim Section 2.4 on admission
+    control. This is the assigned paper for the week 1 viva.
+    <a href="https://dsf.berkeley.edu/papers/fntdb07-architecture.pdf">dsf.berkeley.edu/papers/fntdb07-architecture.pdf</a></p>
+  </div>
+
+  <!-- ===== ASK YOUR TEACHER ===== -->
+  <div class="ask-teacher">
+    <div class="at-tag">Ask your teacher</div>
+    <p>Want me to redraw the five-component diagram for a write instead of a read, walk the SQLite bytecode for our
+    SELECT, or quiz you on the pipeline artifacts until you can name them cold? Ask. I am your teacher for this
+    course, not just a document.</p>
+  </div>
+
+  <!-- ===== NAV ===== -->
+  <nav class="lesson-nav">
+    <a class="prev" href="../index.html">
+      <span class="nav-dir">Previous</span>
+      <span class="nav-title">Course map</span>
+    </a>
+    <a class="next" href="0002-storage-engine-disk-pages.html">
+      <span class="nav-dir">Next</span>
+      <span class="nav-title">Week 02 · Storage engine: disk layout, pages, and slotted records</span>
+    </a>
+  </nav>
+
+  </div><!-- /.col -->
+</main>
+</body>
+</html>

@@ -1,0 +1,886 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lesson 11 · Query optimization: cost, selectivity, and join ordering · Field Guide to the Database Engine</title>
+<link rel="stylesheet" href="../assets/course.css">
+<script defer src="../assets/components.js"></script>
+</head>
+<body class="layer-query">
+<main class="page">
+
+  <!-- ===== MASTHEAD ===== -->
+  <header class="masthead col">
+    <div class="crumbs">
+      <a href="../index.html">Field Guide</a> <span>/</span>
+      <span>Part V · Query processing</span> <span>/</span>
+      <span>Week 11</span>
+    </div>
+    <span class="week-badge">Query optimizer</span>
+    <h1>Query optimization: cost, selectivity, and join ordering</h1>
+    <p class="lede">A query has thousands of equivalent plans, and the slowest is often millions of times
+    slower than the fastest. They all return the same rows. This lesson is about how the engine looks at
+    that pile and reaches for a good one without ever running them.</p>
+  </header>
+
+  <div class="col">
+
+  <!-- ===== OBJECTIVES ===== -->
+  <div class="objectives">
+    <h4>By the end you can</h4>
+    <ul>
+      <li>Explain why a declarative query forces the engine to search an exponential plan space, and why a fixed rule list is not enough.</li>
+      <li>Read and apply the System R cost model and selectivity factors, and say where the uniformity and independence assumptions break.</li>
+      <li>Walk the Selinger dynamic program over relation subsets, the left-deep restriction, and why interesting orders are kept.</li>
+      <li>Tell a clustered scan from a non-clustered one by cost, and find the selectivity crossover where a full scan beats an index.</li>
+      <li>Answer the "which is false" traps about optimality, index preference, and ANDed selectivities.</li>
+    </ul>
+  </div>
+
+  <!-- ===== WHERE THIS SITS (connective tissue) ===== -->
+  <p>Stay on the one query the course follows down the stack:</p>
+
+  <pre><code><span class="tok-kw">SELECT</span> name <span class="tok-kw">FROM</span> emp <span class="tok-kw">WHERE</span> salary &gt; <span class="tok-num">75000</span> <span class="tok-kw">ORDER BY</span> name;</code></pre>
+
+  <p>The <a href="0008-query-parsing.html">parser and rewriter (week 8)</a> already handed this layer a
+  logical plan: a projection of <code>name</code> over a selection of <code>salary &gt; 75000</code> over a
+  scan of <code>emp</code>, with a sort for the <code>ORDER BY</code>. A logical plan says <em>what</em>, not
+  <em>how</em>. It does not say whether to read <code>emp</code> with a sequential scan or an index on
+  <code>salary</code>, and it does not say whether the sort can be skipped because some access path already
+  returns rows in <code>name</code> order. This week owns those decisions. The optimizer turns the logical
+  plan into a physical plan, a tree of concrete operators, and hands it to the
+  <a href="0009-query-execution-volcano.html">Volcano executor (week 9)</a>, which runs it as a tree of
+  open / next / close iterators. When the optimizer chooses an index scan, it leans on the
+  <a href="0006-btree-search-insert.html">B+tree (week 6)</a>; when it costs a join, it picks among the
+  algorithms from <a href="0010-query-execution-joins.html">week 10</a>. Every page-count term in its cost
+  model is a request that will eventually go through the <a href="0004-buffer-pool-design.html">buffer pool
+  (week 4)</a> to <a href="0002-storage-engine-disk-pages.html">storage (week 2)</a>.</p>
+
+  <p>So the optimizer sits in the middle of journey 1. Above it: a logical algebra tree. Below it: an
+  executor that will faithfully run whatever physical tree it is handed, fast plan or catastrophe alike.
+  The executor never second-guesses. That is exactly why this layer carries the whole weight of the
+  decision.</p>
+
+  <div class="callout intuition">
+    <div class="callout-title">Intuition</div>
+    <p>Think of the optimizer as a travel planner with no way to test-drive any route. It cannot run a plan
+    to see how slow it is, because running it is the expensive thing you are trying to avoid. So it
+    estimates: it guesses how many rows survive each filter, multiplies those guesses by how many disk pages
+    and CPU calls each operator will cost, adds it all up into one number, and compares numbers. The
+    estimates are often wrong in absolute terms. The bet is that they are right enough in <em>relative</em>
+    terms to rank a good plan above a disastrous one.</p>
+  </div>
+
+  <!-- ===== THE PROBLEM ===== -->
+  <h2>Why search at all</h2>
+
+  <p>Three choices sit inside a query, and each is independent of the others. For every table you pick an
+  access path: a full scan, or a scan of one of the available indexes. For every join you pick a method:
+  nested loop, sort-merge, or hash. And you pick the order in which to join the tables. The choices
+  multiply. For <code>n</code> tables in the <code>FROM</code> list there are already <code>n!</code> join
+  orders, and Selinger names exactly this, "n factorial permutations of relation join orders," in the 1979
+  System&nbsp;R paper [<a href="https://people.eecs.berkeley.edu/~brewer/cs262/3-selinger79.pdf">Selinger&nbsp;1979, &sect;5</a>].
+  Multiply by access paths per table and methods per join, and the plan space is far too large to walk.</p>
+
+  <p>The plans are not close together in cost. They differ by orders of magnitude. A plan that scans an
+  index and merges might touch a few hundred pages; the same query run as full scans feeding a Cartesian
+  product can touch billions, for the same answer. The single worst mistake is to evaluate a cross product
+  first and filter afterward, so that an operator builds a huge intermediate result that the
+  <code>WHERE</code> clause then throws almost all of away.</p>
+
+  <div class="callout why">
+    <div class="callout-title">Why a fixed rule list is not enough</div>
+    <p>The naive design is a rule-based optimizer: a fixed priority list of transformations applied without
+    looking at the data. The classic rule is "prefer an index over a full scan, always." It is cheap and
+    predictable, and it is wrong whenever the predicate matches most of the table. Suppose
+    <code>salary &gt; 75000</code> selects 90 percent of <code>emp</code>. A non-clustered index scan then
+    chases roughly one heap page per matching row, while a full scan reads each page once. The index loses
+    badly, but the rule cannot see that because it never asked how many rows survive. The data, not the
+    query shape, decides. That is the case for a <em>cost-based</em> optimizer that estimates and compares,
+    which is what System&nbsp;R, PostgreSQL, and SQLite all are at their core
+    [<a href="https://www.postgresql.org/docs/current/runtime-config-query.html">PG query planning</a>].</p>
+  </div>
+
+  <!-- ===== COST MODEL ===== -->
+  <h2>The cost model: one number from I/O and CPU</h2>
+
+  <p>To compare plans you need a single comparable quantity. System&nbsp;R blends disk work and CPU work into
+  one weighted sum:</p>
+
+  <pre><code><span class="tok-com"># System R cost (Selinger 1979, section 4)</span>
+COST = PAGE_FETCHES + W * (RSI_CALLS)</code></pre>
+
+  <p><code>PAGE_FETCHES</code> is the I/O term, the number of pages read. <code>RSI_CALLS</code> is the
+  number of tuples returned across the storage interface, standing in for CPU because "most of System&nbsp;R's
+  CPU time is spent in the RSS"
+  [<a href="https://people.eecs.berkeley.edu/~brewer/cs262/3-selinger79.pdf">Selinger&nbsp;1979, &sect;4</a>].
+  <code>W</code> is an adjustable weight between I/O and CPU. The unit is artificial. Nobody claims the
+  number is seconds. Only the relative ordering of two plans' costs is meaningful, which is the whole point:
+  the optimizer needs to rank, not to predict wall-clock time.</p>
+
+  <div class="callout gotcha">
+    <div class="callout-title">Exam trap</div>
+    <p>"Cost is measured in seconds" is false, and so is "the optimizer finds the optimal plan." Cost is a
+    unitless weighted number. And Selinger's own validation found the predicted-optimal plan was "often not
+    accurate in absolute value," yet the <em>ordering</em> of estimated costs usually matched the ordering
+    of measured costs
+    [<a href="https://people.eecs.berkeley.edu/~brewer/cs262/3-selinger79.pdf">Selinger&nbsp;1979, &sect;7</a>].
+    The optimizer finds a good plan under estimates and reliably dodges disasters. It does not prove
+    optimality.</p>
+  </div>
+
+  <h3>Single-relation access costs and why clustering matters</h3>
+
+  <p>The selectivity factor <code>F</code> is the fraction of rows a predicate passes. The access-cost
+  formulas (Selinger Table&nbsp;2) show how an index changes the I/O term. <code>TCARD</code> is the number
+  of data pages holding the relation, <code>NCARD</code> is its tuple count, <code>NINDX</code> is the
+  number of pages in the index, and <code>P</code> is the fraction of data pages that actually hold this
+  relation's tuples.</p>
+
+  <table>
+    <caption>How the access path changes the page-fetch term (Selinger Table 2, CPU term omitted for clarity).</caption>
+    <thead><tr><th>Access path</th><th>Page-fetch cost</th><th>Reads to scale with</th></tr></thead>
+    <tbody>
+      <tr><td>Clustered index, matching predicate</td><td><code>F * (NINDX + TCARD)</code></td><td>data <b>pages</b> (TCARD)</td></tr>
+      <tr><td>Non-clustered index, matching predicate</td><td><code>F * (NINDX + NCARD)</code></td><td>matching <b>tuples</b> (NCARD)</td></tr>
+      <tr><td>Full (segment) scan</td><td><code>TCARD / P</code></td><td>every data page once</td></tr>
+    </tbody>
+  </table>
+
+  <p>The structural point is the <code>TCARD</code>-versus-<code>NCARD</code> swap. A clustered index stores
+  rows in roughly the index order, so a range scan touches the selected fraction of the data <em>pages</em>
+  in sequence: cost tracks <code>TCARD</code>. A non-clustered index has no control over physical placement,
+  so in the worst case every matching tuple sits on its own page, and the cost tracks the matching
+  <em>tuple</em> count <code>NCARD</code>. Because <code>NCARD</code> is usually much larger than
+  <code>TCARD</code> (many tuples per page), a non-clustered index gets expensive fast as <code>F</code>
+  grows, and at some selectivity the full scan <code>TCARD/P</code> wins. That crossover is the entire
+  reason clustering matters, and it is the death of the "index is always faster" rule.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 560 250" role="img" aria-label="Access cost versus selectivity with a crossover point">
+      <!-- axes -->
+      <line x1="60" y1="20" x2="60" y2="210" stroke="var(--ink-soft)"/>
+      <line x1="60" y1="210" x2="520" y2="210" stroke="var(--ink-soft)"/>
+      <text x="20" y="120" text-anchor="middle" class="svg-label" transform="rotate(-90 20 120)">cost (page fetches)</text>
+      <text x="290" y="240" text-anchor="middle" class="svg-label">selectivity F (fraction of rows matched)</text>
+      <text x="60" y="225" text-anchor="middle" class="svg-label sm">0</text>
+      <text x="520" y="225" text-anchor="middle" class="svg-label sm">1</text>
+      <!-- full scan: flat line -->
+      <line x1="60" y1="120" x2="520" y2="120" stroke="var(--ink)" stroke-width="2" stroke-dasharray="6 4"/>
+      <text x="470" y="112" class="svg-label sm">full scan TCARD/P</text>
+      <!-- clustered: gentle slope -->
+      <line x1="60" y1="195" x2="520" y2="150" stroke="var(--good)" stroke-width="2"/>
+      <text x="320" y="178" class="svg-label sm" fill="var(--good)">clustered F*(NINDX+TCARD)</text>
+      <!-- non-clustered: steep slope -->
+      <line x1="60" y1="200" x2="430" y2="20" stroke="var(--query)" stroke-width="2"/>
+      <text x="360" y="40" class="svg-label sm" fill="var(--query)">non-clustered F*(NINDX+NCARD)</text>
+      <!-- crossover marker -->
+      <circle cx="245" cy="120" r="4" fill="var(--bad)"/>
+      <line x1="245" y1="120" x2="245" y2="210" stroke="var(--bad)" stroke-dasharray="3 3"/>
+      <text x="245" y="225" text-anchor="middle" class="svg-label sm" fill="var(--bad)">crossover</text>
+    </svg>
+    <figcaption><b>Figure 1.</b> The non-clustered index (indigo) starts cheap for tiny <code>F</code> but
+    climbs steeply, because cost tracks the matching tuple count. Past the crossover (red), the flat full
+    scan is cheaper. A rule that always picks the index lives on the wrong side of that line for any selective
+    query that still matches a lot of rows.</figcaption>
+  </figure>
+
+  <!-- ===== SELECTIVITY ESTIMATION ===== -->
+  <h2>Estimating selectivity: where the guesses come from</h2>
+
+  <p>Every cost depends on <code>F</code>, so the optimizer must estimate it per predicate. System&nbsp;R's
+  default selectivity factors (Selinger Table&nbsp;1) are the canonical constants every later system started
+  from:</p>
+
+  <table>
+    <caption>System R default selectivity factors (Selinger Table 1).</caption>
+    <thead><tr><th>Predicate</th><th>Selectivity F</th><th>Fallback when no stats</th></tr></thead>
+    <tbody>
+      <tr><td><code>col = value</code></td><td><code>1 / distinct_keys</code></td><td><code>1/10</code></td></tr>
+      <tr><td><code>col &gt; value</code> (range)</td><td>linear interpolation in the key range</td><td><code>1/3</code></td></tr>
+      <tr><td><code>col BETWEEN a AND b</code></td><td><code>(b - a) / (high - low)</code></td><td><code>1/4</code></td></tr>
+      <tr><td><code>p1 AND p2</code></td><td><code>F(p1) * F(p2)</code></td><td>(multiply)</td></tr>
+      <tr><td><code>p1 OR p2</code></td><td><code>F(p1) + F(p2) - F(p1)*F(p2)</code></td><td>(inclusion-exclusion)</td></tr>
+      <tr><td><code>NOT p</code></td><td><code>1 - F(p)</code></td><td>(complement)</td></tr>
+    </tbody>
+  </table>
+
+  <p>Two assumptions are baked in, and the paper names both. <b>Uniformity</b>: <code>F = 1/distinct_keys</code>
+  for equality assumes "an even distribution of tuples among the index key values." <b>Independence</b>: the
+  <code>AND</code> rule multiplies selectivities, which Selinger flags directly with "Note that this assumes
+  that column values are independent"
+  [<a href="https://people.eecs.berkeley.edu/~brewer/cs262/3-selinger79.pdf">Selinger&nbsp;1979, &sect;4</a>].
+  Both fail on real data. Uniformity fails on skew (a few values dominate). Independence fails on
+  correlation, where a second predicate adds almost no filtering once the first holds, so the product is a
+  large underestimate.</p>
+
+  <div class="callout gotcha">
+    <div class="callout-title">Exam trap</div>
+    <p>"Under independence, ANDed selectivities are added" is false. They <em>multiply</em>:
+    <code>F(p1 AND p2) = F(p1) * F(p2)</code>. It is the <code>OR</code> case that adds (and then subtracts
+    the overlap). Mixing these up is the most common selectivity mistake.</p>
+  </div>
+
+  <h3>Histograms attack the uniformity failure</h3>
+
+  <p>To stop pretending the distribution is flat, modern systems store a histogram of the column. Two
+  layouts, and the difference is the whole lesson:</p>
+
+  <ul>
+    <li><b>Equi-width</b>: buckets cover equal value ranges; their row counts vary. A skewed column dumps
+    most rows into one bucket, so the estimate inside that dense bucket is exactly where it is worst.</li>
+    <li><b>Equi-depth</b> (equi-height): boundaries are chosen so each bucket holds roughly equal row
+    counts; value ranges vary. Dense regions get many narrow buckets, sparse regions get few wide ones.
+    Resolution lands where the data is.</li>
+  </ul>
+
+  <p>PostgreSQL uses an equi-depth histogram for the smooth tail plus a separate most-common-values (MCV)
+  list for the spikes, and the histogram is built only from values not already captured as MCVs, so the two
+  structures partition the column
+  [<a href="https://www.postgresql.org/docs/current/planner-stats.html">PG planner stats</a>]. The docs work
+  a range estimate for <code>unique1 &lt; 1000</code> over a 10000-row table with histogram bounds
+  <code>{0,993,1997,3050,...}</code>:</p>
+
+  <pre><code>selectivity = (1 + (1000 - 993)/(1997 - 993)) / 10 = 0.100697
+rows        = 10000 * 0.100697 = 1007</code></pre>
+
+  <p>One full bucket below the value, plus the interpolated fraction of the straddled bucket, divided by the
+  bucket count. The first simulator below lets you skew a column and watch equi-width go wrong while
+  equi-depth stays close.</p>
+
+  <!-- ===== SIMULATOR 1: SELECTIVITY / HISTOGRAM ===== -->
+  <figure class="sim" id="qo-sel">
+    <div class="sim-head">
+      <span class="sim-title">Selectivity and histogram playground</span>
+      <span class="sim-sub">skew the column, type a predicate, watch the two histograms estimate</span>
+    </div>
+    <div class="sim-body">
+      <div class="sim-stage"><svg id="qo-sel-svg" viewBox="0 0 560 300" width="100%"></svg></div>
+      <div class="sim-controls" id="qo-sel-controls"></div>
+      <div class="sim-readout" id="qo-sel-readout"></div>
+    </div>
+  </figure>
+  <figcaption class="muted" style="margin-top:-1rem">Experiment: drag the skew slider to the right so a few
+  low values dominate, then estimate <code>x &lt; 30</code>. Equi-width misses by a wide margin in the dense
+  region; equi-depth tracks the true count. Then flip the AND toggle and watch the independence assumption
+  underestimate the correlated pair.</figcaption>
+
+  <script>
+  // Simulator 1: selectivity + histogram estimator. Self-contained IIFE.
+  (function () {
+    var svg = document.getElementById("qo-sel-svg");
+    var readout = document.getElementById("qo-sel-readout");
+    var controls = document.getElementById("qo-sel-controls");
+    var NVAL = 50;          // domain 0..49
+    var NROWS = 10000;
+    var NBUCK = 5;          // histogram buckets
+
+    var state = { skew: 0.0, cutoff: 30, andOn: false, corr: 0.0 };
+
+    // Build a value-frequency distribution over 0..NVAL-1.
+    // skew=0 uniform; skew->1 concentrates mass on low values (geometric-ish).
+    function distribution(skew) {
+      var w = [], i, total = 0;
+      for (i = 0; i < NVAL; i++) {
+        var base = 1;
+        var spike = Math.pow(1 - skew * 0.085, i); // decay; bigger skew = faster decay
+        w[i] = base * spike;
+        total += w[i];
+      }
+      var rows = [];
+      for (i = 0; i < NVAL; i++) rows[i] = Math.round(NROWS * w[i] / total);
+      return rows;
+    }
+
+    // True count of rows with value < cutoff.
+    function trueCount(rows, cutoff) {
+      var s = 0; for (var i = 0; i < cutoff && i < NVAL; i++) s += rows[i]; return s;
+    }
+
+    // Equi-width: NBUCK buckets of equal value width. Estimate < cutoff by
+    // counting whole buckets fully below cutoff plus a linear slice of the straddled bucket.
+    function equiWidthEstimate(rows, cutoff) {
+      var width = NVAL / NBUCK, total = rows.reduce(function (a, b) { return a + b; }, 0);
+      var est = 0;
+      for (var b = 0; b < NBUCK; b++) {
+        var lo = b * width, hi = (b + 1) * width, cnt = 0;
+        for (var v = Math.ceil(lo); v < hi && v < NVAL; v++) cnt += rows[v];
+        if (cutoff >= hi) est += cnt;
+        else if (cutoff > lo) est += cnt * (cutoff - lo) / (hi - lo); // uniform-within-bucket guess
+      }
+      return Math.round(est);
+    }
+
+    // Equi-depth: choose boundaries so each bucket holds ~ total/NBUCK rows.
+    function equiDepthBounds(rows) {
+      var total = rows.reduce(function (a, b) { return a + b; }, 0);
+      var per = total / NBUCK, bounds = [0], acc = 0, target = per;
+      for (var v = 0; v < NVAL; v++) {
+        acc += rows[v];
+        if (acc >= target && bounds.length < NBUCK) { bounds.push(v + 1); target += per; }
+      }
+      bounds.push(NVAL);
+      return bounds;
+    }
+    function equiDepthEstimate(rows, cutoff) {
+      var bounds = equiDepthBounds(rows), total = rows.reduce(function (a, b) { return a + b; }, 0);
+      var per = total / (bounds.length - 1), est = 0;
+      for (var b = 0; b < bounds.length - 1; b++) {
+        var lo = bounds[b], hi = bounds[b + 1];
+        if (cutoff >= hi) est += per;
+        else if (cutoff > lo) est += per * (cutoff - lo) / (hi - lo);
+      }
+      return Math.round(est);
+    }
+
+    function draw() {
+      svg.innerHTML = "";
+      var rows = distribution(state.skew);
+      var maxv = Math.max.apply(null, rows) || 1;
+      var x0 = 50, y0 = 150, barW = (470) / NVAL, h = 110;
+
+      // true distribution bars
+      for (var v = 0; v < NVAL; v++) {
+        var bh = h * rows[v] / maxv;
+        var below = v < state.cutoff;
+        svg.appendChild(DBMS.svg("rect", {
+          x: x0 + v * barW, y: y0 - bh, width: Math.max(1, barW - 0.6), height: bh,
+          fill: below ? "var(--query)" : "#cbd0ea", opacity: below ? 0.9 : 0.5
+        }));
+      }
+      svg.appendChild(DBMS.svg("text", { x: x0, y: 24, class: "svg-label" }, "true column distribution (indigo = matches x < " + state.cutoff + ")"));
+      // cutoff line
+      var cx = x0 + state.cutoff * barW;
+      svg.appendChild(DBMS.svg("line", { x1: cx, y1: y0 - h - 6, x2: cx, y2: y0 + 6, stroke: "var(--bad)", "stroke-dasharray": "4 3" }));
+      svg.appendChild(DBMS.svg("text", { x: cx + 3, y: y0 - h, class: "svg-label sm", fill: "var(--bad)" }, "x=" + state.cutoff));
+      // baseline
+      svg.appendChild(DBMS.svg("line", { x1: x0, y1: y0, x2: x0 + NVAL * barW, y2: y0, stroke: "var(--ink-soft)" }));
+
+      // equi-width bucket boundaries (orange ticks)
+      var width = NVAL / NBUCK, b;
+      for (b = 1; b < NBUCK; b++) {
+        var ex = x0 + b * width * barW;
+        svg.appendChild(DBMS.svg("line", { x1: ex, y1: y0 + 10, x2: ex, y2: y0 + 24, stroke: "var(--warn)", "stroke-width": 2 }));
+      }
+      svg.appendChild(DBMS.svg("text", { x: x0, y: y0 + 22, class: "svg-label sm", fill: "var(--warn)" }, "equi-width bounds (equal value ranges)"));
+
+      // equi-depth bucket boundaries (green ticks)
+      var bounds = equiDepthBounds(rows);
+      for (b = 1; b < bounds.length - 1; b++) {
+        var dx = x0 + bounds[b] * barW;
+        svg.appendChild(DBMS.svg("line", { x1: dx, y1: y0 + 30, x2: dx, y2: y0 + 44, stroke: "var(--good)", "stroke-width": 2 }));
+      }
+      svg.appendChild(DBMS.svg("text", { x: x0, y: y0 + 42, class: "svg-label sm", fill: "var(--good)" }, "equi-depth bounds (equal row counts, clustered where dense)"));
+
+      // numeric panel
+      var truth = trueCount(rows, state.cutoff);
+      var ew = equiWidthEstimate(rows, state.cutoff);
+      var ed = equiDepthEstimate(rows, state.cutoff);
+      var pad = function (n) { var s = "" + n; while (s.length < 6) s = " " + s; return s; };
+      var errEW = truth ? Math.round(100 * Math.abs(ew - truth) / truth) : 0;
+      var errED = truth ? Math.round(100 * Math.abs(ed - truth) / truth) : 0;
+
+      var line = "predicate  x < " + state.cutoff + "\n";
+      line += "true rows  " + pad(truth) + "\n";
+      line += "equi-width " + pad(ew) + "   error " + errEW + "%\n";
+      line += "equi-depth " + pad(ed) + "   error " + errED + "%";
+
+      if (state.andOn) {
+        // Second predicate y = k. Independence multiplies. Correlation makes the AND
+        // selectivity collapse toward the first predicate alone.
+        var fX = truth / NROWS;
+        var fY = 1 / 20;                       // y has 20 distinct values, equality -> 1/20
+        var indepRows = Math.round(NROWS * fX * fY);
+        // true correlated count: when corr=1, every matching y row already satisfies x,
+        // so the true AND count approaches fY * NROWS (much larger than the product).
+        var trueAnd = Math.round(indepRows * (1 - state.corr) + (NROWS * fY) * state.corr);
+        line += "\n\nAND x<" + state.cutoff + " AND y=7";
+        line += "\nestimate (independence) " + indepRows;
+        line += "\ntrue (corr=" + state.corr.toFixed(1) + ")          " + trueAnd;
+        if (state.corr > 0.4) line += "   <- estimate is " + Math.round(trueAnd / Math.max(1, indepRows)) + "x too low";
+      }
+      readout.textContent = line;
+    }
+
+    // controls
+    var skewWrap = DBMS.el("label", null, ["skew "]);
+    var skew = DBMS.el("input", { type: "range", min: "0", max: "1", step: "0.05", value: "0" });
+    skew.addEventListener("input", function () { state.skew = parseFloat(skew.value); draw(); });
+    skewWrap.appendChild(skew);
+
+    var cutWrap = DBMS.el("label", null, ["x < "]);
+    var cut = DBMS.el("input", { type: "range", min: "1", max: "49", step: "1", value: "30" });
+    var cutOut = DBMS.el("span", { class: "pill", text: "30" });
+    cut.addEventListener("input", function () { state.cutoff = parseInt(cut.value, 10); cutOut.textContent = cut.value; draw(); });
+    cutWrap.appendChild(cut); cutWrap.appendChild(cutOut);
+
+    var andBtn = DBMS.el("button", { class: "ghost", text: "add AND y=7" });
+    andBtn.addEventListener("click", function () {
+      state.andOn = !state.andOn;
+      andBtn.textContent = state.andOn ? "remove AND y=7" : "add AND y=7";
+      corrWrap.style.display = state.andOn ? "inline-flex" : "none";
+      draw();
+    });
+
+    var corrWrap = DBMS.el("label", null, ["correlate x,y "]);
+    corrWrap.style.display = "none";
+    var corr = DBMS.el("input", { type: "range", min: "0", max: "1", step: "0.1", value: "0" });
+    corr.addEventListener("input", function () { state.corr = parseFloat(corr.value); draw(); });
+    corrWrap.appendChild(corr);
+
+    controls.append(skewWrap, cutWrap, andBtn, corrWrap);
+    draw();
+  })();
+  </script>
+
+  <div class="callout realworld">
+    <div class="callout-title">In real systems</div>
+    <p>PostgreSQL keeps per-column stats in <code>pg_statistic</code>, readable through <code>pg_stats</code>:
+    <code>null_frac</code>, <code>n_distinct</code>, <code>most_common_vals</code>,
+    <code>histogram_bounds</code>, and <code>correlation</code>. They are filled by <code>ANALYZE</code>,
+    which samples rather than reading the whole table, so they are "always approximate even when freshly
+    updated"
+    [<a href="https://www.postgresql.org/docs/current/planner-stats.html">PG planner stats</a>]. The encoding
+    of <code>n_distinct</code> is a trap of its own: a positive value is a literal count, a negative value is
+    a fraction of table size, and <code>n_distinct = -1</code> means every value is distinct (so the estimate
+    survives table growth). To fight the independence failure, <code>CREATE STATISTICS</code> stores
+    multivariate stats so correlated predicates are not naively multiplied.</p>
+  </div>
+
+  <!-- ===== JOIN ORDERING ===== -->
+  <h2>Join ordering: the Selinger dynamic program</h2>
+
+  <p>Join order is where the plan space explodes, and it is where System&nbsp;R's central idea lives. First,
+  a restriction on the shape of the tree.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 600 200" role="img" aria-label="Left-deep join tree versus bushy join tree">
+      <!-- left-deep -->
+      <text x="30" y="24" class="svg-label">left-deep (System R keeps these)</text>
+      <circle cx="150" cy="50" r="14" fill="var(--query-bg)" stroke="var(--query)"/><text x="150" y="55" text-anchor="middle" class="svg-mono">&#9285;</text>
+      <circle cx="110" cy="95" r="14" fill="var(--query-bg)" stroke="var(--query)"/><text x="110" y="100" text-anchor="middle" class="svg-mono">&#9285;</text>
+      <circle cx="70" cy="140" r="14" fill="var(--query-bg)" stroke="var(--query)"/><text x="70" y="145" text-anchor="middle" class="svg-mono">&#9285;</text>
+      <rect x="36" y="170" width="26" height="22" rx="3" fill="#fffefb" stroke="var(--ink-soft)"/><text x="49" y="185" text-anchor="middle" class="svg-mono">A</text>
+      <rect x="92" y="170" width="26" height="22" rx="3" fill="#fffefb" stroke="var(--ink-soft)"/><text x="105" y="185" text-anchor="middle" class="svg-mono">B</text>
+      <rect x="140" y="125" width="26" height="22" rx="3" fill="#fffefb" stroke="var(--ink-soft)"/><text x="153" y="140" text-anchor="middle" class="svg-mono">C</text>
+      <rect x="184" y="80" width="26" height="22" rx="3" fill="#fffefb" stroke="var(--ink-soft)"/><text x="197" y="95" text-anchor="middle" class="svg-mono">D</text>
+      <line x1="142" y1="60" x2="120" y2="84" stroke="var(--ink-soft)"/><line x1="158" y1="60" x2="190" y2="80" stroke="var(--ink-soft)"/>
+      <line x1="102" y1="105" x2="80" y2="129" stroke="var(--ink-soft)"/><line x1="118" y1="105" x2="148" y2="125" stroke="var(--ink-soft)"/>
+      <line x1="62" y1="150" x2="49" y2="170" stroke="var(--ink-soft)"/><line x1="78" y1="150" x2="105" y2="170" stroke="var(--ink-soft)"/>
+      <text x="40" y="150" class="svg-label sm" fill="var(--query)">((A&#8904;B)&#8904;C)&#8904;D</text>
+      <!-- bushy -->
+      <text x="360" y="24" class="svg-label">bushy (excluded by System R)</text>
+      <circle cx="450" cy="50" r="14" fill="#f3eef9" stroke="var(--ink-faint)"/><text x="450" y="55" text-anchor="middle" class="svg-mono">&#9285;</text>
+      <circle cx="400" cy="110" r="14" fill="#f3eef9" stroke="var(--ink-faint)"/><text x="400" y="115" text-anchor="middle" class="svg-mono">&#9285;</text>
+      <circle cx="500" cy="110" r="14" fill="#f3eef9" stroke="var(--ink-faint)"/><text x="500" y="115" text-anchor="middle" class="svg-mono">&#9285;</text>
+      <rect x="367" y="160" width="26" height="22" rx="3" fill="#fffefb" stroke="var(--ink-soft)"/><text x="380" y="175" text-anchor="middle" class="svg-mono">A</text>
+      <rect x="407" y="160" width="26" height="22" rx="3" fill="#fffefb" stroke="var(--ink-soft)"/><text x="420" y="175" text-anchor="middle" class="svg-mono">B</text>
+      <rect x="467" y="160" width="26" height="22" rx="3" fill="#fffefb" stroke="var(--ink-soft)"/><text x="480" y="175" text-anchor="middle" class="svg-mono">C</text>
+      <rect x="507" y="160" width="26" height="22" rx="3" fill="#fffefb" stroke="var(--ink-soft)"/><text x="520" y="175" text-anchor="middle" class="svg-mono">D</text>
+      <line x1="440" y1="60" x2="408" y2="98" stroke="var(--ink-faint)"/><line x1="460" y1="60" x2="492" y2="98" stroke="var(--ink-faint)"/>
+      <line x1="392" y1="122" x2="380" y2="160" stroke="var(--ink-faint)"/><line x1="408" y1="122" x2="420" y2="160" stroke="var(--ink-faint)"/>
+      <line x1="492" y1="122" x2="480" y2="160" stroke="var(--ink-faint)"/><line x1="508" y1="122" x2="520" y2="160" stroke="var(--ink-faint)"/>
+      <text x="380" y="146" class="svg-label sm" fill="var(--ink-faint)">(A&#8904;B)&#8904;(C&#8904;D)</text>
+    </svg>
+    <figcaption><b>Figure 2.</b> In a left-deep tree every join's inner (right) input is a base table, so one
+    growing composite stays in flight and can be pipelined. A bushy tree lets a join feed off two
+    intermediate results, exposing more (sometimes cheaper) plans at the cost of a larger search space and
+    materialized intermediates. System&nbsp;R searches only left-deep.</figcaption>
+  </figure>
+
+  <p>The engine of the search is dynamic programming over subsets of relations. It rests on a substructure
+  property the paper states plainly: "once the first k relations are joined, the method to join the composite
+  to the k+1-st relation is independent of the order of joining the first k"
+  [<a href="https://people.eecs.berkeley.edu/~brewer/cs262/3-selinger79.pdf">Selinger&nbsp;1979, &sect;5</a>].
+  So the cheapest way to produce a given set of relations can be computed once and reused as a building
+  block. Build bottom up: cheapest access path for each single relation, then cheapest join for each pair
+  built from singletons, then each triple built from pairs, and so on to the full set.</p>
+
+  <ol class="steps">
+    <li>For each single relation, find the cheapest access path (one per interesting order, plus the cheapest unordered path).</li>
+    <li>For each pair, find the cheapest join, reusing the single-relation solutions.</li>
+    <li>For each three-relation set, extend the best two-relation plans by joining one more relation.</li>
+    <li>At the top, pick the cheapest full-set plan that delivers any required output order.</li>
+  </ol>
+
+  <p>The table holds at most <code>2^n</code> subsets times the number of interesting orders, so the size is
+  exponential in <code>n</code> but the constant is small. Selinger reports eight-table joins optimized in a
+  few seconds on 1970s hardware. Two pruning rules shrink it further. <b>Cartesian products are pushed
+  late</b>: the search only extends a composite with a relation that has a join predicate to something
+  already in it, so for predicates on T1-T2 and T2-T3 the order T1-T3-T2 is never considered, since it would
+  force a T1&times;T3 cross product. <b>Dominated plans are discarded</b>: keep only the cheapest plan per
+  subset, except that you also keep the cheapest plan per interesting order.</p>
+
+  <h3>Interesting orders: paying now to save a sort later</h3>
+
+  <p>A sort order is "interesting" if a later operator could exploit it: the query's <code>ORDER BY</code> or
+  <code>GROUP BY</code> columns, and <em>every join column</em>. The DP normally keeps one cheapest
+  plan per subset, but it must also keep the cheapest plan for each interesting order, even when that plan is
+  not the globally cheapest. Why pay for a pricier scan now? Because a plan that already produces tuples
+  sorted on a join column lets a downstream sort-merge join skip its own sort, which can more than repay the
+  cost. This bookkeeping is what makes System&nbsp;R more than a naive least-cost search, and it is the
+  contribution the paper itself highlights. Recall from <a href="0010-query-execution-joins.html">week 10</a>
+  that sort-merge join is cheap when its inputs arrive sorted and expensive when it has to sort them, so an
+  interesting order is exactly the lever that flips which join algorithm wins.</p>
+
+  <!-- ===== SIMULATOR 2: DP JOIN ORDER ===== -->
+  <figure class="sim" id="qo-dp">
+    <div class="sim-head">
+      <span class="sim-title">Selinger DP join-order visualizer</span>
+      <span class="sim-sub">fill the subset table level by level, prune cross products, toggle interesting orders</span>
+    </div>
+    <div class="sim-body">
+      <div class="sim-stage"><svg id="qo-dp-svg" viewBox="0 0 560 320" width="100%"></svg></div>
+      <div class="sim-controls" id="qo-dp-controls"></div>
+      <div class="sim-readout" id="qo-dp-readout"></div>
+    </div>
+  </figure>
+  <figcaption class="muted" style="margin-top:-1rem">Experiment: step through the levels and watch which
+  pairs are struck out because they have no join predicate (a forced Cartesian product). Then toggle
+  interesting orders and watch the final chosen plan change even though the cardinalities did not, because a
+  pre-sorted input now lets the last join skip a sort.</figcaption>
+
+  <script>
+  // Simulator 2: System R dynamic program over 4 relations, left-deep, with
+  // Cartesian-product pruning and an interesting-orders toggle. Self-contained IIFE.
+  (function () {
+    var svg = document.getElementById("qo-dp-svg");
+    var readout = document.getElementById("qo-dp-readout");
+    var controls = document.getElementById("qo-dp-controls");
+
+    var RELS = ["A", "B", "C", "D"];
+    var CARD = { A: 1000, B: 50, C: 8000, D: 200 };
+    // join graph: chain A-B-C plus D joined to B. So edges among A,B,C,D.
+    var EDGES = { "A|B": 1, "B|C": 1, "B|D": 1 };
+    function hasEdge(x, y) { return EDGES[x + "|" + y] || EDGES[y + "|" + x]; }
+
+    var state = { level: 0, interesting: false };
+
+    // bitmask helpers over 4 relations
+    function bits(mask) { var r = []; for (var i = 0; i < 4; i++) if (mask & (1 << i)) r.push(RELS[i]); return r; }
+    function popcount(m) { var c = 0; while (m) { c += m & 1; m >>= 1; } return c; }
+
+    // Is there any join predicate connecting relation set S to relation r?
+    function connected(S, r) {
+      var rs = bits(r)[0];
+      var members = bits(S);
+      for (var i = 0; i < members.length; i++) if (hasEdge(members[i], rs)) return true;
+      return false;
+    }
+
+    // Compute best plan cost per subset by DP. Cost model (toy): joining composite of
+    // rows Nc to relation Nr costs Nc + Nc*Nr*sel, with sel=1/200 on an edge.
+    // When interesting orders are on, a plan that ends by joining on B can be served by a
+    // pre-sorted input so the final join is cheaper (sort skipped): apply a discount.
+    function solve() {
+      var best = {};   // mask -> {cost, order:[], cartesian:bool}
+      var i;
+      for (i = 0; i < 4; i++) {
+        var m = 1 << i;
+        best[m] = { cost: CARD[RELS[i]] / 8, order: [RELS[i]], cartesian: false }; // scan ~ pages
+      }
+      for (var size = 2; size <= 4; size++) {
+        for (var mask = 1; mask < 16; mask++) {
+          if (popcount(mask) !== size) continue;
+          var bestForMask = null;
+          for (i = 0; i < 4; i++) {
+            var rb = 1 << i;
+            if (!(mask & rb)) continue;
+            var sub = mask & ~rb;
+            if (!best[sub]) continue;
+            var isCart = !connected(sub, rb);
+            // rows estimate for the composite
+            var Nc = best[sub].rows != null ? best[sub].rows : compositeRows(sub);
+            var Nr = CARD[RELS[i]];
+            var sel = isCart ? 1 : (1 / 200);
+            var joinCost = Nc + Nc * Nr * sel / 1000;
+            // interesting-order discount: if last added rel is B (a hub join column), pre-sortedness helps
+            var disc = (state.interesting && RELS[i] === "B") ? 0.55 : 1.0;
+            var cost = best[sub].cost + joinCost * disc;
+            var cand = {
+              cost: cost, order: best[sub].order.concat(RELS[i]),
+              cartesian: best[sub].cartesian || isCart,
+              rows: Math.max(1, Math.round(Nc * Nr * sel / 1000))
+            };
+            // prune: prefer non-cartesian; among same, cheapest
+            if (!bestForMask) bestForMask = cand;
+            else {
+              if (bestForMask.cartesian && !cand.cartesian) bestForMask = cand;
+              else if (bestForMask.cartesian === cand.cartesian && cand.cost < bestForMask.cost) bestForMask = cand;
+            }
+          }
+          best[mask] = bestForMask;
+        }
+      }
+      return best;
+    }
+    function compositeRows(mask) {
+      var members = bits(mask), prod = 1;
+      for (var i = 0; i < members.length; i++) prod *= CARD[members[i]];
+      return prod / Math.pow(200, members.length - 1);
+    }
+
+    function draw() {
+      svg.innerHTML = "";
+      var best = solve();
+      var colX = [40, 190, 360, 480];
+      var heads = ["singletons", "pairs", "triples", "full"];
+      var s;
+      for (s = 0; s < 4; s++) {
+        svg.appendChild(DBMS.svg("text", { x: colX[s], y: 20, class: "svg-label sm" }, "level " + (s + 1) + ": " + heads[s]));
+      }
+      // list subsets per level
+      var rowY = {};
+      for (s = 1; s <= 4; s++) rowY[s] = 40;
+      for (var mask = 1; mask < 16; mask++) {
+        var size = popcount(mask);
+        var x = colX[size - 1];
+        var y = rowY[size];
+        rowY[size] += 36;
+        var plan = best[mask];
+        var visible = size <= state.level + 1;
+        var struck = plan && plan.cartesian;
+        var fill = !visible ? "#f4f1ea" : struck ? "var(--bad-bg)" : "var(--query-bg)";
+        var stroke = !visible ? "var(--rule)" : struck ? "var(--bad)" : "var(--query)";
+        svg.appendChild(DBMS.svg("rect", { x: x, y: y, width: 138, height: 30, rx: 4, fill: fill, stroke: stroke, "stroke-dasharray": visible ? "0" : "3 3" }));
+        if (visible) {
+          var label = "{" + plan.order.join("") + "}";
+          svg.appendChild(DBMS.svg("text", { x: x + 6, y: y + 13, class: "svg-mono" }, label));
+          var cl = struck ? "scan: skip (cross)" : "cost " + Math.round(plan.cost);
+          svg.appendChild(DBMS.svg("text", { x: x + 6, y: y + 25, class: "svg-label sm", fill: struck ? "var(--bad)" : "var(--ink-soft)" }, cl));
+        } else {
+          svg.appendChild(DBMS.svg("text", { x: x + 6, y: y + 19, class: "svg-label sm", fill: "var(--ink-faint)" }, "{" + bits(mask).join("") + "}"));
+        }
+      }
+      // chosen plan readout
+      var full = best[15];
+      var line = "join graph: A-B, B-C, B-D   cardinalities " + JSON.stringify(CARD) + "\n";
+      line += "interesting orders: " + (state.interesting ? "ON (pre-sort on B lets last join skip its sort)" : "off") + "\n";
+      line += "chosen left-deep order: " + full.order.join(" |><| ") + "   cost " + Math.round(full.cost);
+      if (full.cartesian) line += "\n(note: only cross-product orders remained for the full set)";
+      readout.textContent = line;
+    }
+
+    DBMS.stepper({
+      controls: controls,
+      steps: 3,
+      onRender: function (i) { state.level = i; draw(); },
+      labels: { step: "Fill next level", reset: "Back to singletons" },
+      autoMs: 1100
+    });
+    var toggle = DBMS.el("button", { class: "ghost", text: "interesting orders: off" });
+    toggle.addEventListener("click", function () {
+      state.interesting = !state.interesting;
+      toggle.textContent = "interesting orders: " + (state.interesting ? "on" : "off");
+      draw();
+    });
+    controls.appendChild(toggle);
+    draw();
+  })();
+  </script>
+
+  <div class="callout keyidea">
+    <div class="callout-title">Keep this one thing</div>
+    <p>The optimizer never runs a plan to score it. It estimates how many rows each operator emits
+    (selectivity), turns that into a single comparable cost number, and uses dynamic programming to build the
+    cheapest join order out of cheapest sub-plans. It picks a good plan under guesses, not a provably optimal
+    one.</p>
+  </div>
+
+  <!-- ===== HEURISTIC REWRITES ===== -->
+  <h2>Heuristic rewrites sit above the search</h2>
+
+  <p>Some transformations are almost always good, so the engine applies them unconditionally as rewrites
+  rather than costing them as alternatives. <b>Predicate pushdown</b> moves a <code>WHERE</code> filter as
+  close to the base scan as possible, so rows are discarded before they enter a join. This is the highest-value
+  rewrite, because it shrinks every input downstream. <b>Projection pushdown</b> drops columns that nothing
+  downstream needs, so intermediate tuples are narrower and more fit per page. <b>Join elimination</b> removes
+  a join that cannot change the result, such as a foreign-key lookup whose columns are unused and whose key
+  is guaranteed present. The week 8 rewriter already did some of this; the rest happens here, and it interacts
+  with cost only through the smaller inputs it produces.</p>
+
+  <div class="callout gotcha">
+    <div class="callout-title">Exam trap</div>
+    <p>"Predicate pushdown is a cost-based decision" is false. Pushdown, projection pushdown, and join
+    elimination are heuristic rewrites applied unconditionally because they are essentially always
+    beneficial. They are not costed against an alternative. The cost-based machinery is for access paths,
+    join methods, and join order.</p>
+  </div>
+
+  <h3>How the two real engines diverge</h3>
+
+  <table>
+    <caption>Same cost-based core, very different join-search strategies.</caption>
+    <thead><tr><th>Aspect</th><th>PostgreSQL</th><th>SQLite</th></tr></thead>
+    <tbody>
+      <tr><td>Join search</td><td>near-exhaustive DP below <code>geqo_threshold</code></td><td>polynomial graph planner (NGQP) always</td></tr>
+      <tr><td>Large joins</td><td>genetic optimizer (GEQO) at 12+ FROM items</td><td>same polynomial planner, 50+ way joins in microseconds</td></tr>
+      <tr><td>Join methods</td><td>nested loop, sort-merge, hash</td><td>nested loop only, left-deep</td></tr>
+      <tr><td>Statistics</td><td><code>pg_statistic</code> via <code>ANALYZE</code> (MCV + histogram)</td><td><code>sqlite_stat1</code>, <code>sqlite_stat4</code> histograms</td></tr>
+      <tr><td>Inspect a plan</td><td><code>EXPLAIN</code>, <code>EXPLAIN ANALYZE</code></td><td><code>EXPLAIN QUERY PLAN</code></td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout realworld">
+    <div class="callout-title">In real systems</div>
+    <p>PostgreSQL runs the Selinger-style dynamic program only while the <code>FROM</code> list has fewer than
+    <code>geqo_threshold</code> items (default 12); at or above that, the genetic query optimizer takes over,
+    encoding a join order as an integer-string chromosome, framing the search as a Traveling-Salesman-style
+    problem, and breeding better orders with the standard cost model as fitness
+    [<a href="https://www.postgresql.org/docs/current/geqo-pg-intro.html">PG GEQO</a>]. SQLite never does
+    exponential search at all: its Next Generation Query Planner is "an efficient polynomial-time graph
+    algorithm" that plans 50- to 60-way joins in microseconds, accepting that it may miss the optimal order
+    [<a href="https://www.sqlite.org/optoverview.html">SQLite optimizer overview</a>]. The fastest way to
+    catch a bad estimate in PostgreSQL is <code>EXPLAIN ANALYZE</code>: a large gap between estimated and
+    actual rows is the tell that a selectivity guess went wrong.</p>
+  </div>
+
+  <!-- ===== DEEP DIVE ===== -->
+  <details class="deepdive">
+    <summary>Deeper: PostgreSQL's worked estimate for two ANDed predicates</summary>
+    <div>
+      <p>Over the 10000-row <code>tenk1</code> table, the docs estimate
+      <code>unique1 &lt; 1000 AND stringu1 = 'xxx'</code>. The range part comes from the equi-depth
+      histogram, selectivity <code>0.100697</code> (the worked example earlier). The equality part is a
+      non-MCV value, so its probability is the leftover mass spread over the leftover distinct values:
+      <code>(1 - sum(mcv_freqs)) / (num_distinct - num_mcv) = (1 - 0.03033)/(676 - 10) = 0.0014559</code>.
+      Then independence multiplies: <code>0.100697 * 0.0014559 = 0.0001466</code>, so
+      <code>rows = 10000 * 0.0001466 = 1</code>
+      [<a href="https://www.postgresql.org/docs/current/row-estimation-examples.html">PG row estimation
+      examples</a>]. If <code>unique1</code> and <code>stringu1</code> were correlated, that product would be
+      a large underestimate, which is exactly the case <code>CREATE STATISTICS</code> exists to fix.</p>
+    </div>
+  </details>
+
+  <!-- ===== MCQs ===== -->
+  <h2>Check yourself</h2>
+
+  <div class="mcq" data-answer="2">
+    <p class="mcq-q">Which statement about the optimizer's goal is correct?</p>
+    <button class="mcq-opt">It enumerates every plan and runs each one briefly to time it before choosing.</button>
+    <button class="mcq-opt">It proves that the plan it returns is the globally optimal plan for the query.</button>
+    <button class="mcq-opt">It estimates costs and picks a good plan, aiming for correct relative ranking, not exact times.</button>
+    <button class="mcq-opt">It measures cost in seconds and returns whichever plan has the lowest second count.</button>
+    <p class="mcq-explain">It never runs candidate plans (running is the cost it avoids), and it cannot prove
+    optimality under guessed statistics. Selinger's validation found absolute predictions inaccurate but the
+    ranking usually right. Cost is a unitless weighted number, not seconds.</p>
+  </div>
+
+  <div class="mcq" data-answer="1">
+    <p class="mcq-q">Which of these is false?</p>
+    <button class="mcq-opt">A non-clustered index scan can lose to a full scan when the predicate matches many rows.</button>
+    <button class="mcq-opt">An index scan is always faster than a full scan, so the optimizer always picks the index.</button>
+    <button class="mcq-opt">Clustered scan cost tracks data pages (TCARD); non-clustered tracks tuple count (NCARD).</button>
+    <button class="mcq-opt">A rule that always prefers an index is the broken rule-based behavior the cost model fixes.</button>
+    <p class="mcq-explain">A non-clustered index chases roughly one page per matching tuple, so for low
+    selectivity (many rows matched) its cost <code>F*(NINDX+NCARD)</code> overtakes the full scan
+    <code>TCARD/P</code>. The optimizer compares costs and switches at the crossover; the always-index rule
+    is exactly the design that gets this wrong.</p>
+  </div>
+
+  <div class="mcq" data-answer="0">
+    <p class="mcq-q">Under the independence assumption, how is the selectivity of <code>p1 AND p2</code> computed?</p>
+    <button class="mcq-opt">It is the product <code>F(p1) * F(p2)</code> of the two selectivities.</button>
+    <button class="mcq-opt">It is the sum <code>F(p1) + F(p2)</code> of the two selectivities.</button>
+    <button class="mcq-opt">It is the larger of the two, <code>max(F(p1), F(p2))</code>.</button>
+    <button class="mcq-opt">It is <code>F(p1) + F(p2) - F(p1)*F(p2)</code>, the inclusion bound.</button>
+    <button class="mcq-opt">It is the smaller of the two, <code>min(F(p1), F(p2))</code>.</button>
+    <p class="mcq-explain">ANDed selectivities multiply under independence. The inclusion-exclusion form
+    <code>F1 + F2 - F1*F2</code> is for <code>OR</code>, not <code>AND</code>. On correlated columns the
+    product becomes a large underestimate, which is the failure that motivates extended statistics.</p>
+  </div>
+
+  <div class="mcq" data-answer="3">
+    <p class="mcq-q">Which statement about the System R join search is false?</p>
+    <button class="mcq-opt">It restricts the search to left-deep trees, where each join's inner input is a base table.</button>
+    <button class="mcq-opt">It keeps the cheapest plan per interesting order, not only the single cheapest plan per subset.</button>
+    <button class="mcq-opt">It pushes Cartesian products late by only extending a composite with a join-connected relation.</button>
+    <button class="mcq-opt">It searches all bushy trees so a join can take two intermediate results as inputs.</button>
+    <p class="mcq-explain">System R excludes bushy trees; it searches only left-deep plans to keep one
+    pipelined composite in flight. The other three statements are exactly what the dynamic program does. Some
+    modern systems add bushy plans, but the classic optimizer does not.</p>
+  </div>
+
+  <div class="mcq" data-answer="2">
+    <p class="mcq-q">Why does the optimizer keep a plan for every interesting order, even a non-cheapest one?</p>
+    <button class="mcq-opt">Because the executor cannot run a plan unless one copy exists per output column.</button>
+    <button class="mcq-opt">Because predicate pushdown requires a separate sorted plan for each filter it moves.</button>
+    <button class="mcq-opt">Because a plan producing tuples already sorted on a join column lets a later merge join skip its sort.</button>
+    <button class="mcq-opt">Because interesting orders are the only plans the cost model can compare numerically.</button>
+    <p class="mcq-explain">An interesting order (ORDER BY, GROUP BY, or any join column) can be reused
+    downstream. Carrying a slightly pricier scan that delivers sorted output can repay itself when a
+    sort-merge join then avoids sorting. Pushdown is a separate, unconditional rewrite, not the reason here.</p>
+  </div>
+
+  <div class="mcq" data-answer="1">
+    <p class="mcq-q">Which statement about histograms and statistics is false?</p>
+    <button class="mcq-opt">Equi-depth buckets hold roughly equal row counts, so resolution lands where data is dense.</button>
+    <button class="mcq-opt">PostgreSQL's <code>n_distinct = -1</code> means the statistic is missing or could not be computed.</button>
+    <button class="mcq-opt">Equi-width buckets cover equal value ranges, so a skewed column overloads one bucket.</button>
+    <button class="mcq-opt">PostgreSQL pairs an equi-depth histogram with a most-common-values list for the spikes.</button>
+    <p class="mcq-explain"><code>n_distinct = -1</code> means the column is fully distinct: one distinct value
+    per row. The negative encoding expresses the count as a fraction of table size so it stays valid as the
+    table grows. The other three describe equi-depth, equi-width, and the MCV-plus-histogram split
+    correctly.</p>
+  </div>
+
+  <!-- ===== FLASHCARDS ===== -->
+  <div class="flashcard">
+    <div class="fc-front">Why does a non-clustered index get expensive faster than a clustered one as selectivity grows?</div>
+    <div class="fc-back">Its cost tracks the matching tuple count (NCARD), because matching rows can be one
+    per page. A clustered index tracks data pages (TCARD), since rows sit in index order. NCARD is usually
+    much larger than TCARD, so the non-clustered cost climbs steeply and eventually loses to the full scan.</div>
+  </div>
+
+  <div class="flashcard">
+    <div class="fc-front">State the substructure property that makes the Selinger join search a dynamic program.</div>
+    <div class="fc-back">Once the first k relations are joined, the cheapest way to add the (k+1)-th relation
+    is independent of the order in which the first k were joined. So the best plan for each relation subset
+    can be computed once and reused as a building block for larger subsets.</div>
+  </div>
+
+  <div class="flashcard">
+    <div class="fc-front">What two assumptions in System R's default selectivity factors fail on real data, and how?</div>
+    <div class="fc-back">Uniformity (equality selectivity = 1/distinct) fails on skew, where a few values
+    dominate. Independence (ANDed selectivities multiply) fails on correlation, where the product badly
+    underestimates because the second predicate barely filters once the first holds.</div>
+  </div>
+
+  <!-- ===== PRIMARY SOURCE ===== -->
+  <div class="source-box">
+    <div class="src-tag">Primary source</div>
+    <div class="src-title">Read this next:
+      <a href="https://people.eecs.berkeley.edu/~brewer/cs262/3-selinger79.pdf">Selinger et al., Access Path
+      Selection in a Relational Database Management System (SIGMOD 1979)</a></div>
+    <p class="muted">The System R optimizer, and the template every cost-based optimizer still follows. Focus
+    on Section 4 (the <code>COST = PAGE FETCHES + W * RSI CALLS</code> model and the Table 1 selectivity
+    constants <code>1/10</code>, <code>1/3</code>, <code>1/4</code>) and Section 5 (the dynamic-programming
+    join search, the left-deep restriction, and interesting orders).</p>
+  </div>
+
+  <!-- ===== ASK YOUR TEACHER ===== -->
+  <div class="ask-teacher">
+    <div class="at-tag">Ask your teacher</div>
+    <p>Want to see the cost crossover worked out with real <code>TCARD</code> and <code>NCARD</code> numbers,
+    or trace the DP on a five-table query by hand? Ask me to push harder on selectivity arithmetic, to draw
+    the lattice differently, or to quiz you on the "which is false" traps until they are automatic. I am your
+    teacher for this course, not just a document.</p>
+  </div>
+
+  <!-- ===== NAV ===== -->
+  <nav class="lesson-nav">
+    <a class="prev" href="0010-query-execution-joins.html">
+      <span class="nav-dir">Previous</span>
+      <span class="nav-title">Week 10 · Joins, external sort, and aggregation</span>
+    </a>
+    <a class="next" href="0012-transactions-isolation.html">
+      <span class="nav-dir">Next</span>
+      <span class="nav-title">Week 12 · Transactions, ACID, anomalies, and isolation levels</span>
+    </a>
+  </nav>
+
+  </div><!-- /.col -->
+</main>
+</body>
+</html>

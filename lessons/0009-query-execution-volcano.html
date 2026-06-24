@@ -1,0 +1,815 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lesson 09 · Query execution: the Volcano iterator model · Field Guide to the Database Engine</title>
+<link rel="stylesheet" href="../assets/course.css">
+<script defer src="../assets/components.js"></script>
+</head>
+<body class="layer-query">
+<main class="page">
+
+  <!-- ===== MASTHEAD ===== -->
+  <header class="masthead col">
+    <div class="crumbs">
+      <a href="../index.html">Field Guide</a> <span>/</span>
+      <span>Part V · Query processing</span> <span>/</span>
+      <span>Week 09</span>
+    </div>
+    <span class="week-badge">Query processor</span>
+    <h1>Query execution: the Volcano iterator model</h1>
+    <p class="lede">The optimizer just handed you a tree of operators. How does that tree turn into
+    rows on the wire without writing a temporary table at every step, and without each operator
+    knowing what feeds it?</p>
+  </header>
+
+  <div class="col">
+
+  <!-- ===== OBJECTIVES ===== -->
+  <div class="objectives">
+    <h4>By the end you can</h4>
+    <ul>
+      <li>Explain why materializing each operator's full output is correct but wasteful, and what the iterator model trades it for.</li>
+      <li>Walk the open / next / close protocol on a real plan tree and say who pulls whom.</li>
+      <li>State why one uniform interface buys composability, bounded memory, and pipelining, and what the per-tuple call costs.</li>
+      <li>Compute the I/O cost of naive, block, and index nested loop joins and say when an index scan loses to a sequential scan.</li>
+      <li>Answer the Volcano paper's viva questions on state records, support functions, and anonymous streams.</li>
+    </ul>
+  </div>
+
+  <!-- ===== WHERE THIS SITS (connective tissue) ===== -->
+  <p>Keep the course's running query in view:</p>
+  <pre><code><span class="tok-kw">SELECT</span> name <span class="tok-kw">FROM</span> emp <span class="tok-kw">WHERE</span> salary &gt; <span class="tok-num">75000</span> <span class="tok-kw">ORDER BY</span> name;</code></pre>
+  <p>By the time it reaches this lesson the string has already been turned into a tree.
+  <a href="0008-query-parsing.html">Week 8</a> lexed, parsed, and bound it into a typed query tree and a
+  logical plan: projection(name) over selection(salary &gt; 75000) over scan(emp), with a sort for the
+  ORDER BY. <a href="0011-query-optimization.html">Week 11</a> will turn that logical plan into a
+  physical plan, choosing a sequential scan or an index scan on salary and deciding whether the sort can
+  be skipped. This week sits between them in the pipeline but is taught first, because you cannot reason
+  about which plan is cheapest until you know how a plan actually runs.</p>
+
+  <p>So the layer above (the optimizer) hands this layer a finished physical plan: a tree of concrete
+  operators. This layer hands down a stream of page requests. When the scan at the bottom of the tree
+  needs data, it asks the access method (<a href="0006-btree-search-insert.html">weeks 6</a> and 7) for
+  tuples, which asks the buffer pool (<a href="0004-buffer-pool-design.html">weeks 4</a> and 5) for pages
+  by id, which asks the storage manager (<a href="0002-storage-engine-disk-pages.html">weeks 2</a> and 3)
+  to read bytes off disk. The whole stack is the spine from <a href="0001-dbms-architecture.html">week 1</a>.
+  Our job here is the middle of journey 1: the executor.</p>
+
+  <div class="callout intuition">
+    <div class="callout-title">Intuition</div>
+    <p>Picture a bucket brigade, but reversed. Instead of the bottom of the line passing buckets up
+    whether the top wants them or not, the person at the top says "next" and that request travels all
+    the way down to the well. One bucket of water comes back up the line, hand to hand. Nobody fills a
+    reservoir. Nobody moves until asked. That single-bucket, on-demand discipline is the iterator model.</p>
+  </div>
+
+  <!-- ===== THE PROBLEM ===== -->
+  <h2>The problem: do not build a table you were never asked for</h2>
+
+  <p>The executor receives a tree of physical operators and must produce tuples. The most obvious way
+  to run a tree is to evaluate it bottom up. Run the scan, write all of its output to a temporary table.
+  Run the filter over that table, write its output to another temporary table. Run the projection, write
+  a third. Hand the last table to the client. This is the <em>materialization</em> model, and it is
+  perfectly correct.</p>
+
+  <p>It has two costs that sink it. The first is memory and I/O. Each operator writes its whole output
+  and the next operator rereads it. A five-operator plan over a billion-row table writes and rereads a
+  billion rows four times to produce results nobody asked to keep. The second cost is uniformity. If the
+  join operator hard-codes the fact that its input is a temporary file on disk, you cannot feed it the
+  output of an index scan or another join without rewriting it. Operators stop composing.</p>
+
+  <div class="callout why">
+    <div class="callout-title">Why it works this way</div>
+    <p>The constraint: the executor must compose arbitrary operators and must not pay for intermediate
+    results the query never requested. The naive fix (materialize each step) breaks both. So invert the
+    control flow. Instead of each operator producing its whole result and pushing it, let each operator
+    expose one tiny interface that produces exactly one tuple when asked, and pulls from its own input
+    one tuple at a time. Then a tuple can travel from scan to filter to projection without ever touching
+    disk, and any operator can sit on top of any other because they all speak the same three-call
+    protocol. That protocol is open / next / close, the Volcano iterator interface
+    [<a href="https://doi.org/10.1109/69.273032">Graefe 1994</a>].</p>
+  </div>
+
+  <!-- ===== THE MECHANISM ===== -->
+  <h2>The mechanism: open, next, close</h2>
+
+  <p>In the iterator model every operator, leaf or internal, implements the same three procedures.
+  Graefe frames them as the four parts of a loop over a result set: initialization, the increment,
+  the termination test, and the final housekeeping [<a href="https://doi.org/10.1109/69.273032">Graefe
+  1994, Section III.B</a>].</p>
+
+  <ul>
+    <li><code>open()</code>: set up state, recursively open the inputs, allocate any buffers or hash tables this operator needs.</li>
+    <li><code>next()</code>: return the next output tuple, or an end-of-stream marker when there are no more. Call <code>next()</code> on an input only when more input is needed.</li>
+    <li><code>close()</code>: release state and recursively close the inputs.</li>
+  </ul>
+
+  <p>Execution is demand-driven and top-down by control, bottom-up by data. The consumer at the root
+  calls <code>next()</code>. That call recurses down to the leaves. One tuple bubbles back up per call.
+  The PostgreSQL executor states the same contract: each node, when called, produces the next tuple in
+  its output sequence or NULL if none remain, and a non-leaf node calls its child nodes in turn to obtain
+  input [<a href="https://github.com/postgres/postgres/blob/master/src/backend/executor/README">PostgreSQL
+  executor README</a>]. Parents pull. Children never push.</p>
+
+  <!-- ===== FIGURE: control down, data up ===== -->
+  <figure class="diagram">
+    <svg viewBox="0 0 540 270" role="img" aria-label="Operator tree with control flowing down and tuples flowing up">
+      <defs>
+        <marker id="vex-down" markerWidth="9" markerHeight="9" refX="6" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="var(--query)"/></marker>
+        <marker id="vex-up" markerWidth="9" markerHeight="9" refX="6" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="var(--good)"/></marker>
+      </defs>
+      <!-- nodes -->
+      <rect x="200" y="14" width="140" height="38" rx="6" fill="var(--query-bg)" stroke="var(--query)"/>
+      <text x="270" y="38" text-anchor="middle" class="svg-mono">Projection(name)</text>
+      <rect x="200" y="92" width="140" height="38" rx="6" fill="var(--query-bg)" stroke="var(--query)"/>
+      <text x="270" y="116" text-anchor="middle" class="svg-mono">Filter(sal&gt;75000)</text>
+      <rect x="200" y="170" width="140" height="38" rx="6" fill="#fffdf8" stroke="var(--ink-soft)"/>
+      <text x="270" y="194" text-anchor="middle" class="svg-mono">SeqScan(emp)</text>
+      <!-- control arrows (down, left side) -->
+      <line x1="150" y1="33" x2="150" y2="111" stroke="var(--query)" stroke-width="1.5" marker-end="url(#vex-down)"/>
+      <line x1="150" y1="111" x2="150" y2="189" stroke="var(--query)" stroke-width="1.5" marker-end="url(#vex-down)"/>
+      <line x1="198" y1="33" x2="152" y2="33" stroke="var(--query)" stroke-width="1.5"/>
+      <line x1="152" y1="111" x2="198" y2="111" stroke="var(--query)" stroke-width="1.5"/>
+      <line x1="152" y1="189" x2="198" y2="189" stroke="var(--query)" stroke-width="1.5"/>
+      <text x="96" y="78" text-anchor="middle" class="svg-label" fill="var(--query)">next()</text>
+      <text x="96" y="156" text-anchor="middle" class="svg-label" fill="var(--query)">next()</text>
+      <text x="62" y="118" text-anchor="middle" class="svg-label" fill="var(--query)" transform="rotate(-90 62 118)">control flows down</text>
+      <!-- data arrows (up, right side) -->
+      <line x1="390" y1="189" x2="390" y2="113" stroke="var(--good)" stroke-width="1.5" marker-end="url(#vex-up)"/>
+      <line x1="390" y1="111" x2="390" y2="35" stroke="var(--good)" stroke-width="1.5" marker-end="url(#vex-up)"/>
+      <line x1="342" y1="189" x2="388" y2="189" stroke="var(--good)" stroke-width="1.5"/>
+      <line x1="342" y1="111" x2="388" y2="111" stroke="var(--good)" stroke-width="1.5"/>
+      <line x1="388" y1="33" x2="342" y2="33" stroke="var(--good)" stroke-width="1.5"/>
+      <text x="446" y="156" text-anchor="middle" class="svg-label" fill="var(--good)">one tuple</text>
+      <text x="446" y="78" text-anchor="middle" class="svg-label" fill="var(--good)">one tuple</text>
+      <text x="478" y="118" text-anchor="middle" class="svg-label" fill="var(--good)" transform="rotate(90 478 118)">tuples flow up</text>
+      <!-- the bottom request -->
+      <line x1="270" y1="208" x2="270" y2="240" stroke="var(--ink-soft)" stroke-width="1.5" marker-end="url(#vex-down)"/>
+      <text x="270" y="258" text-anchor="middle" class="svg-label">ask access method / buffer pool for the next heap page</text>
+    </svg>
+    <figcaption><b>Figure 1.</b> The same call stack carries control down (left, indigo) and data up
+    (right, green). One <code>next()</code> at the root pulls exactly one tuple from the leaf. Notice the
+    two arrows are the same edges traversed in opposite senses: the recursion descends, then unwinds with
+    a tuple.</figcaption>
+  </figure>
+
+  <p>Two design choices in that picture deserve a name. First, an operator never learns what kind of
+  operator feeds it. It just calls <code>next()</code> on an input pointer. Graefe calls these
+  <em>anonymous inputs</em> or <em>streams</em>, and they are the reason any operator nests inside any
+  other [<a href="https://doi.org/10.1109/69.273032">Graefe 1994, Section III.B</a>]. Second, all of an
+  iterator's per-instance data lives in a <em>state record</em>, with no static variables. That invariant
+  is what lets the same operator code (say, sort) appear several times in one plan: each occurrence gets
+  its own state record [<a href="https://doi.org/10.1109/69.273032">Graefe 1994, Section III.B</a>].</p>
+
+  <div class="callout keyidea">
+    <div class="callout-title">Keep this one thing</div>
+    <p>The executor is a tree of iterators that all speak open / next / close. The root pulls one tuple
+    at a time and the request recurses to the leaves. Pull, not push. One tuple, not a table.</p>
+  </div>
+
+  <!-- ===== SIMULATOR ===== -->
+  <h2>Watch one tuple bubble up</h2>
+
+  <p>The simulator below runs our query's plan: SeqScan(emp) feeding Filter(salary &gt; 75000) feeding
+  Projection(name). Click Step (or Play) to issue one <code>next()</code> at the root and watch it travel
+  down and a tuple travel back up. Each operator shows the tuple it currently holds, and a counter tallies
+  how many <code>next()</code> calls each operator has fielded. Filter and Projection never hold more than
+  one tuple, which is the whole point.</p>
+
+  <figure class="sim" id="vex-sim">
+    <div class="sim-head">
+      <span class="sim-title">Single-tuple iterator stepper</span>
+      <span class="sim-sub">press Step to pull one tuple through the plan</span>
+    </div>
+    <div class="sim-body">
+      <div class="sim-stage"><svg id="vex-svg" viewBox="0 0 560 300" width="100%"></svg></div>
+      <div class="sim-controls" id="vex-controls"></div>
+      <div class="sim-readout" id="vex-readout"></div>
+    </div>
+  </figure>
+  <figcaption class="muted" style="margin-top:-1rem">Experiment to run: step several times and notice
+  that the scan is called more often than the projection. Rows that fail salary &gt; 75000 are dropped at
+  the filter, so the scan must be pulled repeatedly before one tuple reaches the top. That gap is the
+  filter's selectivity made visible.</figcaption>
+
+  <script>
+  // Single-tuple iterator stepper. Demand-driven pull over a 3-operator plan.
+  (function () {
+    const svg = document.getElementById("vex-svg");
+    const readout = document.getElementById("vex-readout");
+
+    // Tiny emp table. Each row: {name, salary}. Pages are conceptual; we step per tuple.
+    const ROWS = [
+      { name: "Ada",   sal: 91000 },
+      { name: "Bao",   sal: 64000 },
+      { name: "Cruz",  sal: 78000 },
+      { name: "Devi",  sal: 52000 },
+      { name: "Esra",  sal: 83000 },
+      { name: "Finn",  sal: 70000 }
+    ];
+    const THRESH = 75000;
+
+    // Precompute the trace of micro-events for deterministic stepping.
+    // Each event: which operators are active, what tuple each holds, and the call counts.
+    // We model a pull: Projection.next -> Filter.next -> SeqScan.next (loops until a row passes).
+    function buildTrace() {
+      const events = [];
+      let calls = { scan: 0, filt: 0, proj: 0 };
+      let scanCursor = 0;
+      // helper to push a snapshot
+      function snap(active, held, note) {
+        events.push({
+          active: active,
+          held: { scan: held.scan, filt: held.filt, proj: held.proj },
+          calls: { scan: calls.scan, filt: calls.filt, proj: calls.proj },
+          note: note
+        });
+      }
+      let held = { scan: null, filt: null, proj: null };
+      // Outer driver pulls from projection until scan is exhausted.
+      while (scanCursor <= ROWS.length) {
+        // Projection asks Filter.
+        calls.proj++;
+        snap(["proj"], held, "Projection.next(): asks Filter for a row");
+        let passed = null;
+        // Filter loops over scan rows until one passes the predicate or scan ends.
+        while (true) {
+          if (scanCursor >= ROWS.length) {
+            calls.filt++;
+            held = { scan: null, filt: null, proj: held.proj };
+            snap(["filt"], held, "Filter.next(): asks SeqScan, which is exhausted -> end of stream");
+            break;
+          }
+          calls.filt++;
+          snap(["filt"], held, "Filter.next(): asks SeqScan for a row");
+          // Scan returns a row.
+          calls.scan++;
+          const r = ROWS[scanCursor];
+          scanCursor++;
+          held = { scan: r, filt: null, proj: held.proj };
+          snap(["scan"], held, "SeqScan.next(): returns row " + r.name + " (salary " + r.sal + ")");
+          // Filter applies predicate.
+          if (r.sal > THRESH) {
+            held = { scan: r, filt: r, proj: held.proj };
+            snap(["filt"], held, "Filter: " + r.sal + " > " + THRESH + " passes, hand row up");
+            passed = r;
+            break;
+          } else {
+            held = { scan: r, filt: null, proj: held.proj };
+            snap(["filt"], held, "Filter: " + r.sal + " > " + THRESH + " fails, drop row, loop");
+          }
+        }
+        if (passed) {
+          held = { scan: held.scan, filt: passed, proj: { name: passed.name } };
+          snap(["proj"], held, "Projection: keep only name = \"" + passed.name + "\", emit to root");
+        } else {
+          // scan exhausted; projection returns end of stream and we stop.
+          held = { scan: null, filt: null, proj: null };
+          snap(["proj"], held, "Projection.next(): end of stream, query complete");
+          break;
+        }
+      }
+      return events;
+    }
+
+    const TRACE = buildTrace();
+
+    const OPS = [
+      { key: "proj", label: "Projection(name)", x: 200, y: 18,  w: 160, leaf: false },
+      { key: "filt", label: "Filter(sal>75000)", x: 200, y: 110, w: 160, leaf: false },
+      { key: "scan", label: "SeqScan(emp)",      x: 200, y: 202, w: 160, leaf: true }
+    ];
+
+    function fmtHeld(op, ev) {
+      const h = ev.held[op.key];
+      if (!h) return "(empty)";
+      if (op.key === "proj") return "{name: " + h.name + "}";
+      return "{" + h.name + ", " + h.sal + "}";
+    }
+
+    function render(i) {
+      const ev = TRACE[Math.min(i, TRACE.length - 1)];
+      svg.innerHTML = "";
+      // edges between the three boxes
+      [[OPS[0], OPS[1]], [OPS[1], OPS[2]]].forEach(function (pair) {
+        const a = pair[0], b = pair[1];
+        const cx = a.x + a.w / 2;
+        svg.appendChild(DBMS.svg("line", { x1: cx, y1: a.y + 50, x2: cx, y2: b.y, stroke: "var(--rule)", "stroke-width": 1.5 }));
+      });
+      OPS.forEach(function (op) {
+        const on = ev.active.indexOf(op.key) >= 0;
+        const holds = !!ev.held[op.key];
+        svg.appendChild(DBMS.svg("rect", {
+          x: op.x, y: op.y, width: op.w, height: 50, rx: 6,
+          fill: on ? "var(--query)" : (op.leaf ? "#fffdf8" : "var(--query-bg)"),
+          stroke: on ? "var(--query)" : (op.leaf ? "var(--ink-soft)" : "var(--query)"),
+          "stroke-width": on ? 2.5 : 1
+        }));
+        svg.appendChild(DBMS.svg("text", {
+          x: op.x + op.w / 2, y: op.y + 21, "text-anchor": "middle", class: "svg-mono",
+          fill: on ? "#fff" : "var(--ink)"
+        }, op.label));
+        svg.appendChild(DBMS.svg("text", {
+          x: op.x + op.w / 2, y: op.y + 39, "text-anchor": "middle", class: "svg-label",
+          fill: on ? "#fff" : (holds ? "var(--good)" : "var(--ink-faint)")
+        }, "holds: " + fmtHeld(op, ev)));
+        // call counter chip to the right
+        svg.appendChild(DBMS.svg("rect", { x: op.x + op.w + 16, y: op.y + 13, width: 96, height: 24, rx: 12, fill: "var(--paper-2)", stroke: "var(--rule)" }));
+        svg.appendChild(DBMS.svg("text", { x: op.x + op.w + 64, y: op.y + 29, "text-anchor": "middle", class: "svg-label" }, "next() x " + ev.calls[op.key]));
+      });
+      // root puller arrow
+      svg.appendChild(DBMS.svg("text", { x: 280, y: 286, "text-anchor": "middle", class: "svg-label", fill: "var(--ink-soft)" }, "root driver pulls Projection.next()"));
+      readout.textContent = "step " + Math.min(i, TRACE.length - 1) + " / " + (TRACE.length - 1) + "\n" + ev.note +
+        "\ncalls so far  scan: " + ev.calls.scan + "   filter: " + ev.calls.filt + "   projection: " + ev.calls.proj;
+    }
+
+    DBMS.stepper({
+      controls: document.getElementById("vex-controls"),
+      steps: TRACE.length - 1,
+      onRender: render,
+      labels: { step: "Step", reset: "Restart" },
+      autoMs: 800
+    });
+  })();
+  </script>
+
+  <div class="callout gotcha">
+    <div class="callout-title">Exam trap</div>
+    <p>It is tempting to say the Volcano model pushes tuples from producers up to consumers. It does not.
+    Volcano is demand-driven: the consumer calls <code>next()</code> and the producer responds. Push is
+    the opposite control flow and is the alternative model (the basis of query compilation), not Volcano
+    [<a href="https://doi.org/10.1109/69.273032">Graefe 1994</a>].</p>
+  </div>
+
+  <!-- ===== ALGORITHM-SHELL + SUPPORT FUNCTION ===== -->
+  <h2>One interface, many operators</h2>
+
+  <p>The reason a handful of operators cover so much SQL is that Volcano splits each operator into an
+  <em>algorithm shell</em> and its <em>support functions</em>. The shell is the open / next / close loop.
+  The support functions do all the item-level work: evaluate a predicate, hash a key, compare two records,
+  compute a projected column. The shell is empty without them; a support function is just a function
+  pointer plus a typeless argument, and because all interpretation of data items is imported this way,
+  Volcano needs no type system for instances and is data-model independent
+  [<a href="https://doi.org/10.1109/69.273032">Graefe 1994, Sections III.A, IV</a>].</p>
+
+  <p>That split is why three of our operators are really one. Volcano's <em>filter</em> operator carries
+  three optional support functions: a predicate (selection), a transform (projection), and an apply
+  function called once per record for side effects (updates, printing). So <code>Filter</code> and
+  <code>Project</code> in the course are the same physical operator with a different support function
+  plugged in [<a href="https://doi.org/10.1109/69.273032">Graefe 1994, Section III.B.1</a>]. The
+  <code>SeqScan</code> is the file-scan iterator. And the entire join family (join, semi-join, outer
+  joins, intersection, union, difference, aggregation, duplicate elimination) is one operator,
+  <em>one-to-one match</em>, because they all reduce to the same step: separate the matching from the
+  non-matching subsets of two inputs and emit a selected, possibly transformed subset
+  [<a href="https://doi.org/10.1109/69.273032">Graefe 1994, Section III.B.2</a>].</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 540 210" role="img" aria-label="Iterator superclass and its subclasses">
+      <rect x="170" y="14" width="200" height="58" rx="6" fill="var(--query-bg)" stroke="var(--query)"/>
+      <text x="270" y="36" text-anchor="middle" class="svg-mono">Iterator</text>
+      <text x="270" y="56" text-anchor="middle" class="svg-label">open() · next() · close() · inputs[]</text>
+      <!-- subclasses -->
+      <g>
+        <rect x="20"  y="140" width="110" height="50" rx="6" fill="#fffdf8" stroke="var(--ink-soft)"/>
+        <text x="75" y="162" text-anchor="middle" class="svg-mono">SeqScan</text>
+        <text x="75" y="180" text-anchor="middle" class="svg-label">leaf, predicate</text>
+        <rect x="150" y="140" width="110" height="50" rx="6" fill="#fffdf8" stroke="var(--ink-soft)"/>
+        <text x="205" y="162" text-anchor="middle" class="svg-mono">Filter</text>
+        <text x="205" y="180" text-anchor="middle" class="svg-label">predicate fn</text>
+        <rect x="280" y="140" width="110" height="50" rx="6" fill="#fffdf8" stroke="var(--ink-soft)"/>
+        <text x="335" y="162" text-anchor="middle" class="svg-mono">Project</text>
+        <text x="335" y="180" text-anchor="middle" class="svg-label">transform fn</text>
+        <rect x="410" y="140" width="110" height="50" rx="6" fill="#fffdf8" stroke="var(--ink-soft)"/>
+        <text x="465" y="162" text-anchor="middle" class="svg-mono">Join</text>
+        <text x="465" y="180" text-anchor="middle" class="svg-label">one-to-one match</text>
+      </g>
+      <!-- inheritance lines -->
+      <line x1="270" y1="72" x2="270" y2="100" stroke="var(--ink-soft)"/>
+      <line x1="75" y1="100" x2="465" y2="100" stroke="var(--ink-soft)"/>
+      <line x1="75" y1="100" x2="75" y2="140" stroke="var(--ink-soft)"/>
+      <line x1="205" y1="100" x2="205" y2="140" stroke="var(--ink-soft)"/>
+      <line x1="335" y1="100" x2="335" y2="140" stroke="var(--ink-soft)"/>
+      <line x1="465" y1="100" x2="465" y2="140" stroke="var(--ink-soft)"/>
+    </svg>
+    <figcaption><b>Figure 2.</b> Every operator subclasses the same iterator interface. Filter and Project
+    are the same shell with a different support function. The join is one general matching operator. New
+    operators slot in without touching the others, because the interface, not the operator type, is what
+    each parent depends on.</figcaption>
+  </figure>
+
+  <pre><code><span class="tok-com"># the iterator contract, as pseudocode. Every operator looks like this.</span>
+<span class="tok-kw">class</span> <span class="tok-fn">Filter</span>(Iterator):
+    <span class="tok-kw">def</span> <span class="tok-fn">open</span>(self):
+        self.child.open()                 <span class="tok-com"># recurse down</span>
+    <span class="tok-kw">def</span> <span class="tok-fn">next</span>(self):
+        <span class="tok-kw">while</span> <span class="tok-num">True</span>:
+            row = self.child.next()        <span class="tok-com"># pull one tuple from the anonymous input</span>
+            <span class="tok-kw">if</span> row <span class="tok-kw">is</span> EOF:
+                <span class="tok-kw">return</span> EOF
+            <span class="tok-kw">if</span> self.predicate(row):       <span class="tok-com"># support function, imported</span>
+                <span class="tok-kw">return</span> row                 <span class="tok-com"># pass it up; O(1) state, one row held</span>
+            <span class="tok-com"># else drop it and loop: pull again</span>
+    <span class="tok-kw">def</span> <span class="tok-fn">close</span>(self):
+        self.child.close()                 <span class="tok-com"># recurse down</span></code></pre>
+
+  <div class="callout why">
+    <div class="callout-title">Why pull is the right abstraction</div>
+    <p>Three properties fall out of pull, and they are the reason every textbook executor uses it.
+    Composability: a join's <code>next()</code> just calls its children's <code>next()</code>, so it does
+    not care what the child is. Bounded memory: Filter, Projection, and the probe side of a join hold one
+    tuple at a time, not the whole input, so a streaming plan runs in tiny memory. Pipelining: a tuple can
+    travel scan to filter to projection without ever being written to disk
+    [<a href="https://www.postgresql.org/docs/current/planner-optimizer.html">PG planner</a>]. The cost
+    is one function call per operator per tuple. For a billion tuples that is billions of virtual calls,
+    which is exactly why modern analytic engines move to vectorized or compiled push execution. You will
+    meet those in <a href="0015-modern-architectures-lsm.html">week 15</a>.</p>
+  </div>
+
+  <!-- ===== PIPELINE BREAKERS ===== -->
+  <h2>Where the pipeline has to stop</h2>
+
+  <p>Not every operator can stream. A <em>pipeline breaker</em> must consume its entire input before it
+  can emit a single output tuple. Our running query has one: the <code>ORDER BY name</code> sort. Sort
+  cannot know which tuple is smallest until it has seen the last input tuple, so it pulls every tuple from
+  below, buffers them (spilling to disk via external merge sort if they exceed memory), and only then
+  starts returning them in order. The build side of a hash join is the other classic breaker: the hash
+  table must be fully built before any probe can match
+  [<a href="https://15445.courses.cs.cmu.edu/spring2025/notes/12-joins.pdf">CMU 15-445 joins</a>].</p>
+
+  <p>Breakers are where a query's memory budget is set, because that is where a whole input (or a hash
+  table, or sorted runs) must live. In PostgreSQL that budget is <code>work_mem</code>, the per-operation
+  memory before a sort or hash spills to temporary disk files
+  [<a href="https://www.postgresql.org/docs/current/runtime-config-resource.html">PG resource config</a>].
+  External sort, the hash build, and grace partitioning are the subject of
+  <a href="0010-query-execution-joins.html">week 10</a>; here just hold the distinction: Filter and
+  Projection are streaming with O(1) state, Sort and the hash build are breakers.</p>
+
+  <table>
+    <caption>Streaming operators versus pipeline breakers.</caption>
+    <thead><tr><th>Operator</th><th>State held</th><th>Streams or breaks</th></tr></thead>
+    <tbody>
+      <tr><td>SeqScan, IndexScan</td><td>one cursor</td><td>streams</td></tr>
+      <tr><td>Filter, Projection</td><td>one tuple</td><td>streams</td></tr>
+      <tr><td>Index nested loop, merge step</td><td>one tuple per side</td><td>streams</td></tr>
+      <tr><td>Sort (ORDER BY)</td><td>whole input or sorted runs</td><td>breaks</td></tr>
+      <tr><td>Hash join build side</td><td>whole hash table</td><td>breaks</td></tr>
+      <tr><td>Aggregation, DISTINCT</td><td>one entry per group, or whole sort</td><td>breaks</td></tr>
+    </tbody>
+  </table>
+
+  <!-- ===== NESTED LOOP JOIN COST ===== -->
+  <h2>The cost of the simplest join</h2>
+
+  <p>Our running query has no join, but most queries do, and the join is where the iterator model first
+  meets real I/O cost. A join of R and S is conceptually the Cartesian product filtered by a predicate.
+  Done literally that is |R| times |S| comparisons. The nested loop join is the most direct way to run it
+  as iterators, and its three variants show how much the same logical join can cost depending on the
+  physical choice.</p>
+
+  <p>Let R (the outer) have M pages holding m tuples, and S (the inner) have N pages. The
+  <strong>naive nested loop</strong> rereads all of S once per outer tuple:</p>
+
+  <pre><code>naive nested loop:  M + (m &times; N)</code></pre>
+
+  <p>The <code>m &times; N</code> term is the killer. The <strong>block nested loop</strong> rereads S
+  once per outer block instead of per tuple, giving the outer scan B - 2 buffer frames (one for an inner
+  page, one for output):</p>
+
+  <pre><code>block nested loop:  M + (ceil(M / (B - 2)) &times; N)</code></pre>
+
+  <p>The <strong>index nested loop</strong> replaces the inner scan with an index probe at roughly
+  constant cost C per outer tuple:</p>
+
+  <pre><code>index nested loop:  M + (m &times; C)</code></pre>
+
+  <p>On the standard CMU example (M = 1000, m = 100000, N = 500, B = 100, 0.1 ms per I/O) the naive form
+  is about 1.4 hours, the block form about 6.5 seconds, and the right index turns it into a few hundred
+  milliseconds [<a href="https://15445.courses.cs.cmu.edu/spring2025/notes/12-joins.pdf">CMU 15-445
+  joins</a>]. Same logical join, four orders of magnitude apart. The simulator below lets you feel the
+  block term move as you change the buffer count.</p>
+
+  <figure class="sim" id="vnl-sim">
+    <div class="sim-head">
+      <span class="sim-title">Nested loop cost calculator</span>
+      <span class="sim-sub">drag the sliders and watch the three variants diverge</span>
+    </div>
+    <div class="sim-body">
+      <div class="sim-stage"><svg id="vnl-svg" viewBox="0 0 560 180" width="100%"></svg></div>
+      <div class="sim-controls" id="vnl-controls"></div>
+      <div class="sim-readout" id="vnl-readout"></div>
+    </div>
+  </figure>
+  <figcaption class="muted" style="margin-top:-1rem">Experiment: push the buffer count B up and watch
+  only the block bar shrink. The naive bar ignores B entirely (it rereads per tuple), and the index bar
+  ignores B too (it probes, it does not scan). More memory helps the block join and nothing else here.</figcaption>
+
+  <script>
+  // Nested loop join cost calculator. Bars for naive, block, index variants.
+  (function () {
+    const svg = document.getElementById("vnl-svg");
+    const readout = document.getElementById("vnl-readout");
+    const controls = document.getElementById("vnl-controls");
+
+    const state = { M: 1000, m: 100000, N: 500, B: 100, C: 4, ioMs: 0.1 };
+
+    function mkSlider(label, key, min, max, step) {
+      const out = DBMS.el("span", { class: "pill" });
+      const inp = DBMS.el("input", { type: "range", min: min, max: max, step: step, value: state[key] });
+      inp.addEventListener("input", function () { state[key] = Number(inp.value); draw(); });
+      const wrap = DBMS.el("label", null, [label + " ", inp, " ", out]);
+      DBMS.bindRange(inp, out, function (v) { return v; });
+      controls.appendChild(wrap);
+    }
+
+    function costs() {
+      const naive = state.M + state.m * state.N;
+      const blk = state.M + Math.ceil(state.M / Math.max(1, (state.B - 2))) * state.N;
+      const idx = state.M + state.m * state.C;
+      return { naive: naive, blk: blk, idx: idx };
+    }
+
+    function human(io) {
+      const sec = io * state.ioMs / 1000;
+      if (sec >= 3600) return (sec / 3600).toFixed(2) + " h";
+      if (sec >= 1) return sec.toFixed(2) + " s";
+      return (sec * 1000).toFixed(0) + " ms";
+    }
+
+    function draw() {
+      const c = costs();
+      const rows = [
+        { name: "naive  M + m*N", io: c.naive, fill: "var(--bad)" },
+        { name: "block  M + ceil(M/(B-2))*N", io: c.blk, fill: "var(--warn)" },
+        { name: "index  M + m*C", io: c.idx, fill: "var(--good)" }
+      ];
+      const maxIo = Math.max(c.naive, c.blk, c.idx, 1);
+      // log scale so the index bar is visible next to the naive bar
+      const lmax = Math.log10(maxIo + 1);
+      svg.innerHTML = "";
+      rows.forEach(function (r, i) {
+        const y = 20 + i * 50;
+        const w = 360 * (Math.log10(r.io + 1) / lmax);
+        svg.appendChild(DBMS.svg("text", { x: 8, y: y + 14, class: "svg-label" }, r.name));
+        svg.appendChild(DBMS.svg("rect", { x: 8, y: y + 20, width: 360, height: 16, rx: 3, fill: "var(--paper-2)", stroke: "var(--rule)" }));
+        svg.appendChild(DBMS.svg("rect", { x: 8, y: y + 20, width: Math.max(2, w), height: 16, rx: 3, fill: r.fill }));
+        svg.appendChild(DBMS.svg("text", { x: 380, y: y + 33, class: "svg-mono" }, r.io.toLocaleString() + " I/O  ~ " + human(r.io)));
+      });
+      svg.appendChild(DBMS.svg("text", { x: 8, y: 174, class: "svg-label svg-faint" }, "bars on a log scale; lengths compress huge differences"));
+      readout.textContent = "M=" + state.M + " pages, m=" + state.m + " outer tuples, N=" + state.N +
+        " pages, B=" + state.B + " frames, C=" + state.C + " I/O per probe\n" +
+        "naive " + human(c.naive) + "   block " + human(c.blk) + "   index " + human(c.idx) +
+        "   (at " + state.ioMs + " ms/IO)";
+    }
+
+    mkSlider("M (R pages)", "M", 100, 4000, 100);
+    mkSlider("m (R tuples)", "m", 10000, 300000, 10000);
+    mkSlider("N (S pages)", "N", 100, 2000, 100);
+    mkSlider("B (frames)", "B", 3, 400, 1);
+    draw();
+  })();
+  </script>
+
+  <div class="callout realworld">
+    <div class="callout-title">In real systems</div>
+    <p>PostgreSQL is a textbook pull-based Volcano executor. A plan is a tree of <code>Plan</code> nodes;
+    at execution each becomes a <code>PlanState</code>. <code>ExecInitNode</code> recursively initializes
+    the tree (the open step), <code>ExecProcNode</code> pulls the next tuple from a node (the next step),
+    and <code>ExecEndNode</code> tears it down (the close step). Tuples travel between operators in a
+    <code>TupleTableSlot</code>, one per call, exactly the iterator contract
+    [<a href="https://github.com/postgres/postgres/blob/master/src/backend/executor/README">PostgreSQL
+    executor README</a>]. SQLite is different: it compiles each statement to bytecode for a virtual
+    machine (the VDBE) and the executor is that interpreter, not a tree of operator objects. SQLite also
+    implements joins as nested loops only, with no hash or merge join, and leans on indexes and a
+    polynomial-time join-ordering algorithm to make them fast
+    [<a href="https://sqlite.org/optoverview.html">SQLite query optimizer overview</a>].</p>
+  </div>
+
+  <div class="callout gotcha">
+    <div class="callout-title">Exam trap</div>
+    <p>An index scan is not always faster than a sequential scan. For a low-selectivity predicate (one
+    that matches most of the table) every index match triggers a potentially random heap fetch, and
+    reading 60 percent of a table through an index can be slower than one ordered sequential pass.
+    PostgreSQL always keeps a sequential scan plan available for exactly this reason
+    [<a href="https://www.postgresql.org/docs/current/planner-optimizer.html">PG planner</a>]. The
+    optimizer in <a href="0011-query-optimization.html">week 11</a> decides between them using estimated
+    selectivity.</p>
+  </div>
+
+  <!-- ===== DEEP DIVE ===== -->
+  <details class="deepdive">
+    <summary>Deeper: who owns the tuple in the buffer, and why Volcano avoids temp files</summary>
+    <div>
+      <p>When <code>next()</code> returns a record it returns a status plus a Next-Record structure: an
+      RID and an address of the record pinned in the buffer pool. The ownership invariant is that each
+      pinned record is owned by exactly one operator at a time. On receiving a record an operator may hold
+      it (in a hash table), unfix it (when a predicate fails), or pass it on; operators that build new
+      records, such as a join, fix their output and unfix their inputs
+      [<a href="https://doi.org/10.1109/69.273032">Graefe 1994, Section III.B</a>]. This is the
+      pin-count machinery from <a href="0004-buffer-pool-design.html">week 4</a> seen from the executor's
+      side.</p>
+      <p>Volcano deliberately does not pass intermediate results through temporary files between
+      operators, as some textbooks suggest, because that carries a substantial performance penalty.
+      Intermediate streams live on virtual devices whose pages exist only in the buffer and vanish when
+      unpinned, so the same buffer machinery serves both permanent and intermediate data while keeping it
+      in memory [<a href="https://doi.org/10.1109/69.273032">Graefe 1994, Sections III.A, III.B</a>]. The
+      one place data does hit disk is a pipeline breaker that overflows memory, which is the spill behavior
+      of <a href="0010-query-execution-joins.html">week 10</a>.</p>
+    </div>
+  </details>
+
+  <!-- ===== VIVA ===== -->
+  <h2>Paper viva: Volcano</h2>
+
+  <p>This week's assigned paper is Graefe's "Volcano: An Extensible and Parallel Query Evaluation System"
+  (IEEE TKDE 6(1), 1994). The examiner will not ask you to recite it. They will ask you to defend why the
+  design is shaped the way it is. Try to answer each before opening the model answer.</p>
+
+  <div class="callout viva">
+    <div class="callout-title">Viva prompt 1</div>
+    <p>Name the three procedures of the iterator interface, say what each does, and say who initiates the
+    work in a running plan.</p>
+  </div>
+  <details class="deepdive">
+    <summary>Model answer</summary>
+    <div>
+      <p>The three procedures are open, next, and close. <code>open</code> initializes the operator's
+      state (for example allocates a hash table) and recursively opens all of its inputs, so every
+      iterator in a query is initiated recursively. <code>next</code> produces and returns one result
+      record at a time, calling <code>next</code> on its inputs only when it needs more input, and signals
+      end-of-stream when its source is exhausted; this is lazy, demand-driven evaluation. <code>close</code>
+      releases resources and recursively shuts down the inputs. The consumer initiates the work: the root
+      operator's <code>next</code> is called repeatedly, and each operator pulls from below only on demand.
+      So control flows top-down and data flows bottom-up over the same call stack
+      [<a href="https://doi.org/10.1109/69.273032">Graefe 1994, Section III.B</a>].</p>
+    </div>
+  </details>
+
+  <div class="callout viva">
+    <div class="callout-title">Viva prompt 2</div>
+    <p>Why must every operator share exactly one interface, and what does that uniformity buy? Use the
+    terms anonymous streams and state records in your answer.</p>
+  </div>
+  <details class="deepdive">
+    <summary>Model answer</summary>
+    <div>
+      <p>Because an operator only ever calls open / next / close on its input, it never needs to know what
+      produces that input. Graefe calls these <em>anonymous inputs</em> or <em>streams</em>. Uniformity
+      buys three things. Composability: any operators nest in any combination, so the optimizer can
+      reorder and stack them freely. Extensibility: a new operator is added without touching existing ones,
+      because they depend only on the interface. Orthogonal parallelism: a single special operator
+      (exchange) can be inserted anywhere to parallelize a subtree, with no change to the operators around
+      it. The <em>state record</em> makes this concrete: all of an iterator's arguments and runtime state
+      live in its state record with no static variables, and operators are linked by input pointers stored
+      in those records. That is why the same algorithm, such as sort, can appear several times in one plan,
+      each instance with its own state record [<a href="https://doi.org/10.1109/69.273032">Graefe 1994,
+      Sections III.B, IV, VI</a>].</p>
+    </div>
+  </details>
+
+  <div class="callout viva">
+    <div class="callout-title">Viva prompt 3</div>
+    <p>What is a support function, and why is it the key to Volcano being data-model independent? Tie it
+    to how SeqScan, Filter, Project, and Join map onto Volcano's operators.</p>
+  </div>
+  <details class="deepdive">
+    <summary>Model answer</summary>
+    <div>
+      <p>A support function is an imported function entry point plus a typeless argument that performs all
+      item-level work: predicates, hashing, comparison, projection, and side effects. Volcano's iterators
+      are empty algorithm shells without them. Because all interpretation of data items is imported this
+      way, Volcano needs no instance type system and works for any data type or model; adding a new
+      abstract data type does not change the Volcano code at all
+      [<a href="https://doi.org/10.1109/69.273032">Graefe 1994, Sections III.A, IV</a>]. The course
+      operators map directly. <code>SeqScan</code> is the file-scan iterator. <code>Filter</code> is the
+      filter operator's predicate function and <code>Project</code> is its transform function, so Volcano
+      fuses selection, projection, and side effects into one filter operator. <code>Join</code> is the
+      one-to-one match operator, with hybrid hash and sort-merge implementations whose build, probe, and
+      flush phases map onto open (build) and next (probe then flush)
+      [<a href="https://doi.org/10.1109/69.273032">Graefe 1994, Sections III.B.1, III.B.2</a>].</p>
+    </div>
+  </details>
+
+  <!-- ===== MCQs ===== -->
+  <h2>Check yourself</h2>
+
+  <div class="mcq" data-answer="2">
+    <p class="mcq-q">Which statement about the Volcano iterator model is false?</p>
+    <button class="mcq-opt">A parent operator calls next() on its child to obtain each input tuple.</button>
+    <button class="mcq-opt">Execution is demand-driven, so an operator produces a tuple only when asked.</button>
+    <button class="mcq-opt">Producers push tuples up to consumers as soon as the tuples are ready.</button>
+    <button class="mcq-opt">One next() at the root pulls a single tuple through the whole tree.</button>
+    <p class="mcq-explain">Volcano is pull, not push. The consumer calls next() and the producer responds
+    on demand. Pushing tuples eagerly upward is the opposite control flow and is the alternative model
+    (the basis of query compilation), not Volcano. The other three statements all describe pull correctly.</p>
+  </div>
+
+  <div class="mcq" data-answer="1">
+    <p class="mcq-q">Why can the same operator code, such as sort, appear several times in one query plan?</p>
+    <button class="mcq-opt">Because operators communicate only through temporary files on disk.</button>
+    <button class="mcq-opt">Because all per-instance state lives in a state record and there are no static variables.</button>
+    <button class="mcq-opt">Because the optimizer rewrites duplicate operators into a single shared node.</button>
+    <button class="mcq-opt">Because each operator type is hard-coded to know exactly one parent operator.</button>
+    <button class="mcq-opt">Because every iterator keeps its state in module-level global variables.</button>
+    <p class="mcq-explain">Volcano keeps all of an iterator instance's arguments and runtime state in its
+    own state record, with no static variables. So two sort instances in one plan simply get two state
+    records and never collide. Global or static state would make a second instance overwrite the first.</p>
+  </div>
+
+  <div class="mcq" data-answer="0">
+    <p class="mcq-q">Which statement is false about nested loop join cost?</p>
+    <button class="mcq-opt">Block nested loop rereads the inner table once per outer tuple.</button>
+    <button class="mcq-opt">Naive nested loop costs M + (m times N) and is effectively quadratic.</button>
+    <button class="mcq-opt">Index nested loop costs M + (m times C) using an index probe per outer tuple.</button>
+    <button class="mcq-opt">More buffer frames cut block nested loop cost but not the naive form.</button>
+    <p class="mcq-explain">The block variant rereads the inner table once per outer block, not per outer
+    tuple. Per-tuple rereading is the naive form. That distinction is exactly why adding buffers (a bigger
+    block) shrinks the block join and leaves the naive join untouched.</p>
+  </div>
+
+  <div class="mcq" data-answer="3">
+    <p class="mcq-q">A Filter operator sits above a SeqScan. How much state does Filter hold while running?</p>
+    <button class="mcq-opt">The whole input, because it must see every row before deciding.</button>
+    <button class="mcq-opt">A hash table of every row that has passed the predicate so far.</button>
+    <button class="mcq-opt">Half the input, buffered to amortize the per-tuple call overhead.</button>
+    <button class="mcq-opt">One tuple at a time, dropping rows that fail and pulling again.</button>
+    <p class="mcq-explain">Filter is a streaming operator with O(1) state. It pulls one tuple, tests the
+    predicate, returns it or drops it and loops. It never needs to see more than the current tuple. The
+    operators that must buffer the whole input are pipeline breakers such as sort and the hash build side.</p>
+  </div>
+
+  <div class="mcq" data-answer="2">
+    <p class="mcq-q">Which statement about an index scan versus a sequential scan is false?</p>
+    <button class="mcq-opt">A sequential scan reads every heap page in physical order at cost M pages.</button>
+    <button class="mcq-opt">An index scan wins when the predicate is selective and matches few rows.</button>
+    <button class="mcq-opt">An index scan always beats a sequential scan because it is more direct.</button>
+    <button class="mcq-opt">A low-selectivity index scan can lose to a sequential scan on random fetches.</button>
+    <p class="mcq-explain">An index scan is not always faster. When the predicate matches a large fraction
+    of the table, each match triggers a potentially random heap fetch, and that can cost more than one
+    ordered sequential pass. PostgreSQL keeps a sequential scan plan available precisely for this case.</p>
+  </div>
+
+  <div class="mcq" data-answer="1">
+    <p class="mcq-q">Why does the ORDER BY in our running query force a pipeline breaker?</p>
+    <button class="mcq-opt">Because projection cannot run until the rows are already sorted by name.</button>
+    <button class="mcq-opt">Because sort cannot emit its first tuple until it has seen the last input tuple.</button>
+    <button class="mcq-opt">Because the optimizer forbids sorting inside a pull-based iterator tree.</button>
+    <button class="mcq-opt">Because each next() call to a sort can only return tuples already on disk.</button>
+    <p class="mcq-explain">A sort cannot know which tuple is smallest until it has consumed every input
+    tuple, so it must materialize the whole input (spilling via external merge sort if it overflows
+    memory) before returning the first sorted row. That inability to emit early is what defines a pipeline
+    breaker.</p>
+  </div>
+
+  <!-- ===== FLASHCARDS ===== -->
+  <div class="flashcard">
+    <div class="fc-front">In one sentence: what does next() do, and which direction do control and data flow?</div>
+    <div class="fc-back">next() returns one tuple (or end-of-stream), calling next() on its inputs only when
+    it needs more; control flows top-down (parents call children) and data flows bottom-up (one tuple
+    bubbles to the root), over the same call stack.</div>
+  </div>
+
+  <div class="flashcard">
+    <div class="fc-front">Name two pipeline breakers and say what each must buffer before emitting a tuple.</div>
+    <div class="fc-back">Sort must buffer the whole input (or sorted runs) before returning the smallest
+    tuple. The build side of a hash join must build the entire hash table before any probe can match.
+    Aggregation and DISTINCT break too.</div>
+  </div>
+
+  <!-- ===== PRIMARY SOURCE ===== -->
+  <div class="source-box">
+    <div class="src-tag">Primary source</div>
+    <div class="src-title">Volcano: An Extensible and Parallel Query Evaluation System (Graefe, 1994)</div>
+    <p class="muted">Read Section III.B for the open / next / close protocol, anonymous streams, and state
+    records, and Section III.A for support functions. This is the origin of the iterator model and the
+    assigned paper for this week's viva.
+    <a href="https://doi.org/10.1109/69.273032">doi.org/10.1109/69.273032</a>.
+    Open-access mirror:
+    <a href="https://cs-people.bu.edu/mathan/reading-groups/papers-classics/volcano.pdf">volcano.pdf</a>.</p>
+  </div>
+
+  <!-- ===== ASK YOUR TEACHER ===== -->
+  <div class="ask-teacher">
+    <div class="at-tag">Ask your teacher</div>
+    <p>Want me to trace a plan with a join through the stepper, contrast pull with the push and vectorized
+    models you will meet in week 15, or quiz you harder on the nested loop cost formulas? Ask. I am your
+    teacher for this course, not just a document.</p>
+  </div>
+
+  <!-- ===== NAV ===== -->
+  <nav class="lesson-nav">
+    <a class="prev" href="0008-query-parsing.html">
+      <span class="nav-dir">Previous</span>
+      <span class="nav-title">Week 08 · Query parsing: lexing, parsing, binding, and logical plans</span>
+    </a>
+    <a class="next" href="0010-query-execution-joins.html">
+      <span class="nav-dir">Next</span>
+      <span class="nav-title">Week 10 · Joins, external sort, and aggregation</span>
+    </a>
+  </nav>
+
+  </div><!-- /.col -->
+</main>
+</body>
+</html>

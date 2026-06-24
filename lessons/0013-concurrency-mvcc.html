@@ -1,0 +1,894 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lesson 13 · Concurrency: strict 2PL, deadlock, and MVCC · Field Guide to the Database Engine</title>
+<link rel="stylesheet" href="../assets/course.css">
+<script defer src="../assets/components.js"></script>
+</head>
+<body class="layer-txn">
+<main class="page">
+
+  <!-- ===== MASTHEAD ===== -->
+  <header class="masthead col">
+    <div class="crumbs">
+      <a href="../index.html">Field Guide</a> <span>/</span>
+      <span>Part VI · Transactions</span> <span>/</span>
+      <span>Week 13</span>
+    </div>
+    <span class="week-badge">Transaction manager</span>
+    <h1>Concurrency: strict 2PL, deadlock, and MVCC</h1>
+    <p class="lede">Last week told you which interleavings are wrong. This week is the machinery that
+    forbids them while still running transactions at the same time: locks that block, deadlocks that
+    form when two transactions wait on each other, and the multi-version trick that lets readers never
+    wait at all.</p>
+  </header>
+
+  <div class="col">
+
+  <!-- ===== OBJECTIVES ===== -->
+  <div class="objectives">
+    <h4>By the end you can</h4>
+    <ul>
+      <li>State why strict and rigorous 2PL hold locks to commit, and what each one buys beyond plain 2PL.</li>
+      <li>Read a lock table and a waits-for graph, and tell deadlock detection apart from wait-die and wound-wait prevention.</li>
+      <li>Explain how MVCC lets a reader and a writer touch the same row at the same time without either blocking.</li>
+      <li>Walk a PostgreSQL version chain by its xmin and xmax stamps and say which version a snapshot sees.</li>
+      <li>Answer the "which is false" traps about 2PL, wait-die, MVCC, and update-in-place.</li>
+    </ul>
+  </div>
+
+  <!-- ===== WHERE THIS SITS (connective tissue) ===== -->
+  <p>We are on the second journey through the engine, the write path. Last week's statement is back:</p>
+
+  <pre><code><span class="tok-kw">BEGIN</span>;
+<span class="tok-kw">UPDATE</span> account <span class="tok-kw">SET</span> balance = balance - <span class="tok-num">100</span> <span class="tok-kw">WHERE</span> id = <span class="tok-num">42</span>;
+<span class="tok-kw">COMMIT</span>;</code></pre>
+
+  <p><a href="0012-transactions-isolation.html">Week 12</a> handed this lesson a target and a vocabulary:
+  the schedule must be conflict serializable (its precedence graph must stay acyclic), and the result
+  must be at least recoverable. That week named the anomalies (dirty read, lost update, write skew) and
+  the theory (the precedence graph, 2PL, the lock point). It did not build the mechanism. This week is
+  the mechanism. The row for <code>id = 42</code> is located exactly as on the read path (optimizer to
+  access method to buffer pool to storage, weeks 4 through 11), but now concurrency control governs the
+  write. Under strict two-phase locking the transaction takes an exclusive lock on that row and holds it
+  to commit. Under MVCC the UPDATE does not overwrite anything: it writes a new tuple version, stamps the
+  old version's delete marker, and links the chain, so a reader on an older snapshot still sees the old
+  balance and never blocks.</p>
+
+  <p>What this layer hands down to <a href="0014-logging-recovery-aries.html">week 14</a>: a page in the
+  buffer pool that is about to be modified, plus a guarantee about who is allowed to have touched it.
+  Recovery then logs the change before the page can reach disk. The link between the two is direct.
+  The buffer pool's freedom to evict an uncommitted page (steal) is exactly why the next lesson must log
+  undo information, and the abort path that 2PL deadlock resolution triggers is the same undo path ARIES
+  formalizes. Keep that thread in mind.</p>
+
+  <div class="callout intuition">
+    <div class="callout-title">Intuition</div>
+    <p>There are two ways to stop two people editing the same document and corrupting it. The first is a
+    physical key: whoever holds it edits, everyone else waits at the door. That is locking. It is correct
+    but the line at the door is the whole cost, and two people can each be holding a key the other needs,
+    so nobody moves. The second way is to give every reader a photocopy frozen at the moment they walked
+    in. The writer scribbles on a fresh sheet and files it; readers keep reading their copy, oblivious.
+    That is MVCC. Nobody waits to read. The cost moved somewhere else: you now have a pile of old copies
+    to shred later.</p>
+  </div>
+
+  <!-- ============================================================
+       PART 1: LOCKING AND 2PL
+       ============================================================ -->
+  <h2>Holding locks to commit: strict and rigorous 2PL</h2>
+
+  <p>Plain two-phase locking is enough to guarantee conflict serializability: acquire locks in a growing
+  phase, release in a shrinking phase, and never acquire after you release. Week 12 proved that ordering
+  transactions by their lock points gives a valid topological order of the precedence graph, so the graph
+  is acyclic. But plain 2PL has a hole. The shrinking phase can begin before commit, so a transaction can
+  release a write lock, then a second transaction reads that just-unlocked value, and then the first
+  transaction aborts. The second transaction read a value that never officially existed. That is a dirty
+  read, and if the second transaction already committed, the schedule is not even recoverable.</p>
+
+  <div class="callout why">
+    <div class="callout-title">Why hold write locks to commit</div>
+    <p>The constraint is that another transaction must never read or overwrite your write until you have
+    decided whether it survives. The naive fix is to release the write lock as soon as you finish writing.
+    That breaks, because "finished writing" is not "committed"; you might still abort. The real fix is
+    blunt: hold every exclusive lock until commit or abort. That is strict 2PL. Now no other transaction
+    can see your write until it is final, so dirty reads and the cascading aborts they cause are
+    impossible. The schedule it produces is strict in the recoverability sense, which is why the undo
+    rule "restore the value that existed before my write" is always correct.</p>
+  </div>
+
+  <table>
+    <caption>Three points on the 2PL ladder. Each variant adds a guarantee and costs concurrency.</caption>
+    <thead><tr><th>Variant</th><th>What it holds to commit</th><th>What it guarantees</th></tr></thead>
+    <tbody>
+      <tr><td>Plain 2PL</td><td>nothing past the lock point</td><td>conflict serializability only</td></tr>
+      <tr><td>Strict 2PL</td><td>all exclusive (write) locks</td><td>also recoverable and cascadeless</td></tr>
+      <tr><td>Rigorous 2PL</td><td>all locks, shared and exclusive</td><td>also serialization order equals commit order</td></tr>
+    </tbody>
+  </table>
+
+  <p>The difference between strict and rigorous is just the shared locks. Strict 2PL releases read locks
+  in the shrinking phase but pins write locks to commit. Rigorous 2PL (also called strong strict 2PL)
+  holds reads too, which collapses the shrinking phase to a single instant at commit and makes the commit
+  order the serialization order. That last property is what makes rigorous 2PL the easy thing to reason
+  about, so most textbooks quietly mean rigorous when they say "the locking implementation"
+  [<a href="https://15445.courses.cs.cmu.edu/fall2022/notes/15-concurrencycontrol.pdf">CMU 15-445 notes</a>].</p>
+
+  <div class="callout gotcha">
+    <div class="callout-title">Exam trap</div>
+    <p>"2PL guarantees serializability, so it also avoids cascading aborts." False. Plain 2PL gives
+    conflict serializability but can release write locks before commit, which permits dirty reads and
+    therefore cascading aborts. You need strict 2PL (hold write locks to commit) for cascadelessness.
+    Serializability and cascadelessness are different axes, and plain 2PL only buys the first.</p>
+  </div>
+
+  <!-- ===== LOCK MANAGER AND COMPATIBILITY ===== -->
+  <h3>The lock manager: who is granted, who waits</h3>
+
+  <p>The lock manager is an in-memory hash table keyed by the locked object identifier (a table OID, a
+  page, a tuple id, or a hashed key). Each entry holds a granted group (the set of transaction-and-mode
+  pairs currently holding the lock) and a wait queue of pending requests in arrival order. A request is
+  granted if its mode is compatible with every mode in the granted group and with everything ahead of it
+  in the queue; otherwise the requester blocks. The entries themselves are guarded by latches, not locks.
+  A latch is a short mutex over shared memory; a lock is a logical, transaction-duration claim that the
+  system tracks for deadlock. Confusing the two is a standard exam point: the lock table is protected by
+  latches because it is mutable shared state, but the rows it tracks are protected by locks.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 540 230" role="img" aria-label="Lock table entry and S/X compatibility matrix">
+      <text x="14" y="22" class="svg-label" fill="var(--txn)" font-weight="700">Lock table entry for tuple (account, id=42)</text>
+      <rect x="14" y="34" width="300" height="56" rx="6" fill="var(--txn-bg)" stroke="var(--txn)"/>
+      <text x="24" y="54" class="svg-label">granted group</text>
+      <rect x="24" y="62" width="76" height="22" rx="4" fill="#fffefb" stroke="var(--txn)"/>
+      <text x="62" y="77" text-anchor="middle" class="svg-mono">T1 : X</text>
+      <rect x="14" y="100" width="300" height="56" rx="6" fill="#fffefb" stroke="var(--ink-soft)"/>
+      <text x="24" y="120" class="svg-label">wait queue (FIFO)</text>
+      <rect x="24" y="128" width="76" height="22" rx="4" fill="var(--paper-2)" stroke="var(--ink-soft)"/>
+      <text x="62" y="143" text-anchor="middle" class="svg-mono">T2 : S</text>
+      <rect x="106" y="128" width="76" height="22" rx="4" fill="var(--paper-2)" stroke="var(--ink-soft)"/>
+      <text x="144" y="143" text-anchor="middle" class="svg-mono">T3 : X</text>
+      <text x="24" y="178" class="svg-label" fill="var(--ink-faint)">T2 and T3 block: X is compatible with nothing.</text>
+
+      <text x="350" y="22" class="svg-label" fill="var(--txn)" font-weight="700">S / X matrix</text>
+      <rect x="380" y="40" width="60" height="28" fill="var(--paper-2)" stroke="var(--rule)"/>
+      <rect x="440" y="40" width="60" height="28" fill="var(--paper-2)" stroke="var(--rule)"/>
+      <text x="410" y="58" text-anchor="middle" class="svg-mono">S held</text>
+      <text x="470" y="58" text-anchor="middle" class="svg-mono">X held</text>
+      <rect x="320" y="68" width="60" height="28" fill="var(--paper-2)" stroke="var(--rule)"/>
+      <rect x="320" y="96" width="60" height="28" fill="var(--paper-2)" stroke="var(--rule)"/>
+      <text x="350" y="86" text-anchor="middle" class="svg-mono">S req</text>
+      <text x="350" y="114" text-anchor="middle" class="svg-mono">X req</text>
+      <rect x="380" y="68" width="60" height="28" fill="var(--good-bg)" stroke="var(--good)"/>
+      <rect x="440" y="68" width="60" height="28" fill="var(--bad-bg)" stroke="var(--bad)"/>
+      <rect x="380" y="96" width="60" height="28" fill="var(--bad-bg)" stroke="var(--bad)"/>
+      <rect x="440" y="96" width="60" height="28" fill="var(--bad-bg)" stroke="var(--bad)"/>
+      <text x="410" y="86" text-anchor="middle" class="svg-mono">yes</text>
+      <text x="470" y="86" text-anchor="middle" class="svg-mono">no</text>
+      <text x="410" y="114" text-anchor="middle" class="svg-mono">no</text>
+      <text x="470" y="114" text-anchor="middle" class="svg-mono">no</text>
+      <text x="320" y="150" class="svg-label" fill="var(--ink-faint)">Only S over S is compatible.</text>
+      <text x="320" y="168" class="svg-label" fill="var(--ink-faint)">Any X blocks everything.</text>
+    </svg>
+    <figcaption><b>Figure 1.</b> A lock table entry is a granted group plus a wait queue. The compatibility
+    matrix is the only rule the grant logic consults: shared coexists with shared, exclusive coexists with
+    nothing. Notice the queue is FIFO so a stream of readers cannot starve a waiting writer.</figcaption>
+  </figure>
+
+  <h3>Multi-granularity locking and intention locks</h3>
+
+  <p>Locking every tuple is fine until a transaction touches a whole table, at which point it pays for
+  millions of tiny lock entries. Locking the whole table is fine until a second transaction wants one row,
+  at which point concurrency collapses. Multi-granularity locking lets each transaction lock at the level
+  that fits, over a hierarchy of database, table, page, tuple. The problem it creates: if T1 holds an X
+  lock on one row and T2 wants an S lock on the whole table, how does the lock manager notice the conflict
+  without scanning every row? Intention locks solve this. Before locking a descendant, a transaction
+  announces intent at every ancestor.</p>
+
+  <ul class="steps">
+    <li><b>IS</b> (intention shared): I will take S locks somewhere below this node.</li>
+    <li><b>IX</b> (intention exclusive): I will take X (or finer IX) locks below this node.</li>
+    <li><b>SIX</b> (shared and intention exclusive): I am reading this whole subtree (S) and will modify some descendants (IX).</li>
+  </ul>
+
+  <p>Now two transactions can both hold IX on the same table (both intend to modify, just different rows)
+  with no conflict, while a transaction wanting S on the whole table conflicts with anyone holding IX,
+  because IX announces "someone is writing below here." The load-bearing fact is the compatibility matrix:
+  IS conflicts only with X; IX conflicts with S, SIX, and X. Locks are acquired root to leaf and released
+  leaf to root.</p>
+
+  <!-- ===== DEADLOCK ===== -->
+  <h2>Deadlock: detect it, or prevent it</h2>
+
+  <p>The moment you hold locks to commit, you can deadlock. T1 holds A and waits for B; T2 holds B and
+  waits for A. Neither can proceed and neither will release. Lock-based systems break out of this in one
+  of two philosophies, and the difference is a favorite exam axis.</p>
+
+  <p><b>Detection</b> is optimistic. Let transactions wait freely, and periodically build a waits-for
+  graph: a node per active transaction, a directed edge from a blocked transaction to the one holding the
+  lock it needs. A deadlock is exactly a cycle in this graph. A depth-first search finds cycles in
+  O(V+E); on a cycle, the system picks a victim and aborts it, releasing its locks so the rest proceed.
+  Victim selection weighs how long each transaction has run, how much work it would waste, and how many
+  cycles aborting it breaks. PostgreSQL detects, it does not prevent
+  [<a href="https://www.postgresql.org/docs/current/explicit-locking.html">PG explicit locking docs</a>].</p>
+
+  <p><b>Prevention</b> is pessimistic: never let a cycle form. Stamp each transaction with a start
+  timestamp where older means smaller and higher priority. When transaction T requests a lock held by H,
+  decide by age:</p>
+
+  <table>
+    <caption>Wait-die and wound-wait. In both, the older transaction never aborts in its branch, and a reused timestamp on restart guarantees liveness.</caption>
+    <thead><tr><th>Scheme</th><th>T older than holder H</th><th>T younger than holder H</th><th>Why no cycle</th></tr></thead>
+    <tbody>
+      <tr><td>Wait-die (non-preemptive)</td><td>T waits</td><td>T dies (aborts, restarts later)</td><td>waits only point old to young</td></tr>
+      <tr><td>Wound-wait (preemptive)</td><td>T wounds H (H aborts), T takes lock</td><td>T waits</td><td>waits only point young to old</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout gotcha">
+    <div class="callout-title">Exam trap</div>
+    <p>"In wait-die the older transaction aborts." False. In wait-die the older transaction waits and the
+    younger one dies. In wound-wait the older transaction wounds (aborts) the younger. In both schemes the
+    older transaction never aborts in its branch, which is the whole point: a transaction that keeps dying
+    eventually becomes the oldest in the system and is finally allowed to wait, so it makes progress.
+    Also false: "wait-die and wound-wait are detection schemes." They are prevention. No graph is built
+    and no cycle ever forms.</p>
+  </div>
+
+  <p>The cheapest scheme builds no graph and tracks no timestamps: if a lock wait exceeds a timeout,
+  assume deadlock and abort the waiter. It needs no bookkeeping, but it produces false positives (it kills
+  transactions that were merely slow), and the timeout is a guess.</p>
+
+  <!-- ============================================================
+       SIMULATOR 1: LOCK TABLE + DEADLOCK
+       ============================================================ -->
+  <figure class="sim" id="lk-sim">
+    <div class="sim-head">
+      <span class="sim-title">Lock table and deadlock playground</span>
+      <span class="sim-sub">step the schedule and watch a cycle form, then resolve it</span>
+    </div>
+    <div class="sim-body">
+      <div class="sim-controls" id="lk-mode" style="margin-bottom:.4rem"></div>
+      <div class="sim-stage"><svg id="lk-svg" viewBox="0 0 540 260" width="100%"></svg></div>
+      <div class="sim-controls" id="lk-controls"></div>
+      <div class="sim-readout" id="lk-readout"></div>
+    </div>
+  </figure>
+  <figcaption class="muted" style="margin-top:-1rem">Run the schedule under detection and watch T1 and T2
+  reach for each other's locks until the waits-for graph closes a cycle. Then switch to wait-die or
+  wound-wait and step again: the same interleaving never deadlocks, because one transaction is told to
+  abort the instant it would have to wait the wrong way.</figcaption>
+
+  <script>
+  // ---- Simulator 1: lock table + waits-for graph + deadlock resolution ----
+  (function () {
+    const svg = document.getElementById("lk-svg");
+    const readout = document.getElementById("lk-readout");
+    const modeBar = document.getElementById("lk-mode");
+
+    // A classic deadlock interleaving on items A and B.
+    // X(t,item) requests an exclusive lock; each transaction also has a start ts (older = smaller).
+    const SCRIPT = [
+      { t: 1, item: "A", desc: "T1 locks A" },
+      { t: 2, item: "B", desc: "T2 locks B" },
+      { t: 1, item: "B", desc: "T1 requests B (held by T2)" },
+      { t: 2, item: "A", desc: "T2 requests A (held by T1)" }
+    ];
+    const TS = { 1: 10, 2: 20 }; // T1 older than T2
+
+    let mode = "detect"; // detect | waitdie | woundwait
+    const MODES = [
+      { id: "detect",    label: "Detection" },
+      { id: "waitdie",   label: "Wait-die" },
+      { id: "woundwait", label: "Wound-wait" }
+    ];
+    MODES.forEach(function (m) {
+      const b = DBMS.el("button", { class: m.id === mode ? "" : "ghost", text: m.label,
+        onclick: function () { mode = m.id; syncModeButtons(); step.reset(); } });
+      b.dataset.mid = m.id;
+      modeBar.appendChild(b);
+    });
+    function syncModeButtons() {
+      Array.prototype.forEach.call(modeBar.children, function (b) {
+        b.className = b.dataset.mid === mode ? "" : "ghost";
+      });
+    }
+
+    function simulate(n) {
+      // Replay the first n script entries; return a state snapshot.
+      const held = {};        // item -> owner txn
+      const waits = [];       // {from, to, item}
+      const aborted = {};     // txn -> reason
+      let note = "";
+      for (let k = 0; k < n; k++) {
+        const op = SCRIPT[k];
+        if (aborted[op.t]) { continue; }
+        const owner = held[op.item];
+        if (owner === undefined || owner === op.t) {
+          held[op.item] = op.t;
+          note = op.desc + ": granted.";
+        } else {
+          // conflict: op.t wants a lock held by owner
+          if (mode === "detect") {
+            waits.push({ from: op.t, to: owner, item: op.item });
+            note = op.desc + ": BLOCKS, waiting for T" + owner + ".";
+          } else if (mode === "waitdie") {
+            if (TS[op.t] < TS[owner]) { // requester older -> waits
+              waits.push({ from: op.t, to: owner, item: op.item });
+              note = "Wait-die: T" + op.t + " is older, so it waits for T" + owner + ".";
+            } else {                    // requester younger -> dies
+              aborted[op.t] = "younger, dies";
+              note = "Wait-die: T" + op.t + " is younger than T" + owner + ", so it aborts (dies).";
+            }
+          } else { // woundwait
+            if (TS[op.t] < TS[owner]) { // requester older -> wounds holder
+              aborted[owner] = "wounded by older T" + op.t;
+              delete held[op.item];
+              for (const it in held) {} // holder's other locks would release too (single item here)
+              held[op.item] = op.t;
+              note = "Wound-wait: T" + op.t + " is older, so it wounds T" + owner + " and takes " + op.item + ".";
+            } else {                    // requester younger -> waits
+              waits.push({ from: op.t, to: owner, item: op.item });
+              note = "Wound-wait: T" + op.t + " is younger, so it waits for T" + owner + ".";
+            }
+          }
+        }
+      }
+      // detect a cycle in the waits-for graph (only 2 txns here, so a 2-cycle)
+      let cycle = false;
+      for (let i = 0; i < waits.length; i++)
+        for (let j = 0; j < waits.length; j++)
+          if (waits[i].from === waits[j].to && waits[i].to === waits[j].from) cycle = true;
+      return { held: held, waits: waits, aborted: aborted, note: note, cycle: cycle, n: n };
+    }
+
+    function txnBox(x, y, t, st) {
+      const isAbort = st.aborted[t];
+      const inCycle = st.cycle && (st.waits.some(function (w) { return w.from === t || w.to === t; }));
+      const fill = isAbort ? "var(--paper-2)" : (inCycle ? "var(--bad-bg)" : "var(--txn-bg)");
+      const stroke = isAbort ? "var(--ink-faint)" : (inCycle ? "var(--bad)" : "var(--txn)");
+      svg.appendChild(DBMS.svg("rect", { x: x, y: y, width: 110, height: 48, rx: 8, fill: fill, stroke: stroke, "stroke-width": inCycle ? 2.5 : 1.4 }));
+      svg.appendChild(DBMS.svg("text", { x: x + 55, y: y + 22, "text-anchor": "middle", class: "svg-mono" }, "T" + t + (isAbort ? " (abort)" : "")));
+      const holds = Object.keys(st.held).filter(function (it) { return st.held[it] === t; });
+      svg.appendChild(DBMS.svg("text", { x: x + 55, y: y + 39, "text-anchor": "middle", class: "svg-label", fill: "var(--ink-faint)" }, holds.length ? "holds " + holds.join(",") : "ts=" + TS[t]));
+    }
+
+    function render(n) {
+      const st = simulate(n);
+      svg.innerHTML = "";
+      svg.appendChild(DBMS.svg("defs", {}, DBMS.svg("marker",
+        { id: "lkarrow", markerWidth: "9", markerHeight: "9", refX: "8", refY: "3", orient: "auto" },
+        DBMS.svg("path", { d: "M0,0 L8,3 L0,6 Z", fill: st.cycle ? "var(--bad)" : "var(--ink-soft)" }))));
+
+      svg.appendChild(DBMS.svg("text", { x: 14, y: 18, class: "svg-label", fill: "var(--txn)", "font-weight": "700" }, "waits-for graph"));
+      txnBox(60, 40, 1, st);
+      txnBox(360, 40, 2, st);
+
+      // draw waits-for edges between the two boxes
+      st.waits.forEach(function (w, idx) {
+        const yOff = 64 + idx * 0; // single line
+        const fromRight = w.from === 1;
+        const x1 = fromRight ? 170 : 360;
+        const x2 = fromRight ? 360 : 170;
+        const y = 50 + (w.from === 1 ? 8 : 38);
+        svg.appendChild(DBMS.svg("path", {
+          d: "M" + x1 + "," + y + " C" + (x1 + (fromRight ? 60 : -60)) + "," + (y + (fromRight ? -30 : 30)) +
+             " " + (x2 + (fromRight ? -60 : 60)) + "," + (y + (fromRight ? -30 : 30)) + " " + x2 + "," + y,
+          fill: "none", stroke: st.cycle ? "var(--bad)" : "var(--ink-soft)", "stroke-width": 1.6, "marker-end": "url(#lkarrow)"
+        }));
+      });
+
+      // lock table for A and B
+      const items = ["A", "B"];
+      items.forEach(function (it, i) {
+        const x = 60 + i * 250, y = 130;
+        svg.appendChild(DBMS.svg("rect", { x: x, y: y, width: 200, height: 60, rx: 6, fill: "#fffefb", stroke: "var(--rule)" }));
+        svg.appendChild(DBMS.svg("text", { x: x + 10, y: y + 20, class: "svg-label", fill: "var(--ink-soft)" }, "lock(" + it + ")"));
+        const owner = st.held[it];
+        svg.appendChild(DBMS.svg("text", { x: x + 10, y: y + 42, class: "svg-mono" },
+          owner ? "X held by T" + owner : "free"));
+      });
+
+      // banner
+      if (st.cycle) {
+        svg.appendChild(DBMS.svg("text", { x: 270, y: 218, "text-anchor": "middle", class: "svg-label", fill: "var(--bad)", "font-weight": "700" },
+          "DEADLOCK: cycle T1 -> T2 -> T1. Detection aborts a victim."));
+      } else if (Object.keys(st.aborted).length) {
+        svg.appendChild(DBMS.svg("text", { x: 270, y: 218, "text-anchor": "middle", class: "svg-label", fill: "var(--warn)", "font-weight": "700" },
+          "Prevented up front: one transaction aborted before any cycle could form."));
+      } else {
+        svg.appendChild(DBMS.svg("text", { x: 270, y: 218, "text-anchor": "middle", class: "svg-label", fill: "var(--ink-faint)" },
+          "No cycle yet. Keep stepping."));
+      }
+
+      readout.textContent = (st.note || "Press Step to run the schedule.") +
+        "   mode: " + MODES.filter(function (m) { return m.id === mode; })[0].label;
+    }
+
+    const step = DBMS.stepper({
+      controls: document.getElementById("lk-controls"),
+      steps: SCRIPT.length,
+      onRender: render,
+      labels: { step: "Step op", reset: "Restart" },
+      autoMs: 1100
+    });
+  })();
+  </script>
+
+  <div class="callout realworld">
+    <div class="callout-title">In real systems</div>
+    <p>PostgreSQL chooses detection. The docs are blunt: "PostgreSQL automatically detects deadlock
+    situations and resolves them by aborting one of the transactions involved," and a transaction "seeking
+    either a table-level or row-level lock will wait indefinitely for conflicting locks to be released" so
+    long as no deadlock is detected
+    [<a href="https://www.postgresql.org/docs/current/explicit-locking.html">PG docs</a>]. It also will not
+    tell you in advance which transaction becomes the victim. Prevention schemes like wait-die show up more
+    in distributed systems, where building a global waits-for graph across nodes is expensive.</p>
+  </div>
+
+  <!-- ============================================================
+       PART 2: MVCC
+       ============================================================ -->
+  <h2>MVCC: let readers read the past</h2>
+
+  <p>Locking serializes correctly, but its cost is contention. A reader holds S, blocks a writer's X; a
+  writer holds X, blocks a reader's S. For a workload that is mostly reads with the occasional write, that
+  blocking is pure overhead. Multi-version concurrency control attacks it directly. The defining property,
+  in PostgreSQL's own words: "locks acquired for querying (reading) data do not conflict with locks
+  acquired for writing data, and so reading never blocks writing and writing never blocks reading"
+  [<a href="https://www.postgresql.org/docs/current/mvcc-intro.html">PG MVCC intro</a>]. CMU calls MVCC
+  "the most widely used scheme," now in almost every DBMS built in the last decade.</p>
+
+  <div class="callout why">
+    <div class="callout-title">Why a reader never has to wait</div>
+    <p>The constraint that forces blocking under locking is that there is one copy of the row, so a reader
+    and a writer fight over it. Remove the constraint: keep more than one copy. Every write creates a new
+    physical version of the row instead of overwriting the old one; the versions of one logical row form a
+    chain. Each version carries the id of the transaction that created it and a marker for when it stopped
+    being current. A transaction reads against a snapshot, a logical point in time, and sees the latest
+    version that was committed as of that snapshot. The old version is still sitting there, so a reader on
+    an older snapshot reads it without waiting for the writer to finish. Reads became lock-free. The price
+    is that you now store old versions and must reclaim them later.</p>
+  </div>
+
+  <h3>The four design decisions</h3>
+
+  <p>The Wu et al. survey decomposes every MVCC system into four choices
+  [<a href="https://www.vldb.org/pvldb/vol10/p781-Wu.pdf">Wu et al., PVLDB 2017</a>]. The point of naming
+  them is that "MVCC" is not one design but a family, and PostgreSQL is one specific corner of it.</p>
+
+  <table>
+    <caption>The four MVCC design decisions, with PostgreSQL's choice in each.</caption>
+    <thead><tr><th>Decision</th><th>The options</th><th>PostgreSQL</th></tr></thead>
+    <tbody>
+      <tr><td>Protocol (orders writers)</td><td>timestamp ordering, optimistic, or 2PL</td><td>2PL-style row locks, plus SSI at Serializable</td></tr>
+      <tr><td>Version storage</td><td>append-only, time-travel, delta</td><td>append-only, versions inline in the heap</td></tr>
+      <tr><td>Garbage collection</td><td>tuple-level or transaction-level</td><td>VACUUM, gated by the oldest live snapshot</td></tr>
+      <tr><td>Index pointers</td><td>logical or physical</td><td>physical (index points at a heap tuple)</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout gotcha">
+    <div class="callout-title">Exam trap</div>
+    <p>"MVCC means no locks at all." False. MVCC removes read-write blocking, but writers still have to be
+    serialized against each other. Something orders conflicting writes (row locks, timestamp ordering, or
+    optimistic validation), and in PostgreSQL that is a full lock manager that can still deadlock on
+    write-write conflicts. MVCC is orthogonal to the protocol that orders writers, not a replacement for
+    it. The first decision in the table is exactly that protocol.</p>
+  </div>
+
+  <h3>PostgreSQL: append-only versions on the heap</h3>
+
+  <p>PostgreSQL stores versions inline in the heap. Every heap tuple has a header whose visibility fields
+  are <code>t_xmin</code> (the insert XID that created this version), <code>t_xmax</code> (the XID that
+  deleted or superseded it, zero while still live), and <code>t_ctid</code> (a tuple id pointing forward to
+  the next version, used to walk the chain)
+  [<a href="https://www.postgresql.org/docs/current/storage-page-layout.html">PG page layout, Table 66.4</a>].
+  The decisive fact: an UPDATE is not an in-place edit. It writes a brand-new tuple version and sets the
+  old version's <code>t_xmax</code> to the updating transaction's XID. A DELETE just sets <code>t_xmax</code>.
+  The old version stays visible to any snapshot that began before the change committed.</p>
+
+  <pre><code><span class="tok-com"># the UPDATE from the top, as PostgreSQL actually does it</span>
+<span class="tok-com"># row 42 starts as one version:</span>
+v0: <span class="tok-num">(xmin=100, xmax=0)</span>  balance=500     <span class="tok-com"># inserted by txn 100, still live</span>
+
+<span class="tok-com"># txn 205 runs UPDATE ... balance = balance - 100:</span>
+v0: <span class="tok-num">(xmin=100, xmax=205)</span> balance=500     <span class="tok-com"># old version, now marked deleted by 205</span>
+v1: <span class="tok-num">(xmin=205, xmax=0)</span>   balance=400     <span class="tok-com"># new version, created by 205, ctid links v0 -> v1</span>
+
+<span class="tok-com"># a reader on a snapshot taken before 205 committed still sees v0 (500),</span>
+<span class="tok-com"># never blocks, and never sees the in-flight 400.</span></code></pre>
+
+  <p>The visibility rule, simplified: a version is visible to a snapshot when its <code>xmin</code>
+  committed and is in the snapshot's past, and either its <code>xmax</code> is unset, or that
+  <code>xmax</code> did not commit, or it is in the snapshot's future. A snapshot is just the set of
+  in-progress XIDs at its start plus the horizon, checked against the commit log. The same
+  <code>xmax</code> field also encodes row locks: <code>SELECT FOR UPDATE</code> records a locker there
+  without creating a new version, which is how MVCC and explicit locking share one mechanism.</p>
+
+  <!-- ============================================================
+       SIMULATOR 2: MVCC VERSION CHAIN + SNAPSHOTS
+       ============================================================ -->
+  <figure class="sim" id="mv-sim">
+    <div class="sim-head">
+      <span class="sim-title">MVCC version chain and snapshot viewer</span>
+      <span class="sim-sub">two transactions on one row; pick whose snapshot to view</span>
+    </div>
+    <div class="sim-body">
+      <div class="sim-controls" id="mv-view" style="margin-bottom:.4rem"></div>
+      <div class="sim-stage"><svg id="mv-svg" viewBox="0 0 540 230" width="100%"></svg></div>
+      <div class="sim-controls" id="mv-controls"></div>
+      <div class="sim-readout" id="mv-readout"></div>
+    </div>
+  </figure>
+  <figcaption class="muted" style="margin-top:-1rem">Step the schedule: T2 begins and reads, then T1
+  updates and commits, then T2 reads again, then VACUUM runs. Switch the view between T1 and T2 and watch
+  the chain gray out the versions that snapshot cannot see. The key moment: when T1's UPDATE is in flight,
+  T2's read does not block, it just keeps reading the old version. The other key moment: VACUUM cannot
+  reclaim the dead version while T2 still holds an old snapshot.</figcaption>
+
+  <script>
+  // ---- Simulator 2: MVCC version chain + snapshot visibility + VACUUM ----
+  (function () {
+    const svg = document.getElementById("mv-svg");
+    const readout = document.getElementById("mv-readout");
+    const viewBar = document.getElementById("mv-view");
+
+    // A linear schedule. We track each step's effect on the version chain and snapshots.
+    // Versions of row 42; xmin/xmax are the creating/deleting XIDs.
+    // T2 has XID 201 and takes its snapshot when it BEGINs; T1 has XID 205.
+    const STEPS = [
+      { desc: "T2 BEGIN (snapshot: only v0 committed). T1 not started." },
+      { desc: "T2 reads row 42: sees v0 = 500 (committed before its snapshot)." },
+      { desc: "T1 BEGIN, runs UPDATE: writes v1=400, stamps v0.xmax=205. T1 not committed yet." },
+      { desc: "T2 reads row 42 again: still v0 = 500. The in-flight write did NOT block it." },
+      { desc: "T1 COMMIT. v1 is now the latest committed version (400) for new snapshots." },
+      { desc: "T2 reads again: STILL v0 = 500. Its snapshot is frozen at BEGIN (repeatable read)." },
+      { desc: "T2 COMMIT. No live snapshot now predates v1's creation." },
+      { desc: "VACUUM: v0 is dead and unreachable by any live snapshot, so it is reclaimed." }
+    ];
+
+    let view = 2; // which transaction's snapshot to view: 1 or 2
+    [{ id: 1, label: "View T1 snapshot" }, { id: 2, label: "View T2 snapshot" }].forEach(function (v) {
+      const b = DBMS.el("button", { class: v.id === view ? "" : "ghost", text: v.label,
+        onclick: function () { view = v.id; syncView(); render(step.index); } });
+      b.dataset.vid = v.id;
+      viewBar.appendChild(b);
+    });
+    function syncView() {
+      Array.prototype.forEach.call(viewBar.children, function (b) {
+        b.className = (+b.dataset.vid === view) ? "" : "ghost";
+      });
+    }
+
+    // Compute chain state at step n.
+    function state(n) {
+      // v0 created by xmin 100 (committed long ago). v1 by T1 (205).
+      const v0 = { id: "v0", xmin: 100, xmax: 0, val: 500, dead: false, present: true };
+      const v1 = { id: "v1", xmin: 205, xmax: 0, val: 400, present: false, committed: false };
+      // T1 lifecycle
+      let t1Begun = n >= 3, t1Committed = n >= 5;
+      // T2 snapshot taken at step 1 (BEGIN). At BEGIN only v0 (xmin 100) is committed.
+      let t2Snapshot = n >= 1; // T2 sees committed-as-of-begin: v0 only
+      // UPDATE happens at step 3
+      if (n >= 3) { v0.xmax = 205; v1.present = true; }
+      if (n >= 5) { v1.committed = true; }
+      // VACUUM at step 8: v0 reclaimed (dead and not needed)
+      let t2Committed = n >= 7;
+      if (n >= 8) { v0.present = false; v0.dead = true; }
+      return { v0: v0, v1: v1, t1Begun: t1Begun, t1Committed: t1Committed, t2Committed: t2Committed, n: n };
+    }
+
+    // Which version does the chosen snapshot read?
+    function visibleVersion(st) {
+      // T2's snapshot was taken at BEGIN: v1's xmin (205) was not committed then, so invisible.
+      // After VACUUM v0 is gone, but T2 has committed by then, so this is moot for reads.
+      if (view === 2) {
+        if (st.v0.present) return "v0"; // T2 always reads v0 while its snapshot holds and v0 exists
+        return st.v1.committed ? "v1" : "v0";
+      } else {
+        // T1: once it has run the UPDATE (n>=3) it sees its own new version v1.
+        if (st.n >= 3 && st.v1.present) return "v1";
+        return "v0";
+      }
+    }
+
+    function drawVersion(x, v, st, visibleId) {
+      const isVisible = (v.id === visibleId);
+      const grayed = !isVisible;
+      let fill = grayed ? "var(--paper-2)" : "var(--txn-bg)";
+      let stroke = grayed ? "var(--ink-faint)" : "var(--txn)";
+      if (v.dead && !v.present) { fill = "#fff"; stroke = "var(--rule)"; }
+      svg.appendChild(DBMS.svg("rect", { x: x, y: 70, width: 150, height: 86, rx: 8,
+        fill: fill, stroke: stroke, "stroke-width": isVisible ? 2.5 : 1.4,
+        "stroke-dasharray": (v.dead && !v.present) ? "4 4" : "0" }));
+      if (v.dead && !v.present) {
+        svg.appendChild(DBMS.svg("text", { x: x + 75, y: 118, "text-anchor": "middle", class: "svg-label", fill: "var(--ink-faint)" }, "reclaimed"));
+        return;
+      }
+      svg.appendChild(DBMS.svg("text", { x: x + 12, y: 92, class: "svg-mono", fill: grayed ? "var(--ink-faint)" : "var(--ink)" }, v.id + "  balance=" + v.val));
+      svg.appendChild(DBMS.svg("text", { x: x + 12, y: 116, class: "svg-label", fill: grayed ? "var(--ink-faint)" : "var(--ink-soft)" }, "xmin=" + v.xmin));
+      svg.appendChild(DBMS.svg("text", { x: x + 12, y: 134, class: "svg-label", fill: grayed ? "var(--ink-faint)" : "var(--ink-soft)" }, "xmax=" + (v.xmax || 0)));
+      if (isVisible) svg.appendChild(DBMS.svg("text", { x: x + 75, y: 64, "text-anchor": "middle", class: "svg-label", fill: "var(--txn)", "font-weight": "700" }, "T" + view + " reads this"));
+    }
+
+    function render(n) {
+      const st = state(n);
+      svg.innerHTML = "";
+      const visId = visibleVersion(st);
+
+      svg.appendChild(DBMS.svg("text", { x: 14, y: 26, class: "svg-label", fill: "var(--txn)", "font-weight": "700" }, "version chain for row 42 (account)"));
+
+      // chain arrow v0 -> v1
+      if (st.v1.present) {
+        svg.appendChild(DBMS.svg("defs", {}, DBMS.svg("marker",
+          { id: "mvarrow", markerWidth: "9", markerHeight: "9", refX: "7", refY: "3", orient: "auto" },
+          DBMS.svg("path", { d: "M0,0 L7,3 L0,6 Z", fill: "var(--ink-soft)" }))));
+        if (st.v0.present)
+          svg.appendChild(DBMS.svg("line", { x1: 184, y1: 113, x2: 222, y2: 113, stroke: "var(--ink-soft)", "marker-end": "url(#mvarrow)" }));
+        svg.appendChild(DBMS.svg("text", { x: 203, y: 104, "text-anchor": "middle", class: "svg-label", fill: "var(--ink-faint)" }, "ctid"));
+      }
+
+      drawVersion(34, st.v0, st, visId);
+      if (st.v1.present) drawVersion(224, st.v1, st, visId);
+
+      // snapshot side panel
+      svg.appendChild(DBMS.svg("rect", { x: 396, y: 56, width: 132, height: 108, rx: 6, fill: "#fffefb", stroke: "var(--rule)" }));
+      svg.appendChild(DBMS.svg("text", { x: 408, y: 76, class: "svg-label", fill: "var(--ink-soft)" }, "T" + view + " snapshot"));
+      if (view === 2) {
+        svg.appendChild(DBMS.svg("text", { x: 408, y: 98, class: "svg-label", fill: "var(--ink-faint)" }, "taken at BEGIN"));
+        svg.appendChild(DBMS.svg("text", { x: 408, y: 116, class: "svg-mono" }, "sees xmin<201"));
+        svg.appendChild(DBMS.svg("text", { x: 408, y: 138, class: "svg-label", fill: "var(--ink-faint)" }, "205 invisible"));
+        svg.appendChild(DBMS.svg("text", { x: 408, y: 156, class: "svg-label", fill: "var(--ink-faint)" }, "(frozen view)"));
+      } else {
+        svg.appendChild(DBMS.svg("text", { x: 408, y: 98, class: "svg-label", fill: "var(--ink-faint)" }, st.t1Begun ? "active, XID 205" : "not started"));
+        svg.appendChild(DBMS.svg("text", { x: 408, y: 120, class: "svg-mono" }, st.t1Begun ? "sees own v1" : "n/a"));
+      }
+
+      // VACUUM gate hint
+      if (n === 7) {
+        svg.appendChild(DBMS.svg("text", { x: 270, y: 196, "text-anchor": "middle", class: "svg-label", fill: "var(--warn)", "font-weight": "700" },
+          "If T2 stayed open here, VACUUM could NOT reclaim v0: a live snapshot still needs it."));
+      } else if (n === 8) {
+        svg.appendChild(DBMS.svg("text", { x: 270, y: 196, "text-anchor": "middle", class: "svg-label", fill: "var(--good)", "font-weight": "700" },
+          "VACUUM reclaimed v0. Garbage collection is a space cost, never a blocking cost."));
+      } else if (n >= 3 && n <= 4) {
+        svg.appendChild(DBMS.svg("text", { x: 270, y: 196, "text-anchor": "middle", class: "svg-label", fill: "var(--ink-faint)" },
+          "T1's write is in flight, yet T2 reads with no wait."));
+      }
+
+      readout.textContent = (n === 0 ? "Press Step to begin." : (STEPS[n - 1] ? STEPS[n - 1].desc : "")) ;
+    }
+
+    const step = DBMS.stepper({
+      controls: document.getElementById("mv-controls"),
+      steps: STEPS.length,
+      onRender: render,
+      labels: { step: "Step", reset: "Restart" },
+      autoMs: 1500
+    });
+  })();
+  </script>
+
+  <h3>The new cost: dead versions and VACUUM</h3>
+
+  <p>You did not get the lock-free reads for nothing. Every UPDATE leaves a dead version behind, every
+  DELETE leaves a tombstone, and they pile up. PostgreSQL must reclaim them, which is what VACUUM does.
+  The routine-vacuuming docs state the cause plainly: "In PostgreSQL, an UPDATE or DELETE of a row does
+  not immediately remove the old version of the row. This approach is necessary to gain the benefits of
+  multiversion concurrency control"
+  [<a href="https://www.postgresql.org/docs/current/routine-vacuuming.html">PG routine vacuuming</a>].
+  A version can be reclaimed only when no live transaction's snapshot could still need it, which is why a
+  single long-running reader holding an old snapshot stalls garbage collection across the whole table.
+  That is the heart of the MVCC trade: a long reader does not block a writer, it just holds back cleanup,
+  turning a contention problem into a space problem.</p>
+
+  <div class="callout gotcha">
+    <div class="callout-title">Exam trap</div>
+    <p>"Under MVCC, a long-enough read can block a writer." False, and inverting it is the whole point.
+    Under MVCC reading never blocks writing and writing never blocks reading. A long reader instead keeps
+    an old snapshot alive, which prevents VACUUM from reclaiming versions that reader might still see. That
+    is bloat, a space cost, not a blocking cost. Also false: "an UPDATE modifies the row in place." It
+    writes a new version and stamps the old one's xmax, which is exactly why heavy-update tables bloat and
+    need VACUUM.</p>
+  </div>
+
+  <div class="callout keyidea">
+    <div class="callout-title">Keep this one thing</div>
+    <p>Locking pays for correctness in waiting and deadlocks; MVCC pays for it in storage and garbage
+    collection. The reader-writer block is gone, but writers still serialize against each other, and the
+    old versions still have to be swept up.</p>
+  </div>
+
+  <!-- ===== SQLITE CONTRAST ===== -->
+  <h3>SQLite: the opposite corner</h3>
+
+  <p>SQLite reaches the same correctness by the opposite route. In its default rollback-journal mode it
+  uses five whole-file lock states (UNLOCKED, SHARED, RESERVED, PENDING, EXCLUSIVE) and the model is many
+  readers or one writer, never both. WAL mode loosens this: the writer appends to a separate log and
+  readers read a consistent end mark, so "WAL provides more concurrency as readers do not block writers
+  and a writer does not block readers"
+  [<a href="https://www.sqlite.org/wal.html">SQLite WAL</a>]. That end mark is a snapshot, which makes
+  WAL mode a lightweight MVCC. But the single-writer rule never lifts: "since there is only one WAL file,
+  there can only be one writer at a time." So SQLite-WAL gives readers-do-not-block-writers, yet never
+  two concurrent writers, the opposite end of the spectrum from PostgreSQL's full MVCC with many writers
+  serialized by row locks.</p>
+
+  <div class="callout gotcha">
+    <div class="callout-title">Exam trap</div>
+    <p>"SQLite in WAL mode supports multiple concurrent writers." False. WAL lets concurrent readers run
+    alongside one writer; it never allows two simultaneous writers. The single-writer rule is exactly how
+    SQLite stays serializable without a version visibility machine as elaborate as PostgreSQL's.</p>
+  </div>
+
+  <!-- ===== COMPARISON TABLE ===== -->
+  <table>
+    <caption>Two answers to the same correctness target, and where each one puts its cost.</caption>
+    <thead><tr><th>Property</th><th>Strict 2PL (locking)</th><th>MVCC (PostgreSQL)</th></tr></thead>
+    <tbody>
+      <tr><td>Reader vs writer on one row</td><td>they block each other</td><td>neither blocks; reader sees old version</td></tr>
+      <tr><td>Writer vs writer</td><td>serialized by X locks</td><td>still serialized (row locks / SSI)</td></tr>
+      <tr><td>Failure mode under contention</td><td>waiting, then deadlock</td><td>version bloat, slower GC</td></tr>
+      <tr><td>Extra storage</td><td>none beyond the lock table</td><td>old versions until VACUUM</td></tr>
+      <tr><td>Deadlock handling</td><td>detection or prevention needed</td><td>still possible on writes; PG detects</td></tr>
+    </tbody>
+  </table>
+
+  <!-- ===== SSI BRIDGE ===== -->
+  <details class="deepdive">
+    <summary>Deeper: snapshot isolation is not serializable, and how SSI fixes it</summary>
+    <div>
+    <p>Plain MVCC at the Repeatable Read level gives snapshot isolation: every transaction reads a frozen
+    snapshot, and write-write conflicts on the same item are caught by First-Committer-Wins. That blocks
+    dirty reads, non-repeatable reads, lost updates, and even simple phantoms. It does not block write
+    skew, because write skew is two transactions writing <em>different</em> items after reading an
+    overlapping set, so there is no write-write conflict to catch even though the precedence graph has a
+    cycle (week 12). PostgreSQL's Serializable level adds Serializable Snapshot Isolation: it runs
+    snapshot isolation but additionally tracks read-write antidependencies and aborts a transaction when
+    it detects a dangerous structure (a transaction with both an incoming and an outgoing rw-edge), which
+    is a necessary condition for a serialization cycle. The SIRead locks it uses to record reads never
+    block and never deadlock; they only leave a trace so a later conflicting write can be caught
+    [<a href="https://www.postgresql.org/docs/current/transaction-iso.html">PG transaction isolation</a>].
+    This is how MVCC climbs from snapshot isolation up to true serializability without going back to
+    blocking reads.</p>
+    </div>
+  </details>
+
+  <!-- ===== FLASHCARDS ===== -->
+  <h2>Active recall</h2>
+
+  <div class="flashcard">
+    <div class="fc-front">What does strict 2PL hold to commit, and what does that buy over plain 2PL?</div>
+    <div class="fc-back">It holds all exclusive (write) locks until commit or abort. That makes the schedule
+    recoverable and cascadeless (no dirty reads), which plain 2PL does not guarantee.</div>
+  </div>
+
+  <div class="flashcard">
+    <div class="fc-front">In wait-die, what happens when an older transaction requests a lock held by a younger one?</div>
+    <div class="fc-back">The older transaction waits. The younger one dies (aborts) only when it requests a
+    lock held by an older holder. The older transaction never aborts in either branch.</div>
+  </div>
+
+  <div class="flashcard">
+    <div class="fc-front">A PostgreSQL UPDATE on row 42 leaves the heap in what state?</div>
+    <div class="fc-back">Two versions: the old one with its xmax stamped to the updater's XID, and a new
+    one with xmin set to that XID, linked by ctid. The old version waits for VACUUM, not in-place edit.</div>
+  </div>
+
+  <div class="flashcard">
+    <div class="fc-front">Why does a long-running read transaction cause table bloat under MVCC?</div>
+    <div class="fc-back">It holds an old snapshot alive, so VACUUM cannot reclaim any version that snapshot
+    might still see. Dead versions accumulate. It is a space cost, never a blocking cost.</div>
+  </div>
+
+  <!-- ===== MCQs ===== -->
+  <h2>Check yourself</h2>
+
+  <div class="mcq" data-answer="2">
+    <p class="mcq-q">Which statement about two-phase locking is false?</p>
+    <button class="mcq-opt">Plain 2PL guarantees conflict serializability via the lock-point ordering.</button>
+    <button class="mcq-opt">Strict 2PL holds write locks to commit and so avoids cascading aborts.</button>
+    <button class="mcq-opt">Because 2PL gives serializability, plain 2PL also avoids cascading aborts.</button>
+    <button class="mcq-opt">Rigorous 2PL holds read locks too, so commit order equals serialization order.</button>
+    <p class="mcq-explain">The false claim is the third. Plain 2PL can release a write lock during the
+    shrinking phase before commit, letting another transaction read uncommitted data, which is a dirty
+    read and a cascading-abort risk. Serializability and cascadelessness are separate guarantees, and you
+    need strict 2PL (option two) for the second.</p>
+  </div>
+
+  <div class="mcq" data-answer="1">
+    <p class="mcq-q">Under the wait-die prevention scheme, which is correct?</p>
+    <button class="mcq-opt">An older transaction requesting a younger holder's lock aborts itself.</button>
+    <button class="mcq-opt">An older transaction requesting a younger holder's lock simply waits.</button>
+    <button class="mcq-opt">A waits-for graph is built and a cycle triggers a victim abort.</button>
+    <button class="mcq-opt">A younger transaction requesting an older holder's lock always waits.</button>
+    <p class="mcq-explain">Option two is correct: in wait-die the older waits, the younger dies. Option one
+    inverts the rule. Option three describes detection, not prevention; wait-die builds no graph and forms
+    no cycle. Option four describes wound-wait's young-waits branch, not wait-die, where a younger
+    requester dies.</p>
+  </div>
+
+  <div class="mcq" data-answer="3">
+    <p class="mcq-q">Which statement about MVCC is false?</p>
+    <button class="mcq-opt">A reader sees the latest version committed as of its snapshot, never blocking.</button>
+    <button class="mcq-opt">Writers must still be serialized against each other by some protocol.</button>
+    <button class="mcq-opt">A long-running reader holds back garbage collection and causes bloat.</button>
+    <button class="mcq-opt">MVCC removes all locks, so a writer can never deadlock another writer.</button>
+    <p class="mcq-explain">The fourth is false. MVCC removes read-write blocking, not all locks. Writers are
+    still ordered by a protocol (PostgreSQL uses row locks plus SSI), and write-write conflicts can still
+    deadlock, which PostgreSQL resolves by detection. The other three are exactly the MVCC trade: lock-free
+    reads paid for in stored versions and deferred cleanup.</p>
+  </div>
+
+  <div class="mcq" data-answer="0">
+    <p class="mcq-q">A PostgreSQL UPDATE of one row does what to the heap?</p>
+    <button class="mcq-opt">Writes a new tuple version and stamps the old version's xmax with its XID.</button>
+    <button class="mcq-opt">Overwrites the row in place and clears the old xmin and xmax fields.</button>
+    <button class="mcq-opt">Deletes the old row immediately and frees its slot for reuse at once.</button>
+    <button class="mcq-opt">Copies the row to a separate undo segment and edits the heap in place.</button>
+    <p class="mcq-explain">The first is correct: append-only MVCC means UPDATE is delete-plus-insert. The
+    old version's xmax is set to the updater, a new version is written with that XID as its xmin, and ctid
+    links them. Nothing is overwritten in place (that rules out the second and fourth), and the old version
+    is not freed immediately (the third); it waits for VACUUM because older snapshots may still need it.</p>
+  </div>
+
+  <div class="mcq" data-answer="2">
+    <p class="mcq-q">Which statement about deadlock handling is false?</p>
+    <button class="mcq-opt">Detection lets transactions wait and aborts a victim once a cycle is found.</button>
+    <button class="mcq-opt">Wait-die and wound-wait prevent cycles using transaction timestamps.</button>
+    <button class="mcq-opt">PostgreSQL prevents deadlocks up front and tells you the victim in advance.</button>
+    <button class="mcq-opt">A timeout scheme is cheap but produces false positives on slow transactions.</button>
+    <p class="mcq-explain">The third is false on both counts. PostgreSQL detects deadlocks and aborts a
+    victim after a cycle forms; it does not prevent them, and it does not let you predict the victim. The
+    other three are accurate: detection is the waits-for-graph cycle search, wait-die and wound-wait are
+    timestamp-based prevention, and timeouts trade bookkeeping for false positives.</p>
+  </div>
+
+  <div class="mcq" data-answer="1">
+    <p class="mcq-q">Which statement about intention locks in multi-granularity locking is false?</p>
+    <button class="mcq-opt">IX on a table lets two transactions both modify different rows without conflict.</button>
+    <button class="mcq-opt">IS on a table conflicts with another transaction's IX on the same table.</button>
+    <button class="mcq-opt">To take an X lock on a tuple, hold IX or SIX on its parent first.</button>
+    <button class="mcq-opt">SIX means read the whole subtree and modify some specific descendants.</button>
+    <p class="mcq-explain">The second is false. IS announces only intent to read below, so it is compatible
+    with IX (intent to write below); two transactions can hold IS and IX on the same table at once. IS
+    conflicts only with a full X on the node. The others are correct: shared IX, the root-to-leaf
+    acquisition rule, and the meaning of SIX.</p>
+  </div>
+
+  <!-- ===== PRIMARY SOURCE ===== -->
+  <div class="source-box">
+    <div class="src-tag">Primary source</div>
+    <div class="src-title">Read this next: <a href="https://www.postgresql.org/docs/current/mvcc-intro.html">PostgreSQL documentation, Concurrency Control Introduction (MVCC)</a></div>
+    <p class="muted">It states the defining property in one sentence: reading never blocks writing and
+    writing never blocks reading. Read it alongside the routine-vacuuming page to see the cost side, and
+    the explicit-locking page for how PostgreSQL still uses a lock manager and detects deadlocks under
+    MVCC.</p>
+  </div>
+
+  <!-- ===== ASK YOUR TEACHER ===== -->
+  <div class="ask-teacher">
+    <div class="at-tag">Ask your teacher</div>
+    <p>Want me to run the UPDATE from the top under strict 2PL and then under MVCC side by side, or to
+    walk a three-transaction deadlock and have you pick the victim? Ask me to draw the version chain for a
+    DELETE, or to show exactly why write skew slips past plain snapshot isolation. I am your teacher for
+    this course, not just a document.</p>
+  </div>
+
+  <!-- ===== NAV ===== -->
+  <nav class="lesson-nav">
+    <a class="prev" href="0012-transactions-isolation.html">
+      <span class="nav-dir">Previous</span>
+      <span class="nav-title">Week 12 · Transactions, ACID, anomalies, and isolation levels</span>
+    </a>
+    <a class="next" href="0014-logging-recovery-aries.html">
+      <span class="nav-dir">Next</span>
+      <span class="nav-title">Week 14 · Logging and recovery: WAL and ARIES</span>
+    </a>
+  </nav>
+
+  </div><!-- /.col -->
+</main>
+</body>
+</html>

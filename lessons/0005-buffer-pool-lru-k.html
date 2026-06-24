@@ -1,0 +1,769 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lesson 05: LRU-K, sequential flooding, and prefetching · Field Guide to the Database Engine</title>
+<link rel="stylesheet" href="../assets/course.css">
+<script defer src="../assets/components.js"></script>
+</head>
+<body class="layer-buffer">
+<main class="page">
+
+  <!-- ===== MASTHEAD ===== -->
+  <header class="masthead col">
+    <div class="crumbs">
+      <a href="../index.html">Field Guide</a> <span>/</span>
+      <span>Part III · Buffer pool</span> <span>/</span>
+      <span>Week 05</span>
+    </div>
+    <span class="week-badge">Buffer pool</span>
+    <h1>LRU-K, sequential flooding, and prefetching</h1>
+    <p class="lede">Last week we built the buffer pool and let it evict by recency. This week we watch
+    that decision fail. One large table scan can throw out the pages everyone else needs, because
+    recency is the wrong signal for a page that gets read once and never again.</p>
+  </header>
+
+  <div class="col">
+
+  <!-- ===== OBJECTIVES ===== -->
+  <div class="objectives">
+    <h4>By the end you can</h4>
+    <ul>
+      <li>Explain sequential flooding and why LRU and CLOCK are fooled by a one-pass scan.</li>
+      <li>Define Backward K-distance and walk an LRU-2 eviction by hand.</li>
+      <li>Say why LRU-K is not LFU, and what the Correlated Reference Period fixes.</li>
+      <li>Describe how PostgreSQL bounds flooding with clock-sweep usage counts and ring buffers.</li>
+      <li>Answer MCQ-style traps on optimality, MRU for scans, and what real systems use.</li>
+    </ul>
+  </div>
+
+  <!-- ===== WHERE THIS SITS (connective tissue) ===== -->
+  <p>Follow the course's running query down to this layer:
+  <code>SELECT name FROM emp WHERE salary &gt; 75000 ORDER BY name</code>. By step 6 of
+  <a href="0001-dbms-architecture.html">journey 1</a>, the executor and the access method are asking
+  the buffer pool for pages by id. <a href="0004-buffer-pool-design.html">Week 4</a> handed us the
+  mechanism: frames, a page table mapping page id to frame, pin counts, dirty flags, and an
+  eviction cycle that picks an unpinned victim and writes it back if dirty. It also handed us two
+  approximations of the unreachable optimum: LRU, and CLOCK as a cheap stand-in for LRU.</p>
+
+  <p>The layer above (the access method, <a href="0006-btree-search-insert.html">weeks 6 to 7</a>) does
+  not care how we choose a victim. It just wants its working set to stay resident: the B+tree root, the
+  upper internal levels, the small dimension table it keeps probing. The layer below (storage,
+  <a href="0002-storage-engine-disk-pages.html">weeks 2 to 3</a>) charges us a real disk read for every
+  miss and a write for every dirty eviction. So the victim choice decides our miss rate, and the miss
+  rate decides whether the query feels instant or stalls on I/O. This lesson is where we make that
+  choice smart enough to survive a scan. It is Milestone M1: the buffer pool is now complete.</p>
+
+  <div class="callout intuition">
+    <div class="callout-title">Intuition</div>
+    <p>Picture a small bookshelf you keep your current books on. You usually grab the same five. Then
+    you have to skim a 400-page reference once, cover to cover. If your rule is "keep the book I touched
+    most recently," every page of that reference is now the freshest thing on the shelf, so it shoves
+    off your five regulars. You finish the skim, never open the reference again, and now have to go back
+    to the library for the five books you actually use. That is sequential flooding. The fix is to
+    notice that a page you have seen exactly once is probably a one-timer, no matter how recent it is.</p>
+  </div>
+
+  <!-- ===== THE PROBLEM ===== -->
+  <h2>Why recency alone fails</h2>
+
+  <p>LRU and CLOCK both decide eviction from a single number: the time of the last reference. The
+  LRU-K paper puts the complaint plainly: LRU "decides which page to drop from buffer based on too
+  little information, limiting itself to only the time of last reference"
+  [<a href="https://www.cs.cmu.edu/~natassa/courses/15-721/papers/p297-o_neil.pdf">O'Neil et al. 1993</a>].
+  Two access patterns expose the weakness.</p>
+
+  <p>The first is frequency blindness. A B+tree leaf might be touched once every few hundred page
+  references, while a heap data page is touched once every twenty thousand. Under LRU, if their last
+  accesses happen to line up, they get treated identically, and the index page that deserves to stay
+  can be evicted. LRU cannot see that one page is hot over the long run and the other is not.</p>
+
+  <p>The second, and the one this lesson is built around, is sequential flooding. A large sequential
+  scan reads many pages once, in quick succession. Under LRU every one of those pages now carries the
+  most recent timestamp, so they sit at the head of the queue and push out the genuinely hot working
+  set. The scan pages will almost certainly never be read again. So LRU has thrown out the pages it
+  will need and kept the pages it will not. The most recent timestamp is exactly the wrong signal here.</p>
+
+  <div class="callout why">
+    <div class="callout-title">Why recency inverts for a scan</div>
+    <p>For a one-pass scan the future is the mirror image of LRU's assumption. LRU bets that the most
+    recently used page is the most likely to be reused. In a scan, the most recently read page is the
+    one you just finished with and will never revisit. So the right policy for a pure scan is the
+    opposite of LRU: evict the most recently used page (MRU), or confine the scan to a small ring of
+    frames so it can only ever evict itself. Recency is not wrong in general; it is wrong for the
+    pattern where the next reference is to a brand new page, not an old one.</p>
+  </div>
+
+  <!-- ===== FIGURE 1: timeline ===== -->
+  <figure class="diagram">
+    <svg viewBox="0 0 640 230" role="img" aria-label="Reference timeline with a scan burst flooding LRU">
+      <defs>
+        <marker id="lk-arrow" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto">
+          <path d="M0,0 L7,3 L0,6 Z" fill="var(--ink-soft)"/>
+        </marker>
+      </defs>
+      <text x="12" y="20" class="svg-label">Reference string over time (hot set H1 H2 H3, then a scan S1..S6)</text>
+      <!-- timeline -->
+      <line x1="20" y1="48" x2="620" y2="48" stroke="var(--ink-soft)" marker-end="url(#lk-arrow)"/>
+      <!-- hot refs -->
+      <g font-family="var(--mono)" font-size="12">
+        <rect x="22"  y="34" width="34" height="28" rx="4" fill="var(--buffer-bg)" stroke="var(--buffer)"/>
+        <text x="39"  y="52" text-anchor="middle" class="svg-mono">H1</text>
+        <rect x="62"  y="34" width="34" height="28" rx="4" fill="var(--buffer-bg)" stroke="var(--buffer)"/>
+        <text x="79"  y="52" text-anchor="middle" class="svg-mono">H2</text>
+        <rect x="102" y="34" width="34" height="28" rx="4" fill="var(--buffer-bg)" stroke="var(--buffer)"/>
+        <text x="119" y="52" text-anchor="middle" class="svg-mono">H3</text>
+        <!-- scan -->
+        <rect x="160" y="34" width="32" height="28" rx="4" fill="#fffefb" stroke="var(--storage)" stroke-dasharray="3 3"/>
+        <text x="176" y="52" text-anchor="middle" class="svg-mono">S1</text>
+        <rect x="198" y="34" width="32" height="28" rx="4" fill="#fffefb" stroke="var(--storage)" stroke-dasharray="3 3"/>
+        <text x="214" y="52" text-anchor="middle" class="svg-mono">S2</text>
+        <rect x="236" y="34" width="32" height="28" rx="4" fill="#fffefb" stroke="var(--storage)" stroke-dasharray="3 3"/>
+        <text x="252" y="52" text-anchor="middle" class="svg-mono">S3</text>
+        <rect x="274" y="34" width="32" height="28" rx="4" fill="#fffefb" stroke="var(--storage)" stroke-dasharray="3 3"/>
+        <text x="290" y="52" text-anchor="middle" class="svg-mono">S4</text>
+        <rect x="312" y="34" width="32" height="28" rx="4" fill="#fffefb" stroke="var(--storage)" stroke-dasharray="3 3"/>
+        <text x="328" y="52" text-anchor="middle" class="svg-mono">S5</text>
+        <rect x="350" y="34" width="32" height="28" rx="4" fill="#fffefb" stroke="var(--storage)" stroke-dasharray="3 3"/>
+        <text x="366" y="52" text-anchor="middle" class="svg-mono">S6</text>
+        <!-- hot again -->
+        <rect x="408" y="34" width="34" height="28" rx="4" fill="var(--buffer-bg)" stroke="var(--buffer)"/>
+        <text x="425" y="52" text-anchor="middle" class="svg-mono">H1</text>
+        <rect x="448" y="34" width="34" height="28" rx="4" fill="var(--buffer-bg)" stroke="var(--buffer)"/>
+        <text x="465" y="52" text-anchor="middle" class="svg-mono">H2</text>
+      </g>
+      <!-- LRU pool state after scan -->
+      <text x="12" y="100" class="svg-label">After the scan, LRU holds the freshest pages: the scan, not the hot set</text>
+      <g font-family="var(--mono)" font-size="12">
+        <rect x="22"  y="112" width="40" height="30" rx="4" fill="#fffefb" stroke="var(--storage)"/>
+        <text x="42"  y="131" text-anchor="middle" class="svg-mono">S3</text>
+        <rect x="68"  y="112" width="40" height="30" rx="4" fill="#fffefb" stroke="var(--storage)"/>
+        <text x="88"  y="131" text-anchor="middle" class="svg-mono">S4</text>
+        <rect x="114" y="112" width="40" height="30" rx="4" fill="#fffefb" stroke="var(--storage)"/>
+        <text x="134" y="131" text-anchor="middle" class="svg-mono">S5</text>
+        <rect x="160" y="112" width="40" height="30" rx="4" fill="#fffefb" stroke="var(--storage)"/>
+        <text x="180" y="131" text-anchor="middle" class="svg-mono">S6</text>
+      </g>
+      <text x="220" y="132" class="svg-label" fill="var(--bad)">H1 and H2 were evicted, so they miss when re-referenced</text>
+      <!-- LRU-2 pool state -->
+      <text x="12" y="178" class="svg-label">LRU-2 holds the hot set: scan pages have only one reference, so a huge K-distance</text>
+      <g font-family="var(--mono)" font-size="12">
+        <rect x="22"  y="190" width="40" height="30" rx="4" fill="var(--buffer-bg)" stroke="var(--buffer)"/>
+        <text x="42"  y="209" text-anchor="middle" class="svg-mono">H1</text>
+        <rect x="68"  y="190" width="40" height="30" rx="4" fill="var(--buffer-bg)" stroke="var(--buffer)"/>
+        <text x="88"  y="209" text-anchor="middle" class="svg-mono">H2</text>
+        <rect x="114" y="190" width="40" height="30" rx="4" fill="var(--buffer-bg)" stroke="var(--buffer)"/>
+        <text x="134" y="209" text-anchor="middle" class="svg-mono">H3</text>
+        <rect x="160" y="190" width="40" height="30" rx="4" fill="#fffefb" stroke="var(--storage)"/>
+        <text x="180" y="209" text-anchor="middle" class="svg-mono">S6</text>
+      </g>
+      <text x="220" y="210" class="svg-label" fill="var(--good)">H1 and H2 survive, so they hit when re-referenced</text>
+    </svg>
+    <figcaption><b>Figure 1.</b> The same reference string, two outcomes. The hot pages H1 H2 H3 are
+    used before and after the scan. LRU lets the six scan pages overwrite them; LRU-2 keeps them because
+    a page seen only once has no measurable reuse interval and is dropped first.</figcaption>
+  </figure>
+
+  <!-- ===== LRU-K MECHANISM ===== -->
+  <h2>LRU-K: count to K, not to one</h2>
+
+  <p>The fix is to look at more than the last reference. LRU-K records the times of the last K
+  references to each page. From those it estimates how often the page is really used, and evicts the
+  page whose reuse looks slowest. The key quantity is the Backward K-distance.</p>
+
+  <div class="callout keyidea">
+    <div class="callout-title">Keep this one thing</div>
+    <p>Backward K-distance b(p, K) is how far back in the reference string the K-th most recent access
+    to page p sits. LRU-K evicts the page with the largest Backward K-distance. If a page has been seen
+    fewer than K times, its K-distance is infinity, so it is the first to go. Plain LRU is exactly LRU-1.</p>
+  </div>
+
+  <p>Read that definition against the scan. A scan page has been referenced once. With K = 2 we need its
+  second most recent reference to compute a finite distance, and there is none, so b(p, 2) is infinity.
+  A hot page has been referenced many times, so its second most recent reference is close behind, giving
+  a small finite distance. LRU-2 evicts the infinite-distance page, which is the scan page. The hot set
+  survives. The single reference that made the scan page look fresh to LRU is exactly what makes it look
+  disposable to LRU-2.</p>
+
+  <p>When several pages all have infinite K-distance, because none has been seen K times yet, LRU-K
+  cannot rank them by the rule above, so it falls back to a subsidiary policy (plain LRU is the usual
+  choice) to break the tie. LRU-2 is the common setting in practice: it is the smallest K that can
+  measure an actual interval between two references rather than guess from a single timestamp, and the
+  paper shows it already captures most of the benefit.</p>
+
+  <!-- ===== FIGURE 2: backward K-distance ===== -->
+  <figure class="diagram">
+    <svg viewBox="0 0 640 200" role="img" aria-label="Backward K-distance comparison for two pages">
+      <text x="12" y="18" class="svg-label">Reference string (newest on the right). Same last-access time, different K-distance.</text>
+      <!-- ruler -->
+      <line x1="30" y1="40" x2="610" y2="40" stroke="var(--rule)"/>
+      <g font-family="var(--mono)" font-size="11" fill="var(--ink-faint)">
+        <text x="30" y="34">older</text>
+        <text x="560" y="34">now</text>
+      </g>
+      <!-- page A: a hot page, references at t=2,5,9,10 -->
+      <text x="12" y="78" class="svg-label">Page A (hot): references close together</text>
+      <g>
+        <circle cx="120" cy="100" r="7" fill="var(--buffer)"/>
+        <circle cx="240" cy="100" r="7" fill="var(--buffer)"/>
+        <circle cx="500" cy="100" r="7" fill="var(--buffer)"/>
+        <circle cx="560" cy="100" r="9" fill="var(--buffer)" stroke="var(--ink)"/>
+      </g>
+      <!-- mark the 2nd most recent for A -->
+      <line x1="500" y1="118" x2="560" y2="118" stroke="var(--good)" stroke-width="2" marker-end="url(#lk-arrow)"/>
+      <text x="500" y="136" class="svg-label" fill="var(--good)">b(A,2) is small: 2nd-newest is just behind</text>
+      <!-- page B: seen twice long ago and once now -->
+      <text x="12" y="162" class="svg-label">Page B (one-timer + old hit): references far apart</text>
+      <g>
+        <circle cx="90"  cy="178" r="7" fill="var(--storage)"/>
+        <circle cx="560" cy="178" r="9" fill="var(--storage)" stroke="var(--ink)"/>
+      </g>
+      <line x1="90" y1="178" x2="560" y2="178" stroke="var(--bad)" stroke-width="2" stroke-dasharray="4 3"/>
+      <text x="150" y="172" class="svg-label" fill="var(--bad)">b(B,2) is large: 2nd-newest is far back, so B is evicted</text>
+    </svg>
+    <figcaption><b>Figure 2.</b> Two pages whose most recent access is identical (rightmost dot). LRU
+    cannot tell them apart. LRU-2 measures the gap back to the second most recent access: page A's gap is
+    short (steady reuse), page B's is long (its earlier touch was a one-off), so B is evicted first.</figcaption>
+  </figure>
+
+  <div class="callout gotcha">
+    <div class="callout-title">Exam trap</div>
+    <p>LRU-K is not LFU (least frequently used). LFU counts every reference a page has ever had and keeps
+    the page with the highest lifetime count, so it cannot forget popularity that has gone stale. LRU-K
+    looks only at the last K references, which is a built-in aging window: a page that was hot last hour
+    and is cold now ages out, because its K-th most recent reference slides into the distant past. The
+    "which statement conflates LRU-K with LFU" item turns on exactly this. LRU-K adapts to changing
+    access patterns; LFU does not.</p>
+  </div>
+
+  <!-- ===== CORRELATED REFERENCE PERIOD ===== -->
+  <h3>The Correlated Reference Period</h3>
+
+  <p>LRU-K has a subtle failure of its own. Suppose a transaction reads a row and then updates it a few
+  milliseconds later. That is two references to the same page in quick succession, but they are one
+  logical event, not evidence that the page is popular over time. If LRU-2 treated them as two
+  independent references, the page's Backward 2-distance would collapse to almost zero and the page
+  would look intensely hot. The next correlated burst on a different page would then evict it.</p>
+
+  <p>The paper's fix is the Correlated Reference Period: a short timeout window (canonically a couple of
+  seconds) within which repeated references to the same page collapse into a single logical reference.
+  Read-then-update inside one transaction, a retried statement, successive operations in one process:
+  all of these fold into one. Only references separated by more than the window count as distinct
+  evidence of reuse. Without this, LRU-K would be fooled in the opposite direction from LRU, mistaking a
+  tight correlated burst for long-term popularity.</p>
+
+  <!-- ===== INTERACTIVE SIMULATOR ===== -->
+  <h2>Race the policies on one trace</h2>
+
+  <p>Here is the experiment to run. Build a reference string that hits a small hot working set, inject a
+  sequential scan of a length you choose, and run OPT, LRU, CLOCK, and LRU-2 on it side by side with the
+  same pool size. Watch the hit and miss tallies. Then turn on the ring buffer for the scan and watch the
+  hot set stop dying. OPT is the floor nobody can beat, because it cheats by reading the future.</p>
+
+  <figure class="sim" id="lk-sim">
+    <div class="sim-head">
+      <span class="sim-title">Replacement-policy race</span>
+      <span class="sim-sub">step to advance the shared reference string through all four pools</span>
+    </div>
+    <div class="sim-body">
+      <div class="sim-stage"><svg id="lk-svg" viewBox="0 0 640 360" width="100%"></svg></div>
+      <div class="sim-controls" id="lk-controls"></div>
+      <div class="sim-controls" id="lk-knobs" style="margin-top:.2rem"></div>
+      <div class="sim-readout" id="lk-readout"></div>
+    </div>
+  </figure>
+  <figcaption class="muted" style="margin-top:-1rem">Try this: set frames to 3, scan length to 6, ring
+  off, and run to the end. LRU and CLOCK miss on every re-reference of the hot set after the scan, while
+  LRU-2 keeps it. Now turn the ring on and rerun: LRU recovers because the scan can only evict itself.</figcaption>
+
+  <script>
+  // ===== Replacement-policy race: OPT, LRU, CLOCK, LRU-2 on one trace =====
+  (function () {
+    "use strict";
+    const svg = document.getElementById("lk-svg");
+    const readout = document.getElementById("lk-readout");
+    const knobs = document.getElementById("lk-knobs");
+
+    let FRAMES = 3;
+    let SCANLEN = 6;
+    let RING = false;            // confine the scan to a 1-frame ring
+    const RING_FRAMES = 1;       // toy stand-in for PostgreSQL's 256 KB ring
+    const HOT = ["H1", "H2", "H3"];
+
+    // Build the reference string: hot set, then a scan, then hot set again, repeated.
+    function buildTrace() {
+      const scan = [];
+      for (let i = 1; i <= SCANLEN; i++) scan.push("S" + i);
+      // warm the hot set, run the scan, then re-touch the hot set twice
+      return [].concat(HOT, HOT, scan, HOT, HOT, ["H1", "H2"]);
+    }
+    let trace = buildTrace();
+
+    // ----- policy simulators. Each returns {hit:bool, victim, evictDirty} and mutates its own state. -----
+    function isScan(pg) { return pg.charAt(0) === "S"; }
+
+    // OPT: evict the page whose next use is furthest in the future (uses the whole trace).
+    function makeOPT() {
+      const frames = [];
+      return function step(idx) {
+        const pg = trace[idx];
+        if (frames.includes(pg)) return { hit: true, frames: frames.slice() };
+        if (frames.length < FRAMES) { frames.push(pg); return { hit: false, frames: frames.slice() }; }
+        // choose victim: furthest next use
+        let victim = -1, far = -1;
+        for (let f = 0; f < frames.length; f++) {
+          let next = Infinity;
+          for (let j = idx + 1; j < trace.length; j++) if (trace[j] === frames[f]) { next = j; break; }
+          if (next > far) { far = next; victim = f; }
+        }
+        frames[victim] = pg;
+        return { hit: false, frames: frames.slice() };
+      };
+    }
+
+    // LRU: queue ordered oldest..newest. With RING, scan pages share a tiny ring region.
+    function makeLRU() {
+      const frames = [];                 // main region (LRU order, newest at end)
+      const ring = [];                   // ring region for scan pages when RING is on
+      return function step(idx) {
+        const pg = trace[idx];
+        const useRing = RING && isScan(pg);
+        const region = useRing ? ring : frames;
+        const cap = useRing ? RING_FRAMES : (RING ? FRAMES : FRAMES);
+        const hitIn = region.indexOf(pg);
+        if (hitIn !== -1) { region.splice(hitIn, 1); region.push(pg); return { hit: true, frames: frames.concat(ring) }; }
+        if (region.length < cap) { region.push(pg); return { hit: false, frames: frames.concat(ring) }; }
+        region.shift();                  // evict least recently used in this region
+        region.push(pg);
+        return { hit: false, frames: frames.concat(ring) };
+      };
+    }
+
+    // CLOCK: circular buffer with a reference bit and a sweeping hand (LRU approximation).
+    function makeCLOCK() {
+      const slots = new Array(FRAMES).fill(null);
+      const ref = new Array(FRAMES).fill(0);
+      const ring = [];                   // optional scan ring
+      let hand = 0;
+      return function step(idx) {
+        const pg = trace[idx];
+        const useRing = RING && isScan(pg);
+        if (useRing) {
+          const hitIn = ring.indexOf(pg);
+          if (hitIn !== -1) return { hit: true, frames: slots.filter(Boolean).concat(ring) };
+          if (ring.length < RING_FRAMES) ring.push(pg); else { ring.shift(); ring.push(pg); }
+          return { hit: false, frames: slots.filter(Boolean).concat(ring) };
+        }
+        const at = slots.indexOf(pg);
+        if (at !== -1) { ref[at] = 1; return { hit: true, frames: slots.filter(Boolean).concat(ring) }; }
+        // miss: sweep the hand for a victim with ref bit 0
+        while (true) {
+          if (slots[hand] === null) { slots[hand] = pg; ref[hand] = 1; hand = (hand + 1) % FRAMES; break; }
+          if (ref[hand] === 0) { slots[hand] = pg; ref[hand] = 1; hand = (hand + 1) % FRAMES; break; }
+          ref[hand] = 0; hand = (hand + 1) % FRAMES;   // second chance
+        }
+        return { hit: false, frames: slots.filter(Boolean).concat(ring) };
+      };
+    }
+
+    // LRU-2: track last 2 reference times; evict the largest Backward 2-distance (infinity first).
+    function makeLRU2() {
+      const frames = [];                 // page ids resident
+      const hist = {};                   // pageid -> [most recent, second most recent] indices
+      function record(pg, idx) {
+        const h = hist[pg] || [];
+        h.unshift(idx);
+        if (h.length > 2) h.length = 2;
+        hist[pg] = h;
+      }
+      return function step(idx) {
+        const pg = trace[idx];
+        record(pg, idx);
+        if (frames.includes(pg)) return { hit: true, frames: frames.slice() };
+        if (frames.length < FRAMES) { frames.push(pg); return { hit: false, frames: frames.slice() }; }
+        // victim: largest backward 2-distance. Infinity (seen <2 times) goes first; tie-break by oldest last use (LRU).
+        let victim = 0, bestKey = -1, bestRecent = Infinity;
+        for (let f = 0; f < frames.length; f++) {
+          const h = hist[frames[f]];
+          const kdist = (h && h.length >= 2) ? (idx - h[1]) : Infinity;     // distance to 2nd most recent
+          const recent = h ? h[0] : -1;
+          if (kdist > bestKey || (kdist === bestKey && recent < bestRecent)) {
+            bestKey = kdist; victim = f; bestRecent = recent;
+          }
+        }
+        frames[victim] = pg;
+        return { hit: false, frames: frames.slice() };
+      };
+    }
+
+    const POLICIES = [
+      { name: "OPT",   make: makeOPT,   note: "future-aware floor" },
+      { name: "LRU",   make: makeLRU,   note: "evict oldest touch" },
+      { name: "CLOCK", make: makeCLOCK, note: "ref bit + hand" },
+      { name: "LRU-2", make: makeLRU2,  note: "Backward 2-distance" }
+    ];
+
+    let runners, stats;
+    function reset() {
+      trace = buildTrace();
+      runners = POLICIES.map(p => p.make());
+      stats = POLICIES.map(() => ({ hits: 0, misses: 0, frames: [] }));
+    }
+    reset();
+
+    function render(i) {
+      // replay from 0 to i so state is deterministic for any step (handles Back too)
+      runners = POLICIES.map(p => p.make());
+      stats = POLICIES.map(() => ({ hits: 0, misses: 0, frames: [] }));
+      for (let s = 0; s < i; s++) {
+        for (let p = 0; p < POLICIES.length; p++) {
+          const r = runners[p](s);
+          if (r.hit) stats[p].hits++; else stats[p].misses++;
+          stats[p].frames = r.frames;
+        }
+      }
+      draw(i);
+    }
+
+    function draw(i) {
+      svg.innerHTML = "";
+      const cur = trace[i] || (i >= trace.length ? "done" : "");
+      // reference string ribbon
+      svg.appendChild(DBMS.svg("text", { x: 12, y: 16, class: "svg-label" },
+        "Reference string  (step " + Math.min(i, trace.length) + " / " + trace.length + ")"));
+      let x = 12;
+      for (let t = 0; t < trace.length; t++) {
+        const done = t < i, now = t === i, scan = isScan(trace[t]);
+        svg.appendChild(DBMS.svg("rect", {
+          x: x, y: 24, width: 30, height: 22, rx: 3,
+          fill: now ? "var(--buffer)" : (scan ? "#fffefb" : "var(--buffer-bg)"),
+          stroke: scan ? "var(--storage)" : "var(--buffer)",
+          "stroke-dasharray": scan && !now ? "3 3" : "0",
+          opacity: done ? 0.45 : 1
+        }));
+        svg.appendChild(DBMS.svg("text", {
+          x: x + 15, y: 39, "text-anchor": "middle", class: "svg-mono",
+          fill: now ? "#fff" : "var(--ink)"
+        }, trace[t]));
+        x += 33;
+      }
+      // four pools
+      const rowH = 74, top = 70;
+      for (let p = 0; p < POLICIES.length; p++) {
+        const y = top + p * rowH;
+        svg.appendChild(DBMS.svg("text", { x: 12, y: y + 4, class: "svg-mono" }, POLICIES[p].name));
+        svg.appendChild(DBMS.svg("text", { x: 12, y: y + 20, class: "svg-label" }, POLICIES[p].note));
+        const f = stats[p].frames;
+        for (let k = 0; k < FRAMES + (RING ? RING_FRAMES : 0); k++) {
+          const pg = f[k];
+          const fx = 110 + k * 60;
+          const scan = pg && isScan(pg);
+          svg.appendChild(DBMS.svg("rect", {
+            x: fx, y: y - 12, width: 50, height: 34, rx: 5,
+            fill: pg ? (scan ? "#fffefb" : "var(--buffer-bg)") : "#f6f2e9",
+            stroke: pg ? (scan ? "var(--storage)" : "var(--buffer)") : "var(--rule)",
+            "stroke-dasharray": pg ? "0" : "3 3"
+          }));
+          if (pg) svg.appendChild(DBMS.svg("text", { x: fx + 25, y: y + 9, "text-anchor": "middle", class: "svg-mono" }, pg));
+        }
+        // tally
+        const total = stats[p].hits + stats[p].misses;
+        const ratio = total ? Math.round(100 * stats[p].hits / total) : 0;
+        svg.appendChild(DBMS.svg("text", { x: 470, y: y - 2, class: "svg-label", fill: "var(--good)" }, "hits " + stats[p].hits));
+        svg.appendChild(DBMS.svg("text", { x: 470, y: y + 14, class: "svg-label", fill: "var(--bad)" }, "miss " + stats[p].misses));
+        svg.appendChild(DBMS.svg("text", { x: 560, y: y + 6, class: "svg-mono" }, ratio + "%"));
+      }
+      const optMiss = stats[0].misses, lruMiss = stats[1].misses, l2Miss = stats[3].misses;
+      readout.textContent = "next: " + cur + "    OPT misses " + optMiss +
+        " (floor), LRU " + lruMiss + ", LRU-2 " + l2Miss +
+        "    pool " + FRAMES + " frames, scan " + SCANLEN + ", ring " + (RING ? "on" : "off");
+    }
+
+    const stepper = DBMS.stepper({
+      controls: document.getElementById("lk-controls"),
+      steps: function () { return trace.length; },
+      onRender: render,
+      labels: { step: "Step", reset: "Restart" },
+      autoMs: 600
+    });
+
+    // knobs: frames, scan length, ring toggle
+    function mkBtn(label, fn) { return DBMS.el("button", { class: "ghost", text: label, onclick: fn }); }
+    const framesLbl = DBMS.el("span", { class: "sim-readout", html: "" });
+    function refresh() {
+      framesLbl.textContent = "frames " + FRAMES + " · scan " + SCANLEN + " · ring " + (RING ? "on" : "off");
+      reset(); stepper.reset();
+    }
+    knobs.append(
+      mkBtn("frames -", function () { FRAMES = DBMS.clamp(FRAMES - 1, 2, 6); refresh(); }),
+      mkBtn("frames +", function () { FRAMES = DBMS.clamp(FRAMES + 1, 2, 6); refresh(); }),
+      mkBtn("scan -", function () { SCANLEN = DBMS.clamp(SCANLEN - 1, 2, 9); refresh(); }),
+      mkBtn("scan +", function () { SCANLEN = DBMS.clamp(SCANLEN + 1, 2, 9); refresh(); }),
+      mkBtn("toggle ring", function () { RING = !RING; refresh(); }),
+      framesLbl
+    );
+    framesLbl.textContent = "frames " + FRAMES + " · scan " + SCANLEN + " · ring " + (RING ? "on" : "off");
+  })();
+  </script>
+
+  <!-- ===== ALGORITHM STEPS ===== -->
+  <h3>LRU-2 eviction, step by step</h3>
+  <ol class="steps">
+    <li>On a reference to page p, record the current logical time, but first apply the Correlated
+    Reference Period: if the last reference to p is within the window, treat this as the same logical
+    reference instead of a new one.</li>
+    <li>If p is resident, return its frame. No eviction.</li>
+    <li>If a free frame exists, load p there.</li>
+    <li>Otherwise compute each resident page's Backward K-distance: the gap back to its K-th most recent
+    reference, or infinity if it has been seen fewer than K times.</li>
+    <li>Evict the page with the largest Backward K-distance. Break ties among infinite-distance pages
+    with the subsidiary policy (plain LRU on the single reference each has).</li>
+  </ol>
+
+  <pre><code><span class="tok-com"># LRU-2 victim selection, the heart of the policy</span>
+<span class="tok-kw">def</span> <span class="tok-fn">victim</span>(resident, now, hist):
+    best, best_dist = <span class="tok-num">None</span>, -<span class="tok-num">1</span>
+    <span class="tok-kw">for</span> p <span class="tok-kw">in</span> resident:
+        h = hist[p]                          <span class="tok-com"># last K reference times, newest first</span>
+        kdist = (now - h[K-<span class="tok-num">1</span>]) <span class="tok-kw">if</span> len(h) &gt;= K <span class="tok-kw">else</span> INF
+        <span class="tok-kw">if</span> kdist &gt; best_dist:            <span class="tok-com"># INF (seen &lt; K times) wins, so a scan page goes first</span>
+            best, best_dist = p, kdist
+    <span class="tok-kw">return</span> best</code></pre>
+
+  <!-- ===== REAL SYSTEMS ===== -->
+  <h2>What real systems actually do</h2>
+
+  <p>LRU-K is the theory. Production engines rarely implement it literally, because tracking K timestamps
+  per page and keeping them sorted is expensive at the scale of millions of frames. They reach the same
+  goal, scan resistance, by cheaper means.</p>
+
+  <div class="callout realworld">
+    <div class="callout-title">In real systems</div>
+    <p>PostgreSQL does not use plain LRU and does not use LRU-K either. Its buffer manager uses
+    clock-sweep with a per-buffer <code>usage_count</code> that increments on each pin and saturates at
+    <code>BM_MAX_USAGE_COUNT = 5</code>. The clock hand (<code>nextVictimBuffer</code>) sweeps, decrements
+    the count of any unpinned buffer, and takes the first one whose count and pin count are both zero
+    [<a href="https://github.com/postgres/postgres/blob/master/src/backend/storage/buffer/README">PG buffer README</a>].
+    A small usage count gives recently and frequently touched pages several reprieves, which approximates
+    LRU-K's intent without storing timestamps. Against floods it adds ring buffers: a sequential scan is
+    confined to a 256 KB ring (<code>BAS_BULKREAD</code>, small enough to fit in L2 cache), bulk writes to
+    16 MB, and VACUUM to its own ring
+    [<a href="https://github.com/postgres/postgres/blob/master/src/backend/storage/buffer/freelist.c">freelist.c</a>].
+    The README states the motive directly: a page touched only by a big scan "is unlikely to be needed
+    again soon, so instead of running the normal clock-sweep algorithm and blowing out the entire buffer
+    cache," the scan recycles a bounded set of frames. SQLite, by contrast, does use LRU in its default
+    page cache (<code>pcache1.c</code>) [<a href="https://www.sqlite.org/pragma.html">SQLite pragmas</a>].</p>
+  </div>
+
+  <!-- ===== FIGURE 3: clock-sweep + ring ===== -->
+  <figure class="diagram">
+    <svg viewBox="0 0 640 250" role="img" aria-label="PostgreSQL clock-sweep with usage counts and a separate scan ring">
+      <defs>
+        <marker id="lk-hand" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto">
+          <path d="M0,0 L8,3 L0,6 Z" fill="var(--txn)"/>
+        </marker>
+      </defs>
+      <text x="12" y="18" class="svg-label">Main pool: clock-sweep, usage_count 0..5, hand decrements then evicts a 0</text>
+      <!-- circular clock of 6 buffers -->
+      <g font-family="var(--mono)" font-size="12">
+        <circle cx="150" cy="130" r="80" fill="none" stroke="var(--rule)"/>
+        <!-- 6 frames around the circle -->
+        <g>
+          <circle cx="150" cy="56"  r="20" fill="var(--buffer-bg)" stroke="var(--buffer)"/><text x="150" y="61" text-anchor="middle" class="svg-mono">5</text>
+          <circle cx="214" cy="93"  r="20" fill="var(--buffer-bg)" stroke="var(--buffer)"/><text x="214" y="98" text-anchor="middle" class="svg-mono">3</text>
+          <circle cx="214" cy="167" r="20" fill="#fffefb" stroke="var(--buffer)"/><text x="214" y="172" text-anchor="middle" class="svg-mono">0</text>
+          <circle cx="150" cy="204" r="20" fill="var(--buffer-bg)" stroke="var(--buffer)"/><text x="150" y="209" text-anchor="middle" class="svg-mono">2</text>
+          <circle cx="86"  cy="167" r="20" fill="var(--buffer-bg)" stroke="var(--buffer)"/><text x="86" y="172" text-anchor="middle" class="svg-mono">4</text>
+          <circle cx="86"  cy="93"  r="20" fill="var(--buffer-bg)" stroke="var(--buffer)"/><text x="86" y="98" text-anchor="middle" class="svg-mono">1</text>
+        </g>
+        <!-- hand pointing to the 0 -->
+        <line x1="150" y1="130" x2="200" y2="160" stroke="var(--txn)" stroke-width="2" marker-end="url(#lk-hand)"/>
+        <text x="150" y="134" text-anchor="middle" class="svg-label">hand</text>
+      </g>
+      <text x="60" y="240" class="svg-label" fill="var(--bad)">victim: pin 0 and usage 0</text>
+      <!-- ring buffer on the right -->
+      <text x="330" y="18" class="svg-label">Scan ring (BAS_BULKREAD, ~256 KB): scan can only evict itself</text>
+      <g font-family="var(--mono)" font-size="12">
+        <rect x="340" y="60" width="56" height="40" rx="5" fill="#fffefb" stroke="var(--storage)"/><text x="368" y="85" text-anchor="middle" class="svg-mono">S7</text>
+        <rect x="404" y="60" width="56" height="40" rx="5" fill="#fffefb" stroke="var(--storage)"/><text x="432" y="85" text-anchor="middle" class="svg-mono">S8</text>
+        <rect x="468" y="60" width="56" height="40" rx="5" fill="#fffefb" stroke="var(--storage)"/><text x="496" y="85" text-anchor="middle" class="svg-mono">S9</text>
+        <rect x="532" y="60" width="56" height="40" rx="5" fill="#fffefb" stroke="var(--storage)"/><text x="560" y="85" text-anchor="middle" class="svg-mono">S10</text>
+      </g>
+      <text x="340" y="128" class="svg-label">The hot pages in the main pool keep their usage counts and survive.</text>
+      <line x1="368" y1="104" x2="540" y2="104" stroke="var(--ink-faint)" stroke-dasharray="3 3"/>
+      <text x="340" y="160" class="svg-label">A new scan page recycles the oldest ring slot, never touching the clock.</text>
+    </svg>
+    <figcaption><b>Figure 3.</b> PostgreSQL's two mechanisms. The clock-sweep with a saturating usage
+    count approximates frequency-aware LRU cheaply. The separate ring buffer bounds a scan so it cannot
+    flood the main pool, which is the practical form of scan resistance LRU-K gives you in theory.</figcaption>
+  </figure>
+
+  <!-- ===== PREFETCH AND SCAN SHARING ===== -->
+  <h3>Prefetching and scan sharing</h3>
+
+  <p>Eviction policy decides what to keep. Prefetching decides when to read, and it is the other half of
+  making scans cheap. A disk read is slow because of latency, not just bandwidth, so issuing one read at
+  a time and waiting wastes the device. Prefetch (read-ahead) reads pages the engine predicts it will
+  need before they are requested, overlapping that I/O with the CPU work on pages already in memory. The
+  CMU lecture gives two flavors: sequential prefetch during a scan (read the next blocks while processing
+  the current ones) and index prefetch (fetch the next logical leaf in an index scan, which need not be
+  the next physical page on disk)
+  [<a href="https://15445.courses.cs.cmu.edu/fall2024/notes/06-bufferpool.pdf">CMU 15-445 L06</a>].
+  In PostgreSQL, <code>effective_io_concurrency</code> (default 16) tells the engine how many concurrent
+  reads it can expect and sets the prefetch distance
+  [<a href="https://www.postgresql.org/docs/current/runtime-config-resource.html">PG resource config</a>].</p>
+
+  <p>Two related tricks share work instead of duplicating it. Scan sharing (synchronized scans) lets a
+  second query that wants to scan the same table attach its cursor to a scan already in flight, so the two
+  share the pages one read brings in; the engine tracks where the latecomer joined so it can wrap around
+  and finish the part it missed. Buffer pool bypass goes the other way: a large one-shot scan reads pages
+  into query-local memory and never inserts them into the shared pool at all, which is flood prevention by
+  refusing to participate. The ring buffer is the in-between version that PostgreSQL ships by default.</p>
+
+  <!-- ===== COMPARISON TABLE ===== -->
+  <table>
+    <caption>How each policy treats a one-pass scan page versus a hot page.</caption>
+    <thead><tr><th>Policy</th><th>Signal used</th><th>Scan page</th><th>Hot page under flood</th></tr></thead>
+    <tbody>
+      <tr><td>OPT</td><td>full future</td><td>evicted (next use is never)</td><td>kept</td></tr>
+      <tr><td>LRU / CLOCK</td><td>last reference</td><td>kept (looks fresh)</td><td>evicted (flooded out)</td></tr>
+      <tr><td>MRU</td><td>last reference, inverted</td><td>evicted (just used)</td><td>kept</td></tr>
+      <tr><td>LRU-2</td><td>2nd most recent reference</td><td>evicted (K-distance infinite)</td><td>kept</td></tr>
+      <tr><td>Ring buffer</td><td>structural confinement</td><td>recycled within ring</td><td>kept (outside ring)</td></tr>
+    </tbody>
+  </table>
+
+  <details class="deepdive">
+    <summary>Deeper: why LRU-2 and not LRU-3 or LRU-10</summary>
+    <div><p>Larger K remembers more history and reacts more slowly to change, which can help a very stable
+    workload but hurts when access patterns shift, and it costs more storage and comparison work. LRU-2 is
+    the smallest K that measures an actual interval between two references rather than inferring reuse from
+    one timestamp, so it captures the bulk of the benefit at the lowest cost. The paper reports diminishing
+    returns past K = 2 on its workloads, which is why LRU-2 is the practical default and why production
+    systems approximate even that with a small saturating counter rather than true K-timestamp tracking.</p></div>
+  </details>
+
+  <!-- ===== RETRIEVAL PRACTICE: MCQs ===== -->
+  <h2>Check yourself</h2>
+
+  <div class="mcq" data-answer="2">
+    <p class="mcq-q">Which statement is false?</p>
+    <button class="mcq-opt">LRU approximates the optimal policy but can be fooled by a sequential scan.</button>
+    <button class="mcq-opt">CLOCK approximates LRU using a reference bit instead of per-page timestamps.</button>
+    <button class="mcq-opt">LRU is the optimal replacement policy because it always keeps the right pages.</button>
+    <button class="mcq-opt">Belady's MIN is optimal but needs the future, so it is only a baseline.</button>
+    <p class="mcq-explain">The false claim is that LRU is optimal. The optimal policy is Belady's MIN,
+    which evicts the page used furthest in the future and requires knowledge no real system has. LRU is a
+    heuristic on the last reference, and a scan defeats it. CLOCK is a cheaper stand-in for LRU.</p>
+  </div>
+
+  <div class="mcq" data-answer="1">
+    <p class="mcq-q">Which statement conflates LRU-K with LFU?</p>
+    <button class="mcq-opt">LRU-K evicts the page with the largest Backward K-distance.</button>
+    <button class="mcq-opt">LRU-K keeps whichever page has the highest lifetime reference count.</button>
+    <button class="mcq-opt">LRU-K looks only at the last K references, so old popularity ages out.</button>
+    <button class="mcq-opt">LRU-2 measures an interval between two references, not one timestamp.</button>
+    <button class="mcq-opt">A page seen fewer than K times has infinite Backward K-distance.</button>
+    <p class="mcq-explain">Keeping the page with the highest lifetime count is LFU, not LRU-K. LRU-K
+    deliberately forgets: it considers only the last K references, so a page that was hot long ago but is
+    cold now ages out. LFU cannot forget stale popularity. That built-in aging is the whole difference.</p>
+  </div>
+
+  <div class="mcq" data-answer="3">
+    <p class="mcq-q">A query does one full pass over a table and never revisits a page. Which policy fits best, and why?</p>
+    <button class="mcq-opt">LRU, because the most recently read page is the most likely to be reused.</button>
+    <button class="mcq-opt">LFU, because every scan page has the same reference frequency anyway.</button>
+    <button class="mcq-opt">CLOCK, because the reference bit protects each scan page from eviction.</button>
+    <button class="mcq-opt">MRU or a ring buffer, because the just-read page will not be needed again.</button>
+    <p class="mcq-explain">For a one-pass scan the next reference is to a new page, so the most recently
+    used page is the least likely to be reused. MRU evicts it; a ring buffer confines the scan to a few
+    frames so it can only evict itself. LRU keeps scan pages and evicts the hot set, the exact failure.</p>
+  </div>
+
+  <div class="mcq" data-answer="0">
+    <p class="mcq-q">Which statement is false?</p>
+    <button class="mcq-opt">PostgreSQL uses plain LRU for its shared buffer pool.</button>
+    <button class="mcq-opt">PostgreSQL uses clock-sweep with a usage count that saturates at five.</button>
+    <button class="mcq-opt">PostgreSQL confines a sequential scan to a 256 KB ring buffer.</button>
+    <button class="mcq-opt">SQLite's default page cache does use an LRU eviction policy.</button>
+    <button class="mcq-opt">A ring buffer prevents a scan from blowing out the whole cache.</button>
+    <p class="mcq-explain">PostgreSQL does not use plain LRU. It uses clock-sweep with a per-buffer
+    usage_count capped at BM_MAX_USAGE_COUNT (5), plus ring buffers for bulk reads, writes, and VACUUM.
+    The other claims are accurate, including that SQLite's default pcache1 module does use LRU.</p>
+  </div>
+
+  <div class="mcq" data-answer="2">
+    <p class="mcq-q">What does the Correlated Reference Period prevent?</p>
+    <button class="mcq-opt">A scan page from being evicted before its frame is reused by another scan.</button>
+    <button class="mcq-opt">The clock hand from sweeping past a pinned buffer during eviction.</button>
+    <button class="mcq-opt">A read-then-update burst from making one page look long-term popular.</button>
+    <button class="mcq-opt">A dirty victim from being written back before its log record reaches disk.</button>
+    <p class="mcq-explain">The Correlated Reference Period collapses references close together in time
+    (read then update in one transaction, a retry, successive operations) into one logical reference, so a
+    tight burst does not shrink the Backward K-distance and wrongly mark the page as hot. The WAL ordering
+    rule in the last option belongs to week 14.</p>
+  </div>
+
+  <div class="mcq" data-answer="1">
+    <p class="mcq-q">Two resident pages have the same most recent access time. How does LRU-2 choose between them?</p>
+    <button class="mcq-opt">It keeps the one with the smaller page id, breaking the tie arbitrarily.</button>
+    <button class="mcq-opt">It evicts the one whose second most recent access is further in the past.</button>
+    <button class="mcq-opt">It evicts whichever page is currently clean to avoid a write-back.</button>
+    <button class="mcq-opt">It keeps both and evicts a third page chosen by the clock hand.</button>
+    <p class="mcq-explain">LRU cannot distinguish pages with the same last access, but LRU-2 looks back to
+    the second most recent access. The page whose second-newest reference is further back has the larger
+    Backward 2-distance and is evicted. Dirtiness affects the cost of eviction, not the victim choice.</p>
+  </div>
+
+  <!-- ===== FLASHCARDS ===== -->
+  <div class="flashcard">
+    <div class="fc-front">Define Backward K-distance and state the LRU-K eviction rule.</div>
+    <div class="fc-back">Backward K-distance b(p, K) is the distance back to the K-th most recent
+    reference to page p, or infinity if p has been seen fewer than K times. LRU-K evicts the page with the
+    largest b(p, K), so pages seen fewer than K times go first.</div>
+  </div>
+
+  <div class="flashcard">
+    <div class="fc-front">Why is MRU, not LRU, the right policy for a one-pass scan?</div>
+    <div class="fc-back">In a one-pass scan the next reference is always to a new page, so the page you just
+    read is the one you are least likely to touch again. MRU evicts it and protects the working set; LRU
+    keeps it and evicts the working set.</div>
+  </div>
+
+  <!-- ===== PRIMARY SOURCE ===== -->
+  <div class="source-box">
+    <div class="src-tag">Primary source</div>
+    <div class="src-title">The LRU-K Page Replacement Algorithm for Database Disk Buffering (O'Neil, O'Neil, Weikum, SIGMOD 1993)</div>
+    <p class="muted">Read sections 1 and 2 for the cache-swamping example, the Backward K-distance
+    definition, LRU-2 versus LRU-1, the Correlated Reference Period, and the argument that LRU-K is not
+    LFU. <a href="https://www.cs.cmu.edu/~natassa/courses/15-721/papers/p297-o_neil.pdf">PDF mirror</a>.
+    Pair it with <a href="https://15445.courses.cs.cmu.edu/fall2024/notes/06-bufferpool.pdf">CMU 15-445
+    Lecture 06</a> for sequential flooding, prefetching, and scan sharing.</p>
+  </div>
+
+  <!-- ===== ASK YOUR TEACHER ===== -->
+  <div class="ask-teacher">
+    <div class="at-tag">Ask your teacher</div>
+    <p>Want to step through an LRU-2 eviction on your own reference string, or see exactly how
+    PostgreSQL's usage_count differs from true LRU-K? Ask me to extend the simulator, draw the ring buffer
+    against the clock, or quiz you harder on the K-distance arithmetic. I am your teacher for this course,
+    not just a document.</p>
+  </div>
+
+  <!-- ===== NAV ===== -->
+  <nav class="lesson-nav">
+    <a class="prev" href="0004-buffer-pool-design.html">
+      <span class="nav-dir">Previous</span>
+      <span class="nav-title">Week 04 · Buffer pool design: frames, pins, dirty flags, replacement</span>
+    </a>
+    <a class="next" href="0006-btree-search-insert.html">
+      <span class="nav-dir">Next</span>
+      <span class="nav-title">Week 06 · B+tree invariants, search, insertion, and splits</span>
+    </a>
+  </nav>
+
+  </div><!-- /.col -->
+</main>
+</body>
+</html>

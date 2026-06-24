@@ -1,0 +1,644 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lesson 02: Storage engine: disk layout, pages, and slotted records · Field Guide to the Database Engine</title>
+<link rel="stylesheet" href="../assets/course.css">
+<script defer src="../assets/components.js"></script>
+</head>
+<body class="layer-storage">
+<main class="page">
+
+  <!-- ===== MASTHEAD ===== -->
+  <header class="masthead col">
+    <div class="crumbs">
+      <a href="../index.html">Field Guide</a> <span>/</span>
+      <span>Part II · Storage</span> <span>/</span>
+      <span>Week 02</span>
+    </div>
+    <span class="week-badge">Storage engine</span>
+    <h1>Storage engine: disk layout, pages, and slotted records</h1>
+    <p class="lede">A disk moves whole blocks and a row can be any size. So how do you pack
+    variable-length rows into a fixed-size page, find any one of them in a single read, and
+    keep its address stable even after you shuffle the bytes around? The slotted page is the answer,
+    and once you see the constraint it solves, it stops looking arbitrary.</p>
+  </header>
+
+  <div class="col">
+
+  <!-- ===== OBJECTIVES ===== -->
+  <div class="objectives">
+    <h4>By the end you can</h4>
+    <ul>
+      <li>Say why a flat append-only file breaks on deletes and on addressing, and what a page buys you.</li>
+      <li>Draw a slotted page from memory: header, a slot array closing down, tuple data closing up, free space in the gap.</li>
+      <li>Explain why a record id is (page, slot) and not a byte offset, and why that indirection lets tuples move.</li>
+      <li>Decode a tuple's bytes: header, NULL bitmap, fixed and variable fields, and the alignment pad that makes column order matter.</li>
+      <li>Answer MCQ-style traps about pd_lower / pd_upper, line pointer states, and the 32 KB heap page cap.</li>
+    </ul>
+  </div>
+
+  <!-- ===== WHERE THIS SITS (connective tissue) ===== -->
+  <h3>Where this sits in the engine</h3>
+  <p>Hold the course's running query in your head:</p>
+  <pre><code><span class="tok-kw">SELECT</span> name <span class="tok-kw">FROM</span> emp <span class="tok-kw">WHERE</span> salary &gt; <span class="tok-num">75000</span> <span class="tok-kw">ORDER BY</span> name;</code></pre>
+  <p>In <a href="0001-dbms-architecture.html">week 1</a> we watched that string fall through five components
+  to the bottom of the stack. This week is the bottom. When the executor's scan asks the buffer pool for a page,
+  and the buffer pool reads that page off disk, <em>this</em> layer is what those bytes mean. The storage manager
+  hands the layer above a fixed-size page; inside that page, the layout we build here lets it find each
+  <code>emp</code> row, pull out the <code>name</code> and <code>salary</code> columns, and decide whether
+  <code>salary &gt; 75000</code>.</p>
+  <p>What gets handed in, and what gets handed down:</p>
+  <ul>
+    <li><b>From above (the buffer pool, <a href="0004-buffer-pool-design.html">week 4</a>):</b> a request for a page by id, and later a frame of memory holding that page's exact bytes.</li>
+    <li><b>Down to the device:</b> a read or write of one fixed-size block. The disk knows nothing about rows. It moves blocks.</li>
+  </ul>
+  <p>So the storage engine's whole job is to be the translator between "rows and columns" up top and "fixed blocks of bytes"
+  down below. Next week (<a href="0003-storage-engine-heap-files.html">heap files and free space</a>) zooms out from one page
+  to the file of many pages: where a new row goes, and what a delete leaves behind. This week we stay inside a single page.</p>
+
+  <!-- ===== THE PROBLEM ===== -->
+  <h2>The problem, stated honestly</h2>
+  <p>Three facts about persistent storage force everything below.</p>
+  <p>First, the device is block-addressable, not byte-addressable. To read one salary you cannot pull one number;
+  the hardware drags in a whole block. The CMU storage notes put it bluntly: to read a value at some offset
+  "the program first has to load the 4 KB page into memory"
+  [<a href="https://15445.courses.cs.cmu.edu/fall2023/notes/03-storage1.pdf">CMU 15-445 L03</a>].
+  So the unit of work is the page, never the byte.</p>
+  <p>Second, disk is slow on a scale that is hard to feel. If an L1 cache reference took one second, the same notes say,
+  an SSD read would take about 4.4 hours and a spinning disk about 3.3 weeks. Every design choice below is about
+  cutting the number of block transfers a query needs.</p>
+  <p>Third, rows have variable length and you will delete them. That last fact is what kills the obvious design.</p>
+
+  <div class="callout intuition">
+    <div class="callout-title">Intuition</div>
+    <p>Think of a page as a single index card you can only ever pick up, scribble on, and put back as a whole card.
+    You cannot edit one word in place on the shelf. You take the card down, rewrite it, and reshelve it.
+    The slotted page is just a smart way to arrange writing on a card so you can fit a lot, erase some, and still
+    point a friend at "the third entry" even after you have recopied the card to clean it up.</p>
+  </div>
+
+  <div class="callout why">
+    <div class="callout-title">Why the naive design fails</div>
+    <p>Naive fix: append each row to the end of a flat file. Two things break immediately. <b>Deletes</b> leave holes
+    you cannot reuse: the next row is variable length and may not fit the gap, so the file grows forever or
+    fragments. <b>Addressing</b> breaks the moment a row moves: if you point at a row by its byte position and then
+    compact the file to reclaim a hole, every pointer to every row after it is now wrong. An index that stored
+    those positions would all be stale at once. You need a fixed unit you can rewrite whole (the page) and an address
+    that survives the bytes moving (the slot). That is the entire derivation of the slotted page.</p>
+  </div>
+
+  <!-- ===== THREE PAGE CONCEPTS ===== -->
+  <h2>Three things called "page"</h2>
+  <p>The word page is overloaded across three layers, and the gap between them is where a real bug lives.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 520 210" role="img" aria-label="Three stacked page concepts: hardware, OS, database">
+      <defs>
+        <marker id="s2arrow" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto">
+          <path d="M0,0 L7,3 L0,6 Z" fill="var(--ink-soft)"/>
+        </marker>
+      </defs>
+      <!-- DB page 8KB spanning two hardware pages -->
+      <rect x="20" y="20" width="320" height="38" rx="5" fill="var(--storage-bg)" stroke="var(--storage)"/>
+      <text x="180" y="44" text-anchor="middle" class="svg-mono">database page (8 KB)</text>
+      <text x="360" y="44" class="svg-label">DBMS logical page</text>
+
+      <rect x="20" y="78" width="320" height="38" rx="5" fill="#fffdf8" stroke="var(--ink-soft)"/>
+      <text x="180" y="102" text-anchor="middle" class="svg-mono">OS page (4 KB)</text>
+      <text x="360" y="102" class="svg-label">virtual memory unit</text>
+
+      <!-- two hardware pages under the DB page -->
+      <rect x="20" y="136" width="156" height="38" rx="5" fill="#fffdf8" stroke="var(--ink-soft)"/>
+      <text x="98" y="160" text-anchor="middle" class="svg-mono">hw page 4 KB</text>
+      <rect x="184" y="136" width="156" height="38" rx="5" fill="#fffdf8" stroke="var(--ink-soft)"/>
+      <text x="262" y="160" text-anchor="middle" class="svg-mono">hw page 4 KB</text>
+      <text x="360" y="160" class="svg-label">atomic write unit</text>
+
+      <!-- torn write indicator -->
+      <line x1="180" y1="58" x2="180" y2="136" stroke="var(--bad)" stroke-dasharray="4 3" marker-end="url(#s2arrow)"/>
+      <text x="180" y="196" text-anchor="middle" fill="var(--bad)" class="svg-label">one 8 KB DB page straddles two atomic writes: torn-page risk</text>
+    </svg>
+    <figcaption><b>Figure 1.</b> The device promises atomicity only at the hardware page. When the database page is
+    larger, one logical write becomes two physical writes, and a crash between them leaves the page half old, half new.
+    Notice that the three sizes are independent: nothing forces the database page to match the hardware page.</figcaption>
+  </figure>
+
+  <ul>
+    <li><b>Hardware page</b>, usually 4 KB. The device guarantees that a write of this size is all-or-nothing.</li>
+    <li><b>OS page</b>, typically 4 KB, the unit of virtual memory.</li>
+    <li><b>Database page</b>, commonly 1 to 16 KB; PostgreSQL fixes 8 KB at compile time, SQLite defaults to 4 KB.</li>
+  </ul>
+  <p>When the database page (8 KB) is bigger than the hardware page (4 KB), one logical write is two atomic writes.
+  A crash in between leaves a <b>torn page</b>: half the new version, half the old. PostgreSQL defends against this by
+  writing the full page image to the write-ahead log the first time it is touched after a checkpoint, which is also why
+  every page header carries <code>pd_lsn</code>, the log position of its last change. We meet that machinery properly in
+  <a href="0014-logging-recovery-aries.html">week 14</a>; for now, just notice the header field is there for crash safety,
+  not for finding rows.</p>
+
+  <div class="callout gotcha">
+    <div class="callout-title">Exam trap</div>
+    <p>"The database page size must equal the OS or hardware page size." False. They are three independent numbers.
+    The only consequence of the database page being larger is that you need extra protection (full-page writes)
+    against torn writes.</p>
+  </div>
+
+  <!-- ===== SLOTTED PAGE ANATOMY ===== -->
+  <h2>The slotted page</h2>
+  <p>The slotted page is the layout almost every disk database uses inside a page. The shape is simple and the reason
+  for the shape is the whole lesson.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 520 240" role="img" aria-label="Annotated slotted page layout">
+      <!-- outer page -->
+      <rect x="60" y="14" width="400" height="212" rx="6" fill="#fffdf8" stroke="var(--storage)" stroke-width="1.5"/>
+      <!-- header -->
+      <rect x="60" y="14" width="400" height="34" fill="var(--storage-bg)" stroke="var(--storage)"/>
+      <text x="260" y="35" text-anchor="middle" class="svg-mono">page header (pd_lsn, pd_lower, pd_upper, ...)</text>
+      <!-- slot array growing down -->
+      <rect x="60" y="48" width="64" height="22" fill="#eaddcc" stroke="var(--storage)"/>
+      <rect x="124" y="48" width="64" height="22" fill="#eaddcc" stroke="var(--storage)"/>
+      <rect x="188" y="48" width="64" height="22" fill="#eaddcc" stroke="var(--storage)"/>
+      <text x="92"  y="63" text-anchor="middle" class="svg-mono">slot0</text>
+      <text x="156" y="63" text-anchor="middle" class="svg-mono">slot1</text>
+      <text x="220" y="63" text-anchor="middle" class="svg-mono">slot2</text>
+      <text x="270" y="63" class="svg-label">slot array grows down  (pd_lower)</text>
+      <!-- free space -->
+      <rect x="60" y="70" width="400" height="86" fill="#fbf3e8" stroke="var(--rule)" stroke-dasharray="4 3"/>
+      <text x="260" y="116" text-anchor="middle" class="svg-label">free space (the gap)</text>
+      <!-- tuple data growing up -->
+      <rect x="356" y="156" width="104" height="34" fill="var(--storage-bg)" stroke="var(--storage)"/>
+      <rect x="252" y="156" width="104" height="34" fill="var(--storage-bg)" stroke="var(--storage)"/>
+      <rect x="156" y="156" width="96"  height="34" fill="var(--storage-bg)" stroke="var(--storage)"/>
+      <text x="408" y="177" text-anchor="middle" class="svg-mono">tuple0</text>
+      <text x="304" y="177" text-anchor="middle" class="svg-mono">tuple1</text>
+      <text x="204" y="177" text-anchor="middle" class="svg-mono">tuple2</text>
+      <text x="60" y="210" class="svg-label">tuple data grows up  (pd_upper)</text>
+      <!-- slot to tuple arrows -->
+      <path d="M92,70 C92,120 200,150 200,156" fill="none" stroke="var(--accent)" stroke-width="1.2" marker-end="url(#s2arrow2)"/>
+      <path d="M156,70 C156,120 304,150 304,156" fill="none" stroke="var(--accent)" stroke-width="1.2" marker-end="url(#s2arrow2)"/>
+      <defs>
+        <marker id="s2arrow2" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto">
+          <path d="M0,0 L7,3 L0,6 Z" fill="var(--accent)"/>
+        </marker>
+      </defs>
+    </svg>
+    <figcaption><b>Figure 2.</b> Slot <i>i</i> does not contain a tuple; it points at one. The slot array grows down from
+    the header, tuple data grows up from the end, and free space is whatever is left between <code>pd_lower</code> and
+    <code>pd_upper</code>. The page is full when those two meet. Because slot0 stores tuple0's <em>offset</em>, the engine
+    can slide tuple0 anywhere in the page and only the offset in slot0 changes.</figcaption>
+  </figure>
+
+  <p>Read the structure top to bottom:</p>
+  <ol class="steps">
+    <li>A <b>header</b> at the top with bookkeeping: where free space starts, where it ends, the crash-recovery LSN.</li>
+    <li>A <b>slot array</b> just below it, one small fixed-size entry per row, growing downward as you insert.</li>
+    <li><b>Free space</b> in the middle, shrinking from both ends.</li>
+    <li><b>Tuple data</b> at the bottom, growing upward, with the newest tuple nearest the free gap.</li>
+  </ol>
+  <p>The two halves close toward each other. In PostgreSQL the header field <code>pd_lower</code> marks the end of the
+  slot array and <code>pd_upper</code> marks the start of tuple data; free bytes are <code>pd_upper - pd_lower</code>
+  [<a href="https://www.postgresql.org/docs/current/storage-page-layout.html">PG page layout</a>].</p>
+
+  <div class="callout keyidea">
+    <div class="callout-title">Keep this one thing</div>
+    <p>A slot stores a tuple's <em>offset</em>, not the tuple. So the record id an index holds is
+    <code>(page id, slot number)</code>, and it stays valid even when the engine slides the tuple's bytes
+    around inside the page. The indirection is the point.</p>
+  </div>
+
+  <div class="callout why">
+    <div class="callout-title">Why a slot and not a direct pointer</div>
+    <p>Suppose an index entry pointed straight at a tuple's byte offset. The moment you compact the page to close a
+    deletion hole, every tuple after the hole moves, and every index pointing at those tuples is wrong. You would have
+    to rewrite the index on every compaction. The slot array is one cheap level of indirection that absorbs all that
+    motion: tuples move, slot offsets update, but the external <code>(page, slot)</code> address never changes. CMU's notes
+    warn that an application "cannot rely on these ids to mean anything"; they are internal addresses, deliberately opaque
+    [<a href="https://15445.courses.cs.cmu.edu/fall2023/notes/03-storage1.pdf">CMU 15-445 L03</a>].</p>
+  </div>
+
+  <!-- ===== SIMULATOR ===== -->
+  <h2>Try it: a slotted page you can edit</h2>
+  <p>This is one page. Insert rows of a chosen length, delete by slot, and watch the slot array and tuple data
+  close toward each other. Delete a middle row and you get a hole; press compact and the tuples slide together
+  while the record ids in the slot column stay put. Toggle MAXALIGN to see padding inflate every row, and reorder
+  the demo columns to watch a badly ordered row waste pad bytes that a good order avoids.</p>
+
+  <figure class="sim" id="sp-sim">
+    <div class="sim-head">
+      <span class="sim-title">Slotted page byte editor</span>
+      <span class="sim-sub">insert, delete, compact; watch ids stay stable while bytes move</span>
+    </div>
+    <div class="sim-body">
+      <div class="sim-stage"><svg id="sp-svg" viewBox="0 0 480 230" width="100%"></svg></div>
+      <div class="sim-controls" id="sp-controls"></div>
+      <div class="sim-readout" id="sp-readout"></div>
+    </div>
+  </figure>
+  <figcaption class="muted" style="margin-top:-1rem">Experiment to run: insert three rows, delete slot 1, note the
+  fragmentation counter rise, then compact and confirm slot 0 and slot 2 still name the same rows. Then flip the
+  column order and watch the same data take fewer bytes.</figcaption>
+
+  <script>
+  // Slotted page byte editor. Self-contained, lesson-prefixed ids (sp-*).
+  (function () {
+    const PAGE = 240;            // logical bytes of data area in our toy page
+    const HEADER = 16;           // toy header bytes
+    const SLOT = 4;              // bytes per slot entry (like PG's 4-byte line pointer)
+    const svg = document.getElementById("sp-svg");
+    const readout = document.getElementById("sp-readout");
+    const controls = document.getElementById("sp-controls");
+
+    // Two column orders for the same row: a bool(1), a bigint(8), a varchar.
+    // "bad" order = bool, bigint, name -> 7 pad bytes between bool and bigint when aligned.
+    // "good" order = bigint, bool, name -> no interior pad.
+    let alignOn = true;
+    let goodOrder = false;
+    let nextId = 0;
+
+    // each row: {id, len, dead:false}. len is requested payload length.
+    let rows = [];
+
+    function alignedLen(payload) {
+      if (!alignOn) return payload;
+      // model: 8-byte align of the start of data plus interior pad from column order.
+      const interiorPad = goodOrder ? 0 : 7;
+      const total = payload + interiorPad;
+      return Math.ceil(total / 8) * 8;   // MAXALIGN the whole tuple to 8
+    }
+
+    function used() {
+      let slots = rows.length * SLOT;
+      let data = 0;
+      rows.forEach(r => { if (!r.dead) data += alignedLen(r.len); });
+      return { slots, data, total: HEADER + slots + data };
+    }
+
+    function frag() {
+      // fragmentation = bytes locked up by dead tuples that compact would reclaim
+      let f = 0;
+      rows.forEach(r => { if (r.dead) f += alignedLen(r.len); });
+      return f;
+    }
+
+    function freeBytes() {
+      const u = used();
+      return PAGE + HEADER - u.total;   // PAGE is the data budget; header is fixed
+    }
+
+    function insert(len) {
+      const need = SLOT + alignedLen(len);
+      if (freeBytes() < need) {
+        if (frag() > 0) flash("not enough contiguous free space; try compact");
+        else flash("page full: slot array met tuple data");
+        return;
+      }
+      rows.push({ id: nextId++, len: len, dead: false });
+      render();
+    }
+
+    function del(slotIdx) {
+      const live = rows.filter(r => !r.dead);
+      if (slotIdx < 0 || slotIdx >= live.length) { flash("no such live slot"); return; }
+      live[slotIdx].dead = true;     // tombstone: slot stays, byte space lingers
+      render();
+    }
+
+    function compact() {
+      // reclaim dead tuples; live rows keep their ids and order, bytes slide together
+      rows = rows.filter(r => !r.dead);
+      render("compacted: dead bytes reclaimed, record ids unchanged");
+    }
+
+    let msg = "";
+    function flash(m) { msg = m; render(); }
+
+    function render(note) {
+      if (note !== undefined) msg = note;
+      svg.innerHTML = "";
+      const live = rows.filter(r => !r.dead);
+
+      // header band
+      svg.appendChild(DBMS.svg("rect", { x: 20, y: 12, width: 440, height: 26, rx: 4,
+        fill: "var(--storage-bg)", stroke: "var(--storage)" }));
+      svg.appendChild(DBMS.svg("text", { x: 240, y: 30, "text-anchor": "middle", class: "svg-mono" },
+        "header   pd_lower=" + (HEADER + rows.length * SLOT) + "   pd_upper=" + (PAGE + HEADER - used().data)));
+
+      // slot array (one box per slot ever created that is still present)
+      let sx = 20;
+      rows.forEach((r) => {
+        const dead = r.dead;
+        svg.appendChild(DBMS.svg("rect", { x: sx, y: 44, width: 40, height: 22, rx: 3,
+          fill: dead ? "#f0e2d4" : "#eaddcc", stroke: "var(--storage)",
+          "stroke-dasharray": dead ? "3 2" : "0" }));
+        svg.appendChild(DBMS.svg("text", { x: sx + 20, y: 59, "text-anchor": "middle", class: "svg-mono",
+          fill: dead ? "var(--bad)" : "var(--ink)" }, dead ? "x" : ("r" + r.id)));
+        sx += 44;
+      });
+
+      // free-space band
+      svg.appendChild(DBMS.svg("rect", { x: 20, y: 72, width: 440, height: 70, rx: 4,
+        fill: "#fbf3e8", stroke: "var(--rule)", "stroke-dasharray": "4 3" }));
+      svg.appendChild(DBMS.svg("text", { x: 240, y: 110, "text-anchor": "middle", class: "svg-label" },
+        "free space: " + freeBytes() + " bytes" + (frag() ? "  (" + frag() + " locked in dead tuples)" : "")));
+
+      // tuple data row, drawn right to left (grows up from the end)
+      let tx = 460;
+      const scale = 440 / PAGE;
+      rows.forEach((r) => {
+        const w = Math.max(26, alignedLen(r.len) * scale);
+        tx -= w + 4;
+        const dead = r.dead;
+        svg.appendChild(DBMS.svg("rect", { x: tx, y: 150, width: w, height: 34, rx: 3,
+          fill: dead ? "#f3e6d8" : "var(--storage-bg)", stroke: dead ? "var(--bad)" : "var(--storage)",
+          "stroke-dasharray": dead ? "3 2" : "0" }));
+        svg.appendChild(DBMS.svg("text", { x: tx + w / 2, y: 165, "text-anchor": "middle", class: "svg-mono",
+          fill: dead ? "var(--bad)" : "var(--ink)" }, "r" + r.id));
+        svg.appendChild(DBMS.svg("text", { x: tx + w / 2, y: 179, "text-anchor": "middle", class: "svg-label" },
+          alignedLen(r.len) + "B"));
+      });
+
+      const u = used();
+      readout.textContent =
+        "live rows: " + live.length +
+        "   align: " + (alignOn ? "on" : "off") +
+        "   column order: " + (goodOrder ? "good (bigint,bool,name)" : "bad (bool,bigint,name)") +
+        "   used: " + u.total + "/" + (PAGE + HEADER) + "B" +
+        (msg ? "   |  " + msg : "");
+    }
+
+    // controls
+    controls.append(
+      DBMS.el("button", { text: "Insert 24B row", onclick: () => insert(24) }),
+      DBMS.el("button", { text: "Insert 48B row", onclick: () => insert(48) }),
+      DBMS.el("button", { class: "ghost", text: "Delete slot 1", onclick: () => del(1) }),
+      DBMS.el("button", { text: "Compact", onclick: compact }),
+      DBMS.el("button", { class: "ghost", text: "Toggle MAXALIGN", onclick: () => { alignOn = !alignOn; render("alignment " + (alignOn ? "on" : "off")); } }),
+      DBMS.el("button", { class: "ghost", text: "Swap column order", onclick: () => { goodOrder = !goodOrder; render("reordered columns"); } }),
+      DBMS.el("button", { class: "ghost", text: "Empty page", onclick: () => { rows = []; nextId = 0; render("empty page"); } })
+    );
+
+    render("insert a few rows, then delete slot 1 and compact");
+  })();
+  </script>
+
+  <!-- ===== RECORD IDS ===== -->
+  <h2>What a record id actually is</h2>
+  <p>When the index in <a href="0006-btree-search-insert.html">week 6</a> returns a match for
+  <code>salary &gt; 75000</code>, it does not return a row. It returns a record id, called a TID
+  (tuple id) in PostgreSQL: the pair <code>(page id, slot number)</code>. To fetch the row the access
+  method reads that page, indexes into the slot array at that slot number, follows the stored offset, and decodes the bytes.
+  One page read, then constant-time arithmetic.</p>
+
+  <div class="callout gotcha">
+    <div class="callout-title">Exam trap</div>
+    <p>"A record id is a byte offset you can do arithmetic on." False. It is <code>(page, slot)</code>. The slot indirects
+    to the real offset, which can move on compaction. The MCQ loves to offer "the second part of a TID is the tuple's
+    byte position in the file" as a plausible wrong answer.</p>
+  </div>
+
+  <h3>PostgreSQL's line pointer, exactly</h3>
+  <p>PostgreSQL's slot is a 4-byte line pointer (<code>ItemIdData</code>) packed as bitfields
+  [<a href="https://doxygen.postgresql.org/itemid_8h_source.html">itemid.h</a>]:</p>
+  <pre><code><span class="tok-kw">typedef struct</span> ItemIdData {
+    <span class="tok-kw">unsigned</span> lp_off:<span class="tok-num">15</span>,   <span class="tok-com">/* byte offset of the tuple within the page */</span>
+             lp_flags:<span class="tok-num">2</span>,  <span class="tok-com">/* state: UNUSED, NORMAL, REDIRECT, DEAD */</span>
+             lp_len:<span class="tok-num">15</span>;   <span class="tok-com">/* length of the tuple in bytes */</span>
+} ItemIdData;</code></pre>
+  <p>Two details matter for the exam. The four <code>lp_flags</code> states are <code>LP_UNUSED</code> (free for reuse),
+  <code>LP_NORMAL</code> (points at a live tuple), <code>LP_REDIRECT</code> (forwards to a newer version on the same page,
+  used by HOT update chains, which you meet in <a href="0013-concurrency-mvcc.html">week 13</a>), and <code>LP_DEAD</code>
+  (the tuple is gone, the slot awaits reclamation by VACUUM, <a href="0003-storage-engine-heap-files.html">week 3</a>).
+  And <code>lp_off</code> is 15 bits, so it can address offsets up to 2<sup>15</sup> = 32768. That is why a PostgreSQL heap
+  page cannot exceed 32 KB: the line pointer simply cannot name a byte past that.</p>
+
+  <div class="callout realworld">
+    <div class="callout-title">In real systems</div>
+    <p>SQLite reaches the same destination by a different road. It has no heap; every table is a B-tree, and each B-tree
+    page uses a cell pointer array growing down with cell content growing up. The same slotted invariant, different name
+    [<a href="https://www.sqlite.org/fileformat2.html">SQLite file format</a>]. The slotted page is convergent design:
+    the constraint (fixed block, variable rows, stable addresses) forces roughly the same answer everywhere.</p>
+  </div>
+
+  <!-- ===== RECORD ENCODING ===== -->
+  <h2>Inside one tuple</h2>
+  <p>A tuple is "essentially a sequence of bytes" that only the DBMS knows how to decode. The schema lives in the catalog,
+  not in the row. A heap tuple in PostgreSQL carries, in order: a fixed header, an optional NULL bitmap, then the column data.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 520 150" role="img" aria-label="Byte layout of one tuple">
+      <!-- header -->
+      <rect x="14" y="40" width="150" height="40" rx="4" fill="var(--storage-bg)" stroke="var(--storage)"/>
+      <text x="89" y="58" text-anchor="middle" class="svg-mono">tuple header</text>
+      <text x="89" y="73" text-anchor="middle" class="svg-label">xmin, xmax, t_ctid, t_hoff</text>
+      <!-- null bitmap -->
+      <rect x="164" y="40" width="70" height="40" rx="4" fill="#eaddcc" stroke="var(--storage)"/>
+      <text x="199" y="58" text-anchor="middle" class="svg-mono">NULL</text>
+      <text x="199" y="72" text-anchor="middle" class="svg-mono">bitmap</text>
+      <!-- pad -->
+      <rect x="234" y="40" width="44" height="40" rx="4" fill="#fbe3df" stroke="var(--bad)" stroke-dasharray="3 2"/>
+      <text x="256" y="63" text-anchor="middle" class="svg-label" fill="var(--bad)">pad</text>
+      <!-- fixed fields -->
+      <rect x="278" y="40" width="70" height="40" rx="4" fill="#fffdf8" stroke="var(--ink-soft)"/>
+      <text x="313" y="63" text-anchor="middle" class="svg-mono">salary</text>
+      <!-- varlen with length prefix -->
+      <rect x="348" y="40" width="32" height="40" rx="4" fill="#d8eee9" stroke="var(--index)"/>
+      <text x="364" y="63" text-anchor="middle" class="svg-label">len</text>
+      <rect x="380" y="40" width="120" height="40" rx="4" fill="#fffdf8" stroke="var(--ink-soft)"/>
+      <text x="440" y="63" text-anchor="middle" class="svg-mono">name (varchar)</text>
+
+      <text x="14" y="28" class="svg-label">low address</text>
+      <text x="500" y="28" text-anchor="end" class="svg-label">high address</text>
+      <text x="256" y="108" text-anchor="middle" class="svg-label" fill="var(--bad)">pad bytes appear only because column order forces alignment</text>
+      <text x="364" y="124" text-anchor="middle" class="svg-label" fill="var(--index)">a varchar needs a length prefix; you cannot find the next column without it</text>
+    </svg>
+    <figcaption><b>Figure 3.</b> Fixed-length columns sit at computable offsets. A variable-length column needs a length
+    prefix, because you cannot find where the next column starts without knowing how long this one is. The red block is
+    pure waste introduced by alignment, and it is avoidable by reordering columns.</figcaption>
+  </figure>
+
+  <h3>NULLs are a bitmap, not a value</h3>
+  <p>How do you store NULL? Not as zero, and not as a sentinel, because any sentinel you pick could be a legal value
+  someone actually stored. PostgreSQL keeps one bit per column in the header (present only when the
+  <code>HEAP_HASNULL</code> flag is set): the bit says present or null, and a null column then occupies <em>no bytes
+  at all</em> in the data area [<a href="https://www.postgresql.org/docs/current/storage-page-layout.html">PG page layout</a>].</p>
+
+  <div class="callout gotcha">
+    <div class="callout-title">Exam trap</div>
+    <p>"A NULL is stored as a special zero or sentinel in the column's bytes." False. It is a bit in the header bitmap,
+    and the column contributes zero data bytes. The trap relies on you imagining a column always occupies its declared width.</p>
+  </div>
+
+  <h3>Alignment makes column order matter</h3>
+  <p>CPUs read aligned words faster, and some architectures require it, so the DBMS pads fields to natural boundaries.
+  In PostgreSQL the rule is MAXALIGN, typically 8 bytes. The consequence is concrete and testable: the same columns in a
+  different order can take a different number of bytes on disk.</p>
+
+  <table>
+    <caption>Same three columns, two orders. The pad bytes are the whole difference.</caption>
+    <thead><tr><th>Order</th><th>Layout</th><th>Pad</th><th>Row bytes (data area)</th></tr></thead>
+    <tbody>
+      <tr><td>bad</td><td>bool (1) , bigint (8) , name</td><td>7 after the bool</td><td>larger</td></tr>
+      <tr><td>good</td><td>bigint (8) , bool (1) , name</td><td>0 interior</td><td>smaller</td></tr>
+    </tbody>
+  </table>
+  <p>Put the 1-byte <code>bool</code> first and the 8-byte <code>bigint</code> must start on an 8-byte boundary, so 7 pad
+  bytes are wasted between them. Put the <code>bigint</code> first and the gap vanishes. Multiply by millions of rows and
+  it is real disk. The simulator's "Swap column order" button shows exactly this.</p>
+
+  <div class="callout why">
+    <div class="callout-title">Why padding at all</div>
+    <p>The constraint is the CPU, not the disk. A misaligned 8-byte load either traps (some architectures) or costs extra
+    cycles (others), and the storage layer would rather burn a few bytes than make every read of that column slow. So it
+    aligns. The bytes are the price of fast in-memory access once the page is in the buffer pool. The cure is free: order
+    columns widest-first and the pad disappears.</p>
+  </div>
+
+  <details class="deepdive">
+    <summary>Deeper: the 24-byte page header and the 23-byte tuple header</summary>
+    <div>
+      <p>PostgreSQL's <code>PageHeaderData</code> is 24 bytes. The fields that matter here:
+      <code>pd_lsn</code> (8 bytes, last WAL change, gates flushing), <code>pd_lower</code> (2 bytes, end of the line
+      pointer array), <code>pd_upper</code> (2 bytes, start of tuple data), plus checksum, flags, special-space offset, and
+      version. Free space is exactly <code>pd_upper - pd_lower</code>, which is the slotted invariant written as two header
+      fields [<a href="https://www.postgresql.org/docs/current/storage-page-layout.html">PG docs</a>].</p>
+      <p>The heap tuple header (<code>HeapTupleHeaderData</code>) has a documented minimum of 23 bytes: <code>t_xmin</code>
+      and <code>t_xmax</code> (4 each, the inserting and deleting transaction ids, where <code>t_xmax</code> is the
+      tombstone you will study next week), <code>t_ctid</code> (6 bytes, pointer to this or a newer version),
+      <code>t_infomask2</code> and <code>t_infomask</code> (2 each, flags including <code>HEAP_HASNULL</code>), and
+      <code>t_hoff</code> (1 byte, the offset to user data, itself a multiple of MAXALIGN). The NULL bitmap, when present,
+      sits right after this fixed header and before user data.</p>
+    </div>
+  </details>
+
+  <!-- ===== COST TABLE ===== -->
+  <h3>Costs of the slotted operations</h3>
+  <table>
+    <caption>Why this layout is fast where it needs to be.</caption>
+    <thead><tr><th>Operation</th><th>Cost</th><th>Why</th></tr></thead>
+    <tbody>
+      <tr><td>Fetch by record id</td><td>1 page read + O(1)</td><td>index the slot array, follow the offset</td></tr>
+      <tr><td>Insert (room exists)</td><td>O(1)</td><td>append data at pd_upper, append a slot at pd_lower</td></tr>
+      <tr><td>Delete</td><td>O(1)</td><td>mark the slot dead, leave the bytes for later</td></tr>
+      <tr><td>Compact</td><td>O(tuples on page)</td><td>slide live tuples, rewrite their slot offsets</td></tr>
+    </tbody>
+  </table>
+
+  <!-- ===== RETRIEVAL PRACTICE ===== -->
+  <h2>Check yourself</h2>
+
+  <div class="mcq" data-answer="2">
+    <p class="mcq-q">In a slotted page, which statement is false?</p>
+    <button class="mcq-opt">The slot array and free space share the page with the tuple data area.</button>
+    <button class="mcq-opt">A slot stores the byte offset of its tuple, not the tuple itself.</button>
+    <button class="mcq-opt">The slot array and the tuple data grow in the same direction.</button>
+    <button class="mcq-opt">The page is full when the slot array meets the tuple data region.</button>
+    <p class="mcq-explain">False is the third option. The slot array grows down from the header while tuple data grows up
+    from the page end; they close toward each other (pd_lower up, pd_upper down) and the page is full when they meet.
+    Same-direction growth would make "free space is the gap between them" meaningless.</p>
+  </div>
+
+  <div class="mcq" data-answer="1">
+    <p class="mcq-q">A B+tree index returns a match. What does the record id (TID) it hands back actually contain?</p>
+    <button class="mcq-opt">The absolute byte offset of the tuple within the heap file.</button>
+    <button class="mcq-opt">A page id together with a slot number on that page.</button>
+    <button class="mcq-opt">A hash of the primary key resolved through a directory.</button>
+    <button class="mcq-opt">The page id plus the tuple's exact in-page byte offset.</button>
+    <p class="mcq-explain">It is (page id, slot number). The slot indirects to the in-page offset, which can change when the
+    page is compacted. Storing the byte offset directly (option D) would break every index entry the moment a tuple moved,
+    which is the whole reason the slot indirection exists.</p>
+  </div>
+
+  <div class="mcq" data-answer="3">
+    <p class="mcq-q">How does PostgreSQL store a NULL in a row?</p>
+    <button class="mcq-opt">As a reserved sentinel value written into the column's data bytes.</button>
+    <button class="mcq-opt">As a zero filling the full declared width of the column.</button>
+    <button class="mcq-opt">As a separate NULL row chained from the tuple header pointer.</button>
+    <button class="mcq-opt">As a bit in a header bitmap, with the column storing no data bytes.</button>
+    <p class="mcq-explain">Correct is the last option. A NULL bitmap (present only when HEAP_HASNULL is set) marks the
+    column null and that column then occupies no data bytes. A sentinel value cannot work because any value you pick could
+    be a legal stored value.</p>
+  </div>
+
+  <div class="mcq" data-answer="0">
+    <p class="mcq-q">Which statement about alignment and column order is false?</p>
+    <button class="mcq-opt">Reordering columns can never change the on-disk size of a row.</button>
+    <button class="mcq-opt">Placing a 1-byte column before an 8-byte column can waste pad bytes.</button>
+    <button class="mcq-opt">Alignment exists because aligned in-memory reads are cheaper or required.</button>
+    <button class="mcq-opt">Ordering wider fixed-length columns first tends to reduce interior padding.</button>
+    <button class="mcq-opt">PostgreSQL aligns user data to MAXALIGN, typically an 8-byte boundary.</button>
+    <p class="mcq-explain">The first option is false. Column order changes row size precisely because of alignment padding:
+    a bool then a bigint wastes 7 pad bytes that a bigint then a bool avoids. The other four are all true.</p>
+  </div>
+
+  <div class="mcq" data-answer="2">
+    <p class="mcq-q">Why can a PostgreSQL heap page not exceed 32 KB?</p>
+    <button class="mcq-opt">The buffer pool refuses to allocate a frame larger than 32 KB.</button>
+    <button class="mcq-opt">The page header reserves a fixed 32 KB region for tuple data.</button>
+    <button class="mcq-opt">The line pointer's offset field is 15 bits, addressing at most 32768 bytes.</button>
+    <button class="mcq-opt">The hardware page size of 32 KB caps every database page to match.</button>
+    <p class="mcq-explain">Correct is the third option. lp_off is a 15-bit bitfield, so it can name byte offsets only up to
+    2^15 = 32768. A larger page would have bytes the line pointer cannot address. The hardware page is unrelated (usually
+    4 KB), and there is no fixed 32 KB tuple region.</p>
+  </div>
+
+  <div class="mcq" data-answer="1">
+    <p class="mcq-q">The database page is 8 KB and the hardware page is 4 KB. What is the risk this creates?</p>
+    <button class="mcq-opt">The page cannot be cached in the buffer pool without splitting it.</button>
+    <button class="mcq-opt">A crash mid-write can leave the page half old and half new (torn page).</button>
+    <button class="mcq-opt">Every read of the page now requires two separate disk seeks.</button>
+    <button class="mcq-opt">The slot array can no longer address the second half of the page.</button>
+    <p class="mcq-explain">Correct is the second. The device guarantees atomicity only per hardware page, so one 8 KB logical
+    write becomes two 4 KB atomic writes; a crash between them tears the page. PostgreSQL defends with WAL full-page writes,
+    which is why pd_lsn is in the header.</p>
+  </div>
+
+  <!-- ===== FLASHCARDS ===== -->
+  <h2>Active recall</h2>
+  <div class="flashcard">
+    <div class="fc-front">Why is a record id (page, slot) rather than a byte offset?</div>
+    <div class="fc-back">So tuples can move inside a page (on compaction) without invalidating any index entry. The slot
+    absorbs the motion: only its stored offset changes, never the external (page, slot) address.</div>
+  </div>
+  <div class="flashcard">
+    <div class="fc-front">In PostgreSQL, what do pd_lower and pd_upper mark, and what is between them?</div>
+    <div class="fc-back">pd_lower is the end of the slot (line pointer) array; pd_upper is the start of tuple data. Free
+    space is pd_upper minus pd_lower. The page is full when they meet.</div>
+  </div>
+
+  <!-- ===== PRIMARY SOURCE ===== -->
+  <div class="source-box">
+    <div class="src-tag">Primary source</div>
+    <div class="src-title">Read this next:
+      <a href="https://www.postgresql.org/docs/current/storage-page-layout.html">PostgreSQL documentation, Database Page Layout</a></div>
+    <p class="muted">The authoritative account of the 8 KB page, its five parts, the 24-byte page header
+    (pd_lsn, pd_lower, pd_upper), the 4-byte line pointers, and the heap tuple header with its NULL bitmap and the MAXALIGN
+    rule. Read the page-structure table and the HeapTupleHeaderData table; they are the ground truth for everything in this
+    lesson.</p>
+  </div>
+
+  <!-- ===== ASK YOUR TEACHER ===== -->
+  <div class="ask-teacher">
+    <div class="at-tag">Ask your teacher</div>
+    <p>Want to see the actual bytes? Ask me to walk a real <code>pageinspect</code> dump of a heap page, or to derive the
+    exact row size for a table you describe, or to redraw the slotted page as an animation. I am your teacher for this
+    course, not just a document.</p>
+  </div>
+
+  <!-- ===== NAV ===== -->
+  <nav class="lesson-nav">
+    <a class="prev" href="0001-dbms-architecture.html">
+      <span class="nav-dir">Previous</span>
+      <span class="nav-title">Week 01 · DBMS architecture: the life of a query</span>
+    </a>
+    <a class="next" href="0003-storage-engine-heap-files.html">
+      <span class="nav-dir">Next</span>
+      <span class="nav-title">Week 03 · Heap files, free space, and deleting tuples</span>
+    </a>
+  </nav>
+
+  </div><!-- /.col -->
+</main>
+</body>
+</html>

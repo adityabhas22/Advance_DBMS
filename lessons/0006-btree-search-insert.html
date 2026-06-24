@@ -1,0 +1,702 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lesson 06 · B+tree invariants, search, insertion, and splits · Field Guide to the Database Engine</title>
+<link rel="stylesheet" href="../assets/course.css">
+<script defer src="../assets/components.js"></script>
+</head>
+<body class="layer-index">
+<main class="page">
+
+  <!-- ===== MASTHEAD ===== -->
+  <header class="masthead col">
+    <div class="crumbs">
+      <a href="../index.html">Field Guide</a> <span>/</span>
+      <span>Part IV · Index structures</span> <span>/</span>
+      <span>Week 06</span>
+    </div>
+    <span class="week-badge">Index layer</span>
+    <h1>B+tree invariants, search, insertion, and splits</h1>
+    <p class="lede">A balanced binary tree is optimal for comparisons and terrible for disk. Widen each
+    node until one page read makes a few hundred branching decisions and the same height that needed
+    thirty reads now needs three. This lesson derives that shape, then watches it stay balanced as you
+    insert.</p>
+  </header>
+
+  <div class="col">
+
+  <!-- ===== OBJECTIVES ===== -->
+  <div class="objectives">
+    <h4>By the end you can</h4>
+    <ul>
+      <li>Explain why the cost that matters for a disk index is page reads, not comparisons, and why that kills the binary search tree.</li>
+      <li>State the four B+tree invariants and use the routing rule Ki &lt; v &lt;= Ki+1 to search by hand.</li>
+      <li>Insert keys with splits, and say exactly why a leaf split copies a key up while an internal split pushes one up.</li>
+      <li>Predict when the tree grows in height (only on a root split) and why most inserts touch one leaf and stop.</li>
+      <li>Spot the classic exam traps: log base 2 versus fanout, the root exemption, and B-tree versus B+tree.</li>
+    </ul>
+  </div>
+
+  <!-- ===== WHERE THIS SITS ===== -->
+  <h2>Where this sits on the journey</h2>
+  <p>Our running query is <code>SELECT name FROM emp WHERE salary &gt; 75000 ORDER BY name</code>. By the
+  time control reaches this layer the optimizer (<a href="0011-query-optimization.html">week 11</a>) has
+  already decided whether to scan the whole heap or to use an index on <code>salary</code>, and the
+  executor (<a href="0009-query-execution-volcano.html">week 9</a>) is pulling tuples through an access
+  method. If the chosen path is an index scan, this layer is what the access method runs. It takes a key
+  or a key range and hands back row ids (TIDs), which it gets by descending a B+tree.</p>
+  <p>What the layer above hands in: a SARG, the searchable predicate <code>salary &gt; 75000</code>, plus
+  a request for matching rows in key order. What this layer hands down: requests for specific index pages
+  by page id, served by the buffer pool (<a href="0005-buffer-pool-lru-k.html">week 5</a>), which in turn
+  reads them off disk through the storage layer (<a href="0002-storage-engine-disk-pages.html">week 2</a>).
+  The B+tree's whole low-I/O argument leans on that buffer pool keeping the top levels resident, so this
+  lesson sits directly on top of the one before it. Next week (<a href="0007-btree-delete-hash.html">week
+  7</a>) closes the structure: deletion, bulk loading, composite keys, and the hash alternative.</p>
+
+  <div class="callout intuition">
+    <div class="callout-title">Intuition</div>
+    <p>Think of an index as a phone book with tabbed dividers. You do not flip page by page. You jump to
+    the divider for the right letter range, then to a sub-divider, then you are on the page. Each divider
+    is a node, each tab is a separator key, and the trick is that one glance at a divider (one page read)
+    eliminates almost everything. A binary tree is a phone book with exactly one tab per page: technically
+    sorted, but you pay a full lookup for every yes-or-no.</p>
+  </div>
+
+  <!-- ===== WHY A WIDE TREE ===== -->
+  <h2>Why a wide tree and not a binary tree</h2>
+  <p>An index earns its keep by turning an O(N) heap scan into something sublinear. So the obvious move is
+  a balanced binary search tree: an AVL or red-black tree gives O(log<sub>2</sub> N) comparisons, which is
+  about 30 steps for a billion keys. That sounds fine until you remember where the data lives.</p>
+
+  <div class="callout why">
+    <div class="callout-title">Why it works this way</div>
+    <p>The constraint is the device. A disk or SSD moves a fixed block per I/O, commonly 4 KB or 8 KB, and
+    that single I/O costs five to six orders of magnitude more than a comparison in RAM. A binary tree node
+    holds one key and two child pointers, so one page read buys you exactly one bit of branching and then
+    you throw the rest of the 8 KB away. Thirty page reads for a billion keys is thirty random I/Os. The
+    fix is not a cleverer balance rule. It is to stop wasting the page: pack a few hundred keys and a few
+    hundred child pointers into each node so one page read makes a few-hundred-way decision. With fanout
+    around a few hundred, the height to index N keys is log<sub>m</sub> N, and three or four levels reach
+    hundreds of millions of rows. The B+tree is a binary search tree reshaped so the unit of work is the
+    page transfer, not the comparison. [<a href="https://15445.courses.cs.cmu.edu/fall2023/notes/08-trees.pdf">CMU
+    15-445 L08</a>]</p>
+  </div>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 560 220" role="img" aria-label="Binary tree versus B+tree height for the same key count">
+      <text x="140" y="20" text-anchor="middle" class="svg-label">binary tree: 1 bit per page read</text>
+      <!-- binary tree, deep -->
+      <g stroke="var(--ink-soft)" fill="none">
+        <line x1="140" y1="34" x2="100" y2="64"/><line x1="140" y1="34" x2="180" y2="64"/>
+        <line x1="100" y1="78" x2="76" y2="108"/><line x1="100" y1="78" x2="124" y2="108"/>
+        <line x1="180" y1="78" x2="156" y2="108"/><line x1="180" y1="78" x2="204" y2="108"/>
+      </g>
+      <g fill="#fffdf8" stroke="var(--ink-soft)">
+        <rect x="128" y="26" width="24" height="14" rx="2"/>
+        <rect x="88" y="66" width="24" height="14" rx="2"/><rect x="168" y="66" width="24" height="14" rx="2"/>
+        <rect x="64" y="108" width="24" height="14" rx="2"/><rect x="112" y="108" width="24" height="14" rx="2"/>
+        <rect x="144" y="108" width="24" height="14" rx="2"/><rect x="192" y="108" width="24" height="14" rx="2"/>
+      </g>
+      <text x="140" y="150" text-anchor="middle" class="svg-label sm">...continues ~30 levels deep for 10^9 keys</text>
+      <text x="140" y="166" text-anchor="middle" class="svg-mono">~30 page reads</text>
+
+      <text x="420" y="20" text-anchor="middle" class="svg-label">B+tree: hundreds of keys per page read</text>
+      <!-- wide tree, shallow -->
+      <rect x="330" y="28" width="180" height="22" rx="4" fill="var(--index-bg)" stroke="var(--index)"/>
+      <text x="420" y="43" text-anchor="middle" class="svg-mono">root: ~hundreds of separators</text>
+      <g stroke="var(--index)" fill="none">
+        <line x1="360" y1="50" x2="350" y2="74"/><line x1="420" y1="50" x2="420" y2="74"/><line x1="480" y1="50" x2="490" y2="74"/>
+      </g>
+      <rect x="324" y="76" width="60" height="20" rx="3" fill="var(--index-bg)" stroke="var(--index)"/>
+      <rect x="390" y="76" width="60" height="20" rx="3" fill="var(--index-bg)" stroke="var(--index)"/>
+      <rect x="456" y="76" width="60" height="20" rx="3" fill="var(--index-bg)" stroke="var(--index)"/>
+      <g stroke="var(--index)" fill="none">
+        <line x1="354" y1="96" x2="350" y2="118"/><line x1="420" y1="96" x2="420" y2="118"/><line x1="486" y1="96" x2="490" y2="118"/>
+      </g>
+      <rect x="324" y="120" width="192" height="20" rx="3" fill="#fffdf8" stroke="var(--index)" stroke-dasharray="3 3"/>
+      <text x="420" y="134" text-anchor="middle" class="svg-mono">linked leaves (all data here)</text>
+      <text x="420" y="166" text-anchor="middle" class="svg-mono">~3 to 4 page reads</text>
+    </svg>
+    <figcaption><b>Figure 1.</b> Same billion keys, two shapes. The binary tree spends one page read per
+    bit of branching and goes deep. The B+tree spends one page read per few-hundred-way decision and stays
+    short. Notice the B+tree keeps all data in the leaves; the upper nodes only route.</figcaption>
+  </figure>
+
+  <table>
+    <caption>Height collapses as fanout grows, for the same key count N.</caption>
+    <thead><tr><th>Structure</th><th>Branching per read</th><th>Height for 10<sup>9</sup> keys</th><th>Reads per lookup</th></tr></thead>
+    <tbody>
+      <tr><td>Binary tree</td><td>2</td><td>log<sub>2</sub> 10<sup>9</sup> ≈ 30</td><td>~30</td></tr>
+      <tr><td>B+tree, m = 100</td><td>100</td><td>log<sub>100</sub> 10<sup>9</sup> ≈ 4.5</td><td>4 to 5</td></tr>
+      <tr><td>B+tree, m = 500</td><td>500</td><td>log<sub>500</sub> 10<sup>9</sup> ≈ 3.3</td><td>3 to 4</td></tr>
+    </tbody>
+  </table>
+
+  <!-- ===== INVARIANTS ===== -->
+  <h2>The four invariants</h2>
+  <p>A B+tree of order m keeps four properties true at all times. They are not decoration; each one is the
+  reason a guarantee holds. [<a href="https://carlosproal.com/ir/papers/p121-comer.pdf">Comer 1979</a>,
+  <a href="https://15445.courses.cs.cmu.edu/fall2023/notes/08-trees.pdf">CMU 15-445 L08</a>]</p>
+  <ol class="steps">
+    <li><b>All data lives in the leaves.</b> Internal nodes hold only separator keys and child pointers.
+    They route a search; they never store a record or a row pointer. This is the one line that separates a
+    B+tree from a plain B-tree, and it is why a separator can be copied rather than moved on a leaf split.</li>
+    <li><b>Leaves are linked in key order.</b> Once a search lands on the lower bound of a range, it walks
+    leaf to leaf sideways without climbing back up. PostgreSQL keeps the leaf chain doubly linked so scans
+    run in either direction.</li>
+    <li><b>The tree is height-balanced.</b> Every root-to-leaf path has the same length. Balance is a
+    structural invariant maintained by splits and merges, not a periodic rebuild, so the worst-case lookup
+    equals the average-case lookup.</li>
+    <li><b>Every non-root node is at least half full.</b> For order m a non-root node holds between
+    ceil(m/2) - 1 and m - 1 keys. This minimum occupancy is what bounds the height: it forces N keys into at
+    most about log<sub>m/2</sub> N levels, so the logarithmic I/O bound holds in the worst case, not only on
+    average. The root is exempt and may hold a single key.</li>
+  </ol>
+
+  <div class="callout gotcha">
+    <div class="callout-title">Exam trap</div>
+    <p>"Every node including the root is at least half full" is false. The root is the exception. It can
+    hold as few as one key (two children), or zero keys when the whole tree is a single leaf. A node-fill
+    rule stated without the root carve-out is the trap.</p>
+  </div>
+
+  <!-- ===== SEARCH ===== -->
+  <h2>Search: follow Ki &lt; v &lt;= Ki+1</h2>
+  <p>Searching is a descent. At each internal node you binary-search the separators to find the one child
+  whose key range contains your target, then follow that pointer down. The exact rule between adjacent
+  separators K<sub>i</sub> and K<sub>i+1</sub> is that a search value v takes the child between them when
+  K<sub>i</sub> &lt; v &lt;= K<sub>i+1</sub>. PostgreSQL states this inequality verbatim in its nbtree
+  README. [<a href="https://github.com/postgres/postgres/blob/master/src/backend/access/nbtree/README">nbtree
+  README</a>] You repeat until you hit a leaf, binary-search the leaf, and you are done. One page read per
+  level, so O(log<sub>m</sub> N) I/Os. A range scan does this descent once to land on the lower bound, then
+  rides the leaf links rightward until it passes the upper bound. That is exactly how
+  <code>salary &gt; 75000</code> gets served: descend to the first leaf at or above 75000, then walk leaves.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 560 200" role="img" aria-label="Search descent for salary greater than 75000">
+      <!-- root -->
+      <rect x="220" y="14" width="120" height="26" rx="4" fill="var(--index-bg)" stroke="var(--index)"/>
+      <text x="280" y="31" text-anchor="middle" class="svg-mono">[ 60000 | 90000 ]</text>
+      <!-- arrows to internal -->
+      <g stroke="var(--index)" fill="none">
+        <line x1="245" y1="40" x2="120" y2="74" marker-end="url(#ar6)"/>
+        <line x1="285" y1="40" x2="285" y2="74" marker-end="url(#ar6)"/>
+        <line x1="320" y1="40" x2="445" y2="74" marker-end="url(#ar6)"/>
+      </g>
+      <!-- internal nodes -->
+      <rect x="64" y="76" width="112" height="24" rx="4" fill="#fffdf8" stroke="var(--rule)"/>
+      <text x="120" y="92" text-anchor="middle" class="svg-mono">[ 40000 ]</text>
+      <rect x="226" y="76" width="118" height="24" rx="4" fill="var(--index-bg)" stroke="var(--index)" stroke-width="2"/>
+      <text x="285" y="92" text-anchor="middle" class="svg-mono">[ 72000 | 80000 ]</text>
+      <rect x="392" y="76" width="112" height="24" rx="4" fill="#fffdf8" stroke="var(--rule)"/>
+      <text x="448" y="92" text-anchor="middle" class="svg-mono">[ 110000 ]</text>
+      <!-- chosen path label -->
+      <text x="408" y="56" class="svg-label sm" fill="var(--index)">v=75000 &gt; 60000, &lt;= 90000</text>
+      <!-- arrow into leaf -->
+      <line x1="305" y1="100" x2="330" y2="138" stroke="var(--index)" fill="none" marker-end="url(#ar6)"/>
+      <text x="120" y="60" class="svg-label sm">72000 &lt; v &lt;= 80000</text>
+      <!-- leaves -->
+      <g fill="#fffdf8" stroke="var(--rule)">
+        <rect x="40" y="140" width="90" height="24" rx="3"/>
+        <rect x="140" y="140" width="90" height="24" rx="3"/>
+      </g>
+      <rect x="300" y="140" width="118" height="24" rx="3" fill="var(--good-bg)" stroke="var(--good)"/>
+      <rect x="428" y="140" width="92" height="24" rx="3" fill="#fffdf8" stroke="var(--rule)"/>
+      <text x="359" y="156" text-anchor="middle" class="svg-mono">75000 78000</text>
+      <text x="490" y="156" text-anchor="middle" class="svg-mono">82000 ...</text>
+      <!-- leaf links -->
+      <g stroke="var(--ink-faint)" fill="none" stroke-dasharray="2 2">
+        <line x1="130" y1="152" x2="140" y2="152"/><line x1="230" y1="152" x2="300" y2="152"/><line x1="418" y1="152" x2="428" y2="152"/>
+      </g>
+      <text x="359" y="184" text-anchor="middle" class="svg-label sm">land here, then walk leaves rightward for the range</text>
+      <defs><marker id="ar6" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="var(--index)"/></marker></defs>
+    </svg>
+    <figcaption><b>Figure 2.</b> Descending for <code>salary &gt; 75000</code>. At the root, 75000 falls
+    between 60000 and 90000, so take the middle child. At that internal node it falls between 72000 and
+    80000, so take that child. The leaf is the lower bound; the range scan then follows the dashed leaf
+    links rightward.</figcaption>
+  </figure>
+
+  <!-- ===== INSERTION ===== -->
+  <h2>Insertion: fit, or split</h2>
+  <p>Insertion starts as a search: descend to the leaf where the key belongs. Then one of two things
+  happens.</p>
+  <ol class="steps">
+    <li>If the leaf has room, write the entry in sorted position and stop. No structural change. Most
+    inserts end here, which is why inserts are cheap on average.</li>
+    <li>If the leaf is full, split it. Allocate a new leaf, move the upper half of the entries into it, link
+    it into the leaf chain, and <b>copy up</b> the first key of the new right leaf as a separator into the
+    parent. The word is copy: the key still exists down in the leaf, because all data must stay in leaves.</li>
+    <li>That copied-up separator may overflow the parent internal node. Split the parent too, but here you
+    <b>push up</b> the middle key (move it, do not copy it) into the grandparent, because an internal node
+    only routes and need not keep a copy.</li>
+    <li>Splits propagate up only as far as overflow continues. The moment a node has room for the incoming
+    separator, propagation stops. If the root itself splits, a new root is allocated with the two halves as
+    children. That is the only way the tree grows taller, and it grows from the top, which is precisely why
+    every leaf stays at the same depth.</li>
+  </ol>
+
+  <div class="callout keyidea">
+    <div class="callout-title">Keep this one thing</div>
+    <p>Leaf split copies the separator up (data must stay in the leaf). Internal split pushes the middle key
+    up (a router keeps no copy). Height changes only when the root splits.</p>
+  </div>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 560 210" role="img" aria-label="Leaf split copy-up versus internal split push-up">
+      <text x="140" y="16" text-anchor="middle" class="svg-label">leaf split: COPY up</text>
+      <!-- parent before/after for leaf -->
+      <rect x="92" y="26" width="96" height="22" rx="3" fill="var(--index-bg)" stroke="var(--index)"/>
+      <text x="140" y="41" text-anchor="middle" class="svg-mono">[ ... 50 ... ]</text>
+      <g stroke="var(--index)" fill="none"><line x1="120" y1="48" x2="80" y2="78"/><line x1="160" y1="48" x2="200" y2="78"/></g>
+      <rect x="36" y="80" width="92" height="24" rx="3" fill="#fffdf8" stroke="var(--rule)"/>
+      <text x="82" y="96" text-anchor="middle" class="svg-mono">30 40</text>
+      <rect x="152" y="80" width="92" height="24" rx="3" fill="var(--good-bg)" stroke="var(--good)"/>
+      <text x="198" y="96" text-anchor="middle" class="svg-mono">50 60 70</text>
+      <text x="140" y="130" text-anchor="middle" class="svg-label sm">50 is copied into the parent</text>
+      <text x="140" y="146" text-anchor="middle" class="svg-label sm">AND still present in the right leaf</text>
+
+      <text x="420" y="16" text-anchor="middle" class="svg-label">internal split: PUSH up</text>
+      <rect x="372" y="26" width="96" height="22" rx="3" fill="var(--index-bg)" stroke="var(--index)"/>
+      <text x="420" y="41" text-anchor="middle" class="svg-mono">[ ... 50 ... ]</text>
+      <g stroke="var(--index)" fill="none"><line x1="400" y1="48" x2="360" y2="78"/><line x1="440" y1="48" x2="480" y2="78"/></g>
+      <rect x="316" y="80" width="92" height="24" rx="3" fill="#fffdf8" stroke="var(--rule)"/>
+      <text x="362" y="96" text-anchor="middle" class="svg-mono">20 35</text>
+      <rect x="432" y="80" width="92" height="24" rx="3" fill="#fffdf8" stroke="var(--rule)"/>
+      <text x="478" y="96" text-anchor="middle" class="svg-mono">70 85</text>
+      <text x="420" y="130" text-anchor="middle" class="svg-label sm">50 moves up to the parent</text>
+      <text x="420" y="146" text-anchor="middle" class="svg-label sm">and is GONE from both children</text>
+
+      <line x1="280" y1="20" x2="280" y2="160" stroke="var(--rule)" stroke-dasharray="3 3"/>
+    </svg>
+    <figcaption><b>Figure 3.</b> The two split kinds side by side. On the left the separator 50 is both in
+    the parent and in the right leaf (copy). On the right the separator 50 is in the parent only, removed
+    from both children (push). Confusing these two is the most common B+tree error.</figcaption>
+  </figure>
+
+  <!-- ===== SIMULATOR ===== -->
+  <h2>Build a B+tree by hand</h2>
+  <p>Set a small order, then insert keys and watch the structure react. Use the worked sequence button to
+  replay a deterministic run that forces a leaf split, then an internal split, then a new root. The half-full
+  boundary is drawn on every node, the height and I/O counters tick per operation, and a split is announced
+  as copy-up or push-up so you can see the difference rather than take it on faith.</p>
+
+  <figure class="sim" id="bt6-sim">
+    <div class="sim-head">
+      <span class="sim-title">Animated B+tree inserter</span>
+      <span class="sim-sub">insert keys, force splits, watch the root grow</span>
+    </div>
+    <div class="sim-body">
+      <div class="sim-stage"><svg id="bt6-svg" viewBox="0 0 720 300" width="100%"></svg></div>
+      <div class="sim-controls" id="bt6-controls">
+        <label>order m
+          <select id="bt6-order">
+            <option value="3">3</option>
+            <option value="4" selected>4</option>
+          </select>
+        </label>
+        <label>key
+          <input id="bt6-key" type="number" value="" placeholder="e.g. 33" style="width:5.5rem">
+        </label>
+        <button id="bt6-insert" class="btn">Insert key</button>
+        <button id="bt6-worked" class="btn ghost">Replay worked sequence</button>
+        <button id="bt6-clear" class="btn ghost">Empty tree</button>
+      </div>
+      <div class="sim-readout" id="bt6-readout"></div>
+    </div>
+  </figure>
+  <p class="muted" style="margin-top:-1rem">Experiment: with m = 4, insert 10, 20, 30, then 40.
+  The fourth key overflows the single leaf and splits it. Keep inserting and find the key that splits the
+  root, the only moment the height counter goes up.</p>
+
+  <script>
+  // ===== Week 6: animated B+tree inserter. Self-contained, IIFE-scoped. =====
+  (function () {
+    const svg = document.getElementById("bt6-svg");
+    const readout = document.getElementById("bt6-readout");
+    const orderSel = document.getElementById("bt6-order");
+    const keyIn = document.getElementById("bt6-key");
+
+    let ORDER = parseInt(orderSel.value, 10);   // max children for internal; max keys for leaf = ORDER-1
+    let root = null;
+    let ioCount = 0;
+    let lastMsg = "Empty tree. Insert a key to begin.";
+
+    function maxKeys() { return ORDER - 1; }        // keys per node before overflow
+    function minKeys() { return Math.ceil(ORDER / 2) - 1; } // half-full minimum for non-root
+
+    function newLeaf() { return { leaf: true, keys: [], next: null }; }
+    function newInternal() { return { leaf: false, keys: [], kids: [] }; }
+
+    function emptyTree() { root = newLeaf(); ioCount = 0; lastMsg = "Empty tree. Insert a key to begin."; }
+
+    // descend to the leaf that should hold k; returns [leaf, pathOfInternals]
+    function findLeaf(k) {
+      let node = root, path = [];
+      while (!node.leaf) {
+        ioCount++;
+        let i = 0;
+        while (i < node.keys.length && k >= node.keys[i]) i++; // copy-up convention: go right when k == separator
+        path.push({ node: node, idx: i });
+        node = node.kids[i];
+      }
+      ioCount++;
+      return [node, path];
+    }
+
+    function insertKey(k) {
+      if (root === null) emptyTree();
+      if (containsKey(root, k)) { lastMsg = "Key " + k + " already present. No change."; return; }
+      ioCount = 0;
+      const [leaf, path] = findLeaf(k);
+      // insert into leaf in sorted order
+      let pos = 0; while (pos < leaf.keys.length && leaf.keys[pos] < k) pos++;
+      leaf.keys.splice(pos, 0, k);
+      if (leaf.keys.length <= maxKeys()) {
+        lastMsg = "Inserted " + k + " into a leaf with room. No split. (" + ioCount + " page reads.)";
+        return;
+      }
+      // leaf overflow: split, COPY UP first key of right half
+      const mid = Math.ceil(leaf.keys.length / 2);
+      const right = newLeaf();
+      right.keys = leaf.keys.splice(mid);
+      right.next = leaf.next; leaf.next = right;
+      const sep = right.keys[0];           // copy, not remove
+      lastMsg = "Leaf full. Split, COPY UP separator " + sep + " to the parent.";
+      promote(path, leaf, sep, right);
+    }
+
+    // insert separator sep (with right child) into the parent of `left`
+    function promote(path, left, sep, right) {
+      if (path.length === 0) {
+        const nr = newInternal();
+        nr.keys = [sep]; nr.kids = [left, right];
+        root = nr;
+        lastMsg += " Root split: new root created, tree height +1.";
+        return;
+      }
+      const parentFrame = path.pop();
+      const parent = parentFrame.node;
+      let i = 0; while (i < parent.keys.length && parent.keys[i] < sep) i++;
+      parent.keys.splice(i, 0, sep);
+      parent.kids.splice(i + 1, 0, right);
+      if (parent.keys.length <= maxKeys()) return;   // fits, done
+      // internal overflow: split, PUSH UP the middle key (removed from children)
+      const midIdx = Math.floor(parent.keys.length / 2);
+      const upKey = parent.keys[midIdx];
+      const r = newInternal();
+      r.keys = parent.keys.splice(midIdx + 1);
+      r.kids = parent.kids.splice(midIdx + 1);
+      parent.keys.splice(midIdx);                     // remove the pushed-up key from the left node
+      lastMsg = "Internal node full. Split, PUSH UP middle key " + upKey + " (removed from children).";
+      promote(path, parent, upKey, r);
+    }
+
+    function containsKey(node, k) {
+      while (!node.leaf) {
+        let i = 0; while (i < node.keys.length && k >= node.keys[i]) i++;
+        node = node.kids[i];
+      }
+      return node.keys.indexOf(k) !== -1;
+    }
+
+    function height(node) { return node.leaf ? 1 : 1 + height(node.kids[0]); }
+    function countLeafKeys(node) {
+      if (node.leaf) return node.keys.length;
+      return node.kids.reduce(function (a, c) { return a + countLeafKeys(c); }, 0);
+    }
+
+    // ---------- layout + render ----------
+    function layout() {
+      // assign x by in-order leaf order, y by depth
+      const levels = [];
+      (function walk(node, depth) {
+        if (!levels[depth]) levels[depth] = [];
+        levels[depth].push(node);
+        if (!node.leaf) node.kids.forEach(function (c) { walk(c, depth + 1); });
+      })(root, 0);
+      return levels;
+    }
+
+    function render() {
+      svg.innerHTML = "";
+      const levels = layout();
+      const W = 720, topPad = 24, levelGap = 78;
+      const positions = new Map();
+
+      // place leaves evenly, then center parents over their children
+      const leaves = levels[levels.length - 1];
+      const slotW = W / (leaves.length + 0.0001);
+      leaves.forEach(function (lf, i) { positions.set(lf, topPad + (i + 0.5) * slotW); });
+      for (let d = levels.length - 2; d >= 0; d--) {
+        levels[d].forEach(function (nd) {
+          const xs = nd.kids.map(function (c) { return positions.get(c); });
+          positions.set(nd, xs.reduce(function (a, b) { return a + b; }, 0) / xs.length);
+        });
+      }
+
+      // edges first
+      for (let d = 0; d < levels.length - 1; d++) {
+        levels[d].forEach(function (nd) {
+          const px = positions.get(nd), py = topPad + d * levelGap + 16;
+          nd.kids.forEach(function (c) {
+            const cx = positions.get(c), cy = topPad + (d + 1) * levelGap;
+            svg.appendChild(DBMS.svg("line", { x1: px, y1: py, x2: cx, y2: cy, stroke: "var(--index)", "stroke-width": 1.2, opacity: 0.7 }));
+          });
+        });
+      }
+      // leaf links
+      for (let i = 0; i < leaves.length - 1; i++) {
+        const a = positions.get(leaves[i]), b = positions.get(leaves[i + 1]);
+        const y = topPad + (levels.length - 1) * levelGap + 8;
+        svg.appendChild(DBMS.svg("line", { x1: a + boxW(leaves[i]) / 2, y1: y, x2: b - boxW(leaves[i + 1]) / 2, y2: y, stroke: "var(--ink-faint)", "stroke-dasharray": "3 3" }));
+      }
+      // nodes
+      levels.forEach(function (row, d) {
+        row.forEach(function (nd) {
+          drawNode(nd, positions.get(nd), topPad + d * levelGap, nd === root);
+        });
+      });
+
+      const h = height(root), n = countLeafKeys(root);
+      readout.textContent =
+        "height: " + h + "    keys stored: " + n + "    order m: " + ORDER +
+        "    leaf max keys: " + maxKeys() + "    non-root min keys: " + minKeys() + "\n" + lastMsg;
+    }
+
+    function boxW(nd) { return Math.max(46, nd.keys.length * 26 + 16); }
+
+    function drawNode(nd, cx, top, isRoot) {
+      const w = boxW(nd), x = cx - w / 2, h = 26;
+      const halfFull = nd.keys.length >= minKeys();
+      const fill = nd.leaf ? "#fffefb" : "var(--index-bg)";
+      const stroke = isRoot ? "var(--index)" : (nd.leaf ? "var(--rule)" : "var(--index)");
+      svg.appendChild(DBMS.svg("rect", {
+        x: x, y: top, width: w, height: h, rx: 4, fill: fill, stroke: stroke,
+        "stroke-width": isRoot ? 2 : 1.2
+      }));
+      // half-full marker: a small bar, green if at/above minimum (non-root), amber if a leaf below min
+      if (!isRoot) {
+        svg.appendChild(DBMS.svg("rect", {
+          x: x + 2, y: top + h - 4, width: w - 4, height: 3, rx: 1.5,
+          fill: halfFull ? "var(--index)" : "var(--accent)", opacity: halfFull ? 0.55 : 0.3
+        }));
+      }
+      svg.appendChild(DBMS.svg("text", {
+        x: cx, y: top + 17, "text-anchor": "middle", class: "svg-mono"
+      }, nd.keys.join(" ")));
+      if (isRoot) {
+        svg.appendChild(DBMS.svg("text", { x: cx, y: top - 4, "text-anchor": "middle", class: "svg-label sm", fill: "var(--index)" }, "root"));
+      }
+    }
+
+    // ---------- controls ----------
+    function doInsert(k) {
+      if (!Number.isFinite(k)) { lastMsg = "Enter an integer key first."; render(); return; }
+      insertKey(k); render();
+    }
+    document.getElementById("bt6-insert").addEventListener("click", function () {
+      doInsert(parseInt(keyIn.value, 10)); keyIn.value = ""; keyIn.focus();
+    });
+    keyIn.addEventListener("keydown", function (e) { if (e.key === "Enter") document.getElementById("bt6-insert").click(); });
+    document.getElementById("bt6-clear").addEventListener("click", function () { emptyTree(); render(); });
+    orderSel.addEventListener("change", function () { ORDER = parseInt(orderSel.value, 10); emptyTree(); render(); });
+
+    document.getElementById("bt6-worked").addEventListener("click", function () {
+      ORDER = 4; orderSel.value = "4"; emptyTree();
+      // deterministic run: leaf split, then internal split that creates a new root
+      const seq = [10, 20, 30, 40, 50, 60, 70, 80, 90];
+      let idx = 0;
+      const tick = setInterval(function () {
+        if (idx >= seq.length) { clearInterval(tick); return; }
+        insertKey(seq[idx]); idx++; render();
+      }, 650);
+    });
+
+    emptyTree();
+    render();
+  })();
+  </script>
+
+  <div class="callout realworld">
+    <div class="callout-title">In real systems</div>
+    <p>PostgreSQL's default index is nbtree, a B+tree built on the Lehman and Yao high-concurrency design.
+    Every page carries a right-link to its right sibling and a high key that upper-bounds the page's keys.
+    A search that arrives during a concurrent split can detect it (the target key now exceeds the page's
+    high key) and follow the right-link to the moved data, so searches need almost no locking. nbtree also
+    uses pivot tuples that exist only to navigate, and suffix truncation drops unneeded trailing columns of
+    a separator at split time to raise fanout. [<a href="https://github.com/postgres/postgres/blob/master/src/backend/access/nbtree/README">nbtree
+    README</a>, <a href="https://www.postgresql.org/docs/16/btree-implementation.html">PG B-Tree Implementation</a>]</p>
+  </div>
+
+  <!-- ===== CODE ===== -->
+  <h3>Insertion in pseudocode</h3>
+  <pre><code><span class="tok-com"># Insert key k. Descend, then fit or split. Splits bubble up only on overflow.</span>
+<span class="tok-kw">def</span> <span class="tok-fn">insert</span>(tree, k):
+    leaf, path = descend_to_leaf(tree.root, k)   <span class="tok-com"># Ki &lt; v &lt;= Ki+1 at each level</span>
+    leaf.put_sorted(k)
+    <span class="tok-kw">if</span> len(leaf.keys) &lt;= MAX_KEYS:
+        <span class="tok-kw">return</span>                                   <span class="tok-com"># common case: no structural change</span>
+    right = leaf.split_upper_half()              <span class="tok-com"># link right into leaf chain</span>
+    sep   = right.keys[<span class="tok-num">0</span>]                       <span class="tok-com"># COPY UP: key stays in the leaf too</span>
+    promote(path, leaf, sep, right)
+
+<span class="tok-kw">def</span> <span class="tok-fn">promote</span>(path, left, sep, right):
+    <span class="tok-kw">if</span> path.is_empty():                          <span class="tok-com"># left was the root</span>
+        tree.root = Internal(keys=[sep], kids=[left, right])   <span class="tok-com"># only place height grows</span>
+        <span class="tok-kw">return</span>
+    parent = path.pop()
+    parent.insert(sep, right)
+    <span class="tok-kw">if</span> len(parent.keys) &lt;= MAX_KEYS:
+        <span class="tok-kw">return</span>
+    up, rnode = parent.split_middle()            <span class="tok-com"># PUSH UP: middle key removed from children</span>
+    promote(path, parent, up, rnode)</code></pre>
+
+  <details class="deepdive">
+    <summary>Deeper: why splits are rare on average</summary>
+    <div><p>A split divides a full node into two halves, so right after a split each half is about half
+    full. To split again the same node would have to refill from roughly m/2 keys back up to m, which takes
+    about m/2 more inserts. So in a steady stream of inserts, splits are amortized over many cheap inserts,
+    and the analysis gives O(1) amortized structural work per insert on top of the O(log<sub>m</sub> N)
+    descent. The descent dominates. This is also why fillfactor matters at build time: packing leaves to 90
+    percent rather than 100 percent leaves slack so the first inserts after a bulk load do not immediately
+    split. [<a href="https://www.postgresql.org/docs/16/btree-implementation.html">PG B-Tree Implementation</a>]</p></div>
+  </details>
+
+  <div class="callout intuition">
+    <div class="callout-title">Intuition</div>
+    <p>Why is the marginal cost of a real lookup closer to one or two reads than to the full height? Because
+    every search on the index touches the root and the level below it, so those upper pages are always hot
+    and the buffer pool keeps them resident. The only pages that are likely cold are the leaf you finally
+    land on. That is the week 5 buffer pool doing the index a favor: a four-level tree behaves like a
+    one-or-two-I/O structure in practice.</p>
+  </div>
+
+  <!-- ===== MCQs ===== -->
+  <h2>Check yourself</h2>
+
+  <div class="mcq" data-answer="2">
+    <p class="mcq-q">A B+tree on a column with N rows answers a point lookup in how many page reads, and why?</p>
+    <button class="mcq-opt">About log base 2 of N, because each node makes a single binary branching choice.</button>
+    <button class="mcq-opt">About N over the page size, because the leaves must be scanned to find the key.</button>
+    <button class="mcq-opt">About log base m of N, because each page read branches m ways at the fanout.</button>
+    <button class="mcq-opt">Exactly one, because the root holds a direct pointer to every leaf in the tree.</button>
+    <p class="mcq-explain">The base of the log is the fanout m, not 2. That is the entire reason a B+tree
+    beats a binary tree on disk: one page read makes a high-fanout decision, so the height is log<sub>m</sub>
+    N and three or four levels reach hundreds of millions of rows. Saying log base 2 is the classic trap; it
+    is the right answer for a binary tree and the wrong cost model for a paged index.</p>
+  </div>
+
+  <div class="mcq" data-answer="1">
+    <p class="mcq-q">On a leaf split in a B+tree, what happens to the separator key?</p>
+    <button class="mcq-opt">It is moved up into the parent and removed from both of the new leaves.</button>
+    <button class="mcq-opt">It is copied up into the parent and also kept in the new right leaf.</button>
+    <button class="mcq-opt">It is written only to the parent because internal nodes own all the keys.</button>
+    <button class="mcq-opt">It is dropped entirely once the two halves are linked into the leaf chain.</button>
+    <p class="mcq-explain">A leaf split copies the separator up. The key has to stay in the leaf because in a
+    B+tree all data lives in the leaves, so the parent gets a copy for routing while the leaf keeps the real
+    entry. Moving it up (option A) is what an internal-node split does, not a leaf split. Confusing copy-up
+    with push-up is the single most common B+tree mistake.</p>
+  </div>
+
+  <div class="mcq" data-answer="3">
+    <p class="mcq-q">Which statement about B+tree occupancy is false?</p>
+    <button class="mcq-opt">A non-root internal node holds between ceil(m/2) and m children at all times.</button>
+    <button class="mcq-opt">The half-full rule on non-root nodes is what bounds the worst-case height.</button>
+    <button class="mcq-opt">A split leaves both resulting halves at roughly half occupancy.</button>
+    <button class="mcq-opt">The root must also stay at least half full, just like every other node.</button>
+    <p class="mcq-explain">The root is exempt from the half-full rule, so option D is false. The root can
+    hold a single key (two children), or zero keys when the tree is one leaf. The other three are true: the
+    minimum occupancy on non-root nodes is exactly what caps height in the worst case, and a split halves a
+    full node so both pieces start around half full.</p>
+  </div>
+
+  <div class="mcq" data-answer="0">
+    <p class="mcq-q">Which statement about a B+tree is false?</p>
+    <button class="mcq-opt">Internal nodes store record payloads, so a lookup can stop before the leaves.</button>
+    <button class="mcq-opt">Leaves are linked in key order so a range scan walks sideways without re-descending.</button>
+    <button class="mcq-opt">All root-to-leaf paths have equal length because balance is a structural invariant.</button>
+    <button class="mcq-opt">Internal nodes hold only separator keys and child pointers used for routing.</button>
+    <p class="mcq-explain">Option A is false and is the B-tree versus B+tree distinction. In a B+tree all
+    data entries live in the leaves; internal nodes hold only separators and route. A plain B-tree may keep
+    data in internal nodes, but the B+tree deliberately does not, which is what makes the leaf chain a clean
+    sorted list for range scans. The other three are core B+tree invariants.</p>
+  </div>
+
+  <div class="mcq" data-answer="2">
+    <p class="mcq-q">During a long series of inserts, when does a B+tree increase in height?</p>
+    <button class="mcq-opt">Every time any leaf splits, since a new separator is always added above it.</button>
+    <button class="mcq-opt">Whenever an internal node splits, regardless of where it sits in the tree.</button>
+    <button class="mcq-opt">Only when the root itself splits and a new root is created above it.</button>
+    <button class="mcq-opt">On every insert, because each new key lengthens the path to its own leaf.</button>
+    <p class="mcq-explain">Height grows only when the root splits. A leaf or internal split below the root
+    just pushes a separator into an existing parent that had room, so the path length is unchanged. When the
+    root overflows there is no parent to absorb the separator, so a new root is allocated above the two
+    halves, and that single event lifts every leaf one level deeper at once. This top-down growth is why all
+    leaves stay at equal depth.</p>
+  </div>
+
+  <div class="mcq" data-answer="1">
+    <p class="mcq-q">Why is the buffer pool relevant to the I/O cost of a B+tree lookup?</p>
+    <button class="mcq-opt">It rebalances the tree in the background so the height never exceeds two levels.</button>
+    <button class="mcq-opt">It keeps the hot upper levels resident, so marginal cost is one or two leaf reads.</button>
+    <button class="mcq-opt">It stores the entire index in memory, making every lookup a single fast read.</button>
+    <button class="mcq-opt">It converts random leaf reads into sequential reads by reordering the requests.</button>
+    <p class="mcq-explain">Every search touches the root and the level just below it, so those pages are
+    always hot and the buffer pool keeps them in frames. The leaf you finally land on is the page most
+    likely to be cold. So a four-level tree behaves like a one-or-two-I/O structure in practice. The buffer
+    pool does not rebalance the tree, does not guarantee the whole index fits in memory, and does not reorder
+    random leaf reads into sequential ones.</p>
+  </div>
+
+  <!-- ===== FLASHCARDS ===== -->
+  <div class="flashcard">
+    <div class="fc-front">State the difference between copy-up and push-up, and when each happens.</div>
+    <div class="fc-back">A leaf split copies its separator up: the key goes into the parent and stays in the
+    right leaf, because data must remain in leaves. An internal split pushes its middle key up: the key moves
+    into the parent and is removed from both children, because a router keeps no copy.</div>
+  </div>
+
+  <div class="flashcard">
+    <div class="fc-front">For order m, how many keys may a non-root node hold, and what is the root allowed to hold?</div>
+    <div class="fc-back">A non-root node holds between ceil(m/2) - 1 and m - 1 keys (the half-full
+    invariant). The root is exempt: it may hold as few as one key, or zero keys when the whole tree is a
+    single leaf.</div>
+  </div>
+
+  <!-- ===== PRIMARY SOURCE ===== -->
+  <div class="source-box">
+    <div class="src-tag">Primary source</div>
+    <div class="src-title">Read this next: CMU 15-445 Lecture 08, Tree Indexes (Fall 2023)</div>
+    <p class="muted">The clearest treatment of the B+tree as an M-way search tree, with fanout as the
+    central parameter and the search, insert, and split algorithms worked step by step. Focus on the
+    M-way framing and the copy-up versus push-up split rules.
+    <a href="https://15445.courses.cs.cmu.edu/fall2023/notes/08-trees.pdf">15445.courses.cs.cmu.edu/fall2023/notes/08-trees.pdf</a></p>
+  </div>
+
+  <!-- ===== ASK YOUR TEACHER ===== -->
+  <div class="ask-teacher">
+    <div class="at-tag">Ask your teacher</div>
+    <p>Want me to trace a specific insert sequence on the board, derive the exact key that splits the root
+    for a given order, or contrast nbtree's right-link search with the textbook descent? Ask me to go deeper
+    or quiz you harder. I am your teacher for this course, not just a document.</p>
+  </div>
+
+  <!-- ===== NAV ===== -->
+  <nav class="lesson-nav">
+    <a class="prev" href="0005-buffer-pool-lru-k.html">
+      <span class="nav-dir">Previous</span>
+      <span class="nav-title">Week 05 · LRU-K, sequential flooding, and prefetching</span>
+    </a>
+    <a class="next" href="0007-btree-delete-hash.html">
+      <span class="nav-dir">Next</span>
+      <span class="nav-title">Week 07 · B+tree deletion, bulk loading, composite keys, and hash indexes</span>
+    </a>
+  </nav>
+
+  </div><!-- /.col -->
+</main>
+</body>
+</html>

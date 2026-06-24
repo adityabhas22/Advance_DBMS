@@ -1,0 +1,226 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ARIES recovery on one page · Field Guide to the Database Engine</title>
+<link rel="stylesheet" href="../assets/course.css">
+<style>
+  /* Cheat-sheet density tweaks, scoped to this page */
+  .ref h2 { margin: 1.8rem 0 .3rem; font-size: 1.3rem; }
+  .ref h3 { margin: 1.2rem 0 .2rem; font-size: 1.05rem; }
+  .ref p, .ref li { font-size: .92rem; line-height: 1.5; }
+  .ref table { margin: .8rem 0; font-size: .82rem; }
+  .ref th, .ref td { padding: .35rem .55rem; }
+  .ref .callout { margin: 1rem 0; font-size: .9rem; }
+  .ref code { font-size: .82em; }
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 0 1.6rem; align-items: start; }
+  @media (max-width: 720px) { .grid2 { grid-template-columns: 1fr; } }
+  @media print { .grid2 { grid-template-columns: 1fr 1fr; } }
+  .ref .steps > li { margin: .45rem 0; }
+  .lsn { font-family: var(--mono); white-space: nowrap; }
+</style>
+</head>
+<body class="layer-recovery">
+<main class="page">
+
+  <!-- ===== MASTHEAD ===== -->
+  <header class="masthead col">
+    <div class="crumbs">
+      <a href="../index.html">Field Guide</a> <span>/</span>
+      <span>Reference</span> <span>/</span>
+      <span>Recovery</span>
+    </div>
+    <span class="week-badge">Recovery · WAL</span>
+    <h1>ARIES recovery on one page</h1>
+    <p class="lede">The write-ahead log, the three bookkeeping structures, the three restart passes, and why steal and no-force force undo and redo. Mohan et al., ACM TODS 17(1), 1992.</p>
+  </header>
+
+  <div class="col ref">
+
+  <!-- ===== WAL RULE ===== -->
+  <h2>The WAL rule</h2>
+  <p>In-place updating: a changed page is written back to the same disk location it came from, so the <strong>log is the only source of truth</strong> for recovery (not a shadow copy). Two obligations make this safe:</p>
+  <ol class="steps">
+    <li><strong>Undo before steal.</strong> Before a dirty page is written to the durable database, the log records describing its changes (at least the undo portions) must already be on stable storage. The buffer manager forces the log up to that page's <code>pageLSN</code> before stealing it.</li>
+    <li><strong>Redo before commit.</strong> A transaction is not committed until its commit record and all earlier log up to that LSN are forced to stable storage.</li>
+  </ol>
+  <div class="callout keyidea">
+    <div class="callout-title">Keep this one thing</div>
+    <p>Log first, page later. Rule 1 guarantees you can always undo an uncommitted change that leaked to disk; rule 2 guarantees a committed change can always be redone. Everything else in ARIES is bookkeeping that makes those two replays exact.</p>
+  </div>
+
+  <!-- ===== KEY FIELDS ===== -->
+  <h2>The fields that make replay exact</h2>
+  <table>
+    <caption>Per-record, per-page, and per-table identifiers.</caption>
+    <thead><tr><th>Name</th><th>Lives on</th><th>What it is</th></tr></thead>
+    <tbody>
+      <tr><td><code>LSN</code></td><td>every log record</td><td>Log sequence number. Monotonically increasing identifier of a log record.</td></tr>
+      <tr><td><code>pageLSN</code></td><td>every data page</td><td>LSN of the log record for the most recent update applied to that page. Lets redo test whether a logged update is already present.</td></tr>
+      <tr><td><code>prevLSN</code></td><td>every log record</td><td>LSN of the previous record written by the same transaction. Chains a transaction's records into a backward list (first record holds 0).</td></tr>
+      <tr><td><code>recLSN</code></td><td>Dirty Page Table entry</td><td>Recovery LSN. End-of-log LSN at the moment the page was first dirtied; the earliest log point whose updates may not yet be on disk.</td></tr>
+      <tr><td><code>undoNextLSN</code></td><td>CLRs only</td><td>Points to the predecessor of the record this CLR just compensated, that is, the next record of that transaction still to be undone.</td></tr>
+    </tbody>
+  </table>
+
+  <h3>The two in-memory tables</h3>
+  <div class="grid2">
+    <div>
+      <table>
+        <caption>Transaction Table (active transactions)</caption>
+        <thead><tr><th>Field</th><th>Meaning</th></tr></thead>
+        <tbody>
+          <tr><td><code>TransID</code></td><td>transaction id</td></tr>
+          <tr><td><code>State</code></td><td><code>P</code> prepared / in-doubt, <code>U</code> unprepared / undoable, committed</td></tr>
+          <tr><td><code>LastLSN</code></td><td>LSN of its latest log record</td></tr>
+          <tr><td><code>UndoNxtLSN</code></td><td>next record to undo: from the last CLR's <code>undoNextLSN</code> if that record is a CLR, else equals <code>LastLSN</code></td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div>
+      <table>
+        <caption>Dirty Page Table (dirty buffer pages)</caption>
+        <thead><tr><th>Field</th><th>Meaning</th></tr></thead>
+        <tbody>
+          <tr><td><code>PageID</code></td><td>the dirty page</td></tr>
+          <tr><td><code>recLSN</code></td><td>set to end-of-log LSN when a clean page is first fixed to modify; entry removed when the page is written to disk</td></tr>
+        </tbody>
+      </table>
+      <p>Both tables are written into checkpoint records, initialized from the latest checkpoint at restart, and brought up to date by the Analysis pass.</p>
+    </div>
+  </div>
+
+  <!-- ===== CLR ===== -->
+  <h2>Compensation Log Records</h2>
+  <p>When ARIES undoes an update it logs the undo as a <strong>CLR</strong>. CLRs are <strong>redo-only</strong>: they are never themselves undone. The CLR's <code>undoNextLSN</code> records how far rollback has progressed, so a failure or nested rollback during undo resumes from that point and skips already-undone work. This bounds log volume under repeated or nested rollbacks. Because the CLR describes what the undo actually did, undo need not be the physical inverse on the same page, which enables <strong>logical undo</strong> and high-concurrency operations.</p>
+  <div class="callout gotcha">
+    <div class="callout-title">Exam trap</div>
+    <p>CLRs are never undone (they have no undo); only regular update records are. IMS undid the same non-CLR repeatedly and DB2 undid CLRs too. ARIES does neither, which is the whole point of <code>undoNextLSN</code>.</p>
+  </div>
+
+  <!-- ===== THREE PASSES ===== -->
+  <h2>The three restart passes</h2>
+  <ol class="steps">
+    <li><strong>Analysis.</strong> Scan <em>forward</em> from the most recent checkpoint to the end of the log. <em>Builds:</em> the Transaction Table and Dirty Page Table brought up to end of log, the set of <strong>loser</strong> transactions to undo, and <code class="lsn">RedoLSN = min(recLSN)</code> over all Dirty Page Table entries, where the redo pass must start.</li>
+    <li><strong>Redo (repeating history).</strong> Scan <em>forward</em> from <code>RedoLSN</code> to end of log. For each redoable update or CLR whose <code>PageID</code> is in the Dirty Page Table and whose <code class="lsn">LSN &ge; page recLSN</code>, fix and latch the page. <em>Conditional:</em> reapply only if <code class="lsn">pageLSN &lt; LSN</code>, then set <code>pageLSN = LSN</code>; otherwise skip (already on disk). Reapplies updates of <em>all</em> transactions, including losers, to rebuild the exact failure-time state. <em>No logging during redo.</em> Also reacquires locks for in-doubt (prepared) distributed transactions.</li>
+    <li><strong>Undo of losers.</strong> Roll back all losers in <em>reverse</em> chronological order in a single sweep, repeatedly taking the max of the next-to-be-undone LSNs across not-yet-finished losers. <em>Unconditional:</em> no <code>pageLSN</code> comparison, because repeating history guarantees every loser update is present. Each undone update writes a CLR; on hitting a CLR, jump to its <code>undoNextLSN</code> to skip already-undone work.</li>
+  </ol>
+  <div class="callout why">
+    <div class="callout-title">Why repeat history before undoing</div>
+    <p>Redoing even the losers reestablishes the exact state at the moment of the crash. Only then are losers undone. This is what guarantees ARIES never undoes an effect that is absent and never undoes-then-redoes a committed change already on disk, the two bugs it criticizes in older WAL methods. <strong>Losers</strong> = transactions neither committed nor in the in-doubt (prepared) state at failure.</p>
+  </div>
+
+  <!-- ===== TIMELINE SVG ===== -->
+  <figure class="diagram">
+    <svg viewBox="0 0 760 230" role="img" aria-label="Timeline of a crash: checkpoint, RedoLSN, crash, and the three recovery passes">
+      <defs>
+        <marker id="arr" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="var(--recovery)"/></marker>
+        <marker id="arrk" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="var(--ink-soft)"/></marker>
+      </defs>
+
+      <!-- main log axis -->
+      <line x1="40" y1="60" x2="720" y2="60" stroke="var(--ink-soft)" stroke-width="1.5" marker-end="url(#arrk)"/>
+      <text x="724" y="56" class="svg-label" text-anchor="end" dy="-6">log time -&gt;</text>
+
+      <!-- event ticks -->
+      <!-- checkpoint -->
+      <line x1="140" y1="48" x2="140" y2="72" stroke="var(--recovery)" stroke-width="2"/>
+      <text x="140" y="40" text-anchor="middle" class="svg-label">checkpoint</text>
+      <!-- RedoLSN = min recLSN -->
+      <line x1="250" y1="48" x2="250" y2="72" stroke="var(--storage)" stroke-width="2"/>
+      <text x="250" y="40" text-anchor="middle" class="svg-mono" fill="var(--storage)">RedoLSN</text>
+      <text x="250" y="86" text-anchor="middle" class="svg-label sm">min recLSN</text>
+      <!-- some updates -->
+      <circle cx="360" cy="60" r="3" fill="var(--ink-soft)"/>
+      <circle cx="430" cy="60" r="3" fill="var(--ink-soft)"/>
+      <circle cx="500" cy="60" r="3" fill="var(--ink-soft)"/>
+      <text x="430" y="86" text-anchor="middle" class="svg-label sm">updates (winners + losers)</text>
+      <!-- crash -->
+      <line x1="620" y1="44" x2="620" y2="76" stroke="var(--bad)" stroke-width="2.5"/>
+      <path d="M612,42 l16,6 l-16,6" fill="none" stroke="var(--bad)" stroke-width="2"/>
+      <text x="620" y="36" text-anchor="middle" class="svg-label" fill="var(--bad)">CRASH</text>
+
+      <!-- pass bars -->
+      <!-- Analysis: checkpoint -> end of log, forward -->
+      <rect x="140" y="112" width="480" height="20" rx="4" fill="var(--recovery-bg)" stroke="var(--recovery)"/>
+      <line x1="146" y1="122" x2="614" y2="122" stroke="var(--recovery)" stroke-width="1.2" marker-end="url(#arr)"/>
+      <text x="380" y="126" text-anchor="middle" class="svg-mono">1. Analysis (forward)</text>
+
+      <!-- Redo: RedoLSN -> end of log, forward -->
+      <rect x="250" y="146" width="370" height="20" rx="4" fill="#f6e7da" stroke="var(--storage)"/>
+      <line x1="256" y1="156" x2="614" y2="156" stroke="var(--storage)" stroke-width="1.2" marker-end="url(#arr)"/>
+      <text x="435" y="160" text-anchor="middle" class="svg-mono" fill="var(--storage)">2. Redo from RedoLSN (forward)</text>
+
+      <!-- Undo: end of log -> back through losers, backward -->
+      <rect x="200" y="180" width="420" height="20" rx="4" fill="var(--txn-bg)" stroke="var(--txn)"/>
+      <line x1="614" y1="190" x2="206" y2="190" stroke="var(--txn)" stroke-width="1.2" marker-end="url(#arr)"/>
+      <text x="410" y="194" text-anchor="middle" class="svg-mono" fill="var(--txn)">3. Undo losers (backward)</text>
+
+      <!-- guide lines from ticks down to bars -->
+      <line x1="140" y1="72" x2="140" y2="112" stroke="var(--rule)" stroke-dasharray="3 3"/>
+      <line x1="250" y1="72" x2="250" y2="146" stroke="var(--rule)" stroke-dasharray="3 3"/>
+      <line x1="620" y1="76" x2="620" y2="180" stroke="var(--rule)" stroke-dasharray="3 3"/>
+    </svg>
+    <figcaption><b>Figure 1.</b> Analysis runs from the last checkpoint forward to find losers and <code>RedoLSN</code>. Redo replays forward from <code>RedoLSN = min(recLSN)</code>, which can sit before the checkpoint. Undo then sweeps backward, compensating losers with CLRs. Redo is conditional on <code>pageLSN</code>; undo is unconditional.</figcaption>
+  </figure>
+
+  <!-- ===== STEAL / NO-FORCE MATRIX ===== -->
+  <h2>Steal and no-force: what each needs</h2>
+  <p>The buffer policy decides which replays are possible, so it decides which recovery work a crash can demand. ARIES supports the hard corner, <strong>steal + no-force</strong>, which is why it needs both undo and redo.</p>
+  <table>
+    <caption>Buffer policy to required recovery work.</caption>
+    <thead><tr><th>&nbsp;</th><th>No-steal<br><small>dirty page of an uncommitted txn never written</small></th><th>Steal<br><small>uncommitted dirty page may reach disk</small></th></tr></thead>
+    <tbody>
+      <tr>
+        <th>Force<br><small>committed txn's pages flushed at commit</small></th>
+        <td><strong>No undo, no redo.</strong> Simplest, but force is slow (random I/O at commit) and no-steal needs a huge buffer.</td>
+        <td><strong>Undo only.</strong> Stolen uncommitted changes must be rolled back, but committed work is already on disk.</td>
+      </tr>
+      <tr>
+        <th>No-force<br><small>commit need not flush pages</small></th>
+        <td><strong>Redo only.</strong> Committed changes may be missing from disk and must be replayed.</td>
+        <td><strong>Undo + redo.</strong> The ARIES corner. Fast at runtime, hardest at restart.</td>
+      </tr>
+    </tbody>
+  </table>
+  <div class="callout realworld">
+    <div class="callout-title">Why steal forces undo, no-force forces redo</div>
+    <p><strong>Steal -&gt; undo:</strong> an uncommitted transaction's dirty page can land on disk before commit, so a crash leaves uncommitted changes that must be undone. <strong>No-force -&gt; redo:</strong> a committed transaction's dirty pages may still be in the buffer at commit, so a crash can lose them and they must be redone. ARIES imposes no page-replacement restriction beyond enforcing WAL.</p>
+  </div>
+
+  <!-- ===== REDO VS UNDO QUICK CARD ===== -->
+  <div class="grid2">
+    <div class="callout intuition">
+      <div class="callout-title">Redo, in one line</div>
+      <p>Forward, from <code>RedoLSN</code>. <strong>Conditional:</strong> apply only if <code class="lsn">pageLSN &lt; LSN</code>. All transactions. No logging.</p>
+    </div>
+    <div class="callout intuition">
+      <div class="callout-title">Undo, in one line</div>
+      <p>Backward, losers only. <strong>Unconditional:</strong> no <code>pageLSN</code> test. Writes a CLR per undo; follows <code>undoNextLSN</code> to skip done work.</p>
+    </div>
+  </div>
+
+  <!-- ===== SOURCE ===== -->
+  <div class="source-box">
+    <div class="src-tag">Primary source</div>
+    <div class="src-title">Mohan, Haderle, Lindsay, Pirahesh, Schwarz. ARIES: A Transaction Recovery Method. ACM TODS 17(1), March 1992, pp. 94 to 162.</div>
+    <p class="muted">Section 4 for the data structures (pageLSN, Transaction Table, Dirty Page Table, recLSN, CLR fields), Section 6 for the three passes. Section 3 for repeating history and CLRs.</p>
+  </div>
+
+  <!-- ===== FOOTER NAV ===== -->
+  <nav class="lesson-nav">
+    <a class="prev" href="../index.html">
+      <span class="nav-dir">Back to</span>
+      <span class="nav-title">Field Guide index</span>
+    </a>
+    <a class="next" href="../lessons/0014-logging-recovery-aries.html">
+      <span class="nav-dir">Lesson</span>
+      <span class="nav-title">Week 14 · WAL and the ARIES algorithm</span>
+    </a>
+  </nav>
+
+  </div><!-- /.col -->
+</main>
+</body>
+</html>

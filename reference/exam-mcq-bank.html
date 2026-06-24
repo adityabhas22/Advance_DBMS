@@ -1,0 +1,826 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MCQ exam bank · Field Guide to the Database Engine</title>
+<link rel="stylesheet" href="../assets/course.css">
+<script defer src="../assets/components.js"></script>
+<style>
+  /* page-local: dense, scannable bank layout */
+  .bank-toc { font-family: var(--sans); font-size: .82rem; columns: 2; column-gap: 1.6rem; margin: 1rem 0 1.8rem; }
+  .bank-toc a { display: block; padding: .12rem 0; border: none; }
+  .topic-head { margin-top: 2.4rem; padding-top: .6rem; border-top: 2px solid var(--layer); }
+  .topic-head .wk { font-family: var(--sans); font-size: .7rem; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; color: var(--ink-faint); }
+  .mcq { margin: 1rem 0; }
+  .combo { font-family: var(--sans); font-size: .64rem; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; color: var(--query); border: 1px solid var(--query); border-radius: 3px; padding: 0 .3rem; margin-left: .4rem; vertical-align: middle; }
+  @media print { .bank-toc { display: none; } .topic-head { break-before: auto; } .mcq { break-inside: avoid; } }
+</style>
+</head>
+<body class="layer-query">
+<main class="page">
+
+  <!-- ===== MASTHEAD ===== -->
+  <header class="masthead col">
+    <div class="crumbs">
+      <a href="../index.html">Field Guide</a> <span>/</span>
+      <span>Reference</span> <span>/</span>
+      <span>MCQ exam bank</span>
+    </div>
+    <span class="week-badge">All 16 weeks</span>
+    <h1>MCQ exam bank</h1>
+    <p class="lede">Fifty-two self-grading practice questions across the whole engine, grouped by
+    topic. Click an option to lock your answer and reveal the explanation. Several items ask which
+    statement is false, and a few combine two topics. Print this page to get the full answer key
+    with every explanation expanded.</p>
+  </header>
+
+  <div class="col">
+
+  <nav class="bank-toc" aria-label="Question topics">
+    <a href="#storage">1. Storage: pages, records, heap files (wk 2-3)</a>
+    <a href="#buffer">2. Buffer pool and replacement (wk 4-5)</a>
+    <a href="#indexing">3. B+trees and hashing (wk 6-7)</a>
+    <a href="#parsing">4. Parsing and logical plans (wk 8)</a>
+    <a href="#execution">5. Execution and joins (wk 9-10)</a>
+    <a href="#optimization">6. Query optimization (wk 11)</a>
+    <a href="#transactions">7. Transactions and isolation (wk 12)</a>
+    <a href="#concurrency">8. Concurrency control and MVCC (wk 13)</a>
+    <a href="#recovery">9. WAL and ARIES recovery (wk 14)</a>
+    <a href="#modern">10. Modern and distributed (wk 15-16)</a>
+  </nav>
+
+  <p class="muted" style="font-family:var(--sans);font-size:.82rem">Tip: an item tagged
+  <span class="combo">combines topics</span> draws on two subsystems at once. Watch for the
+  "which is false" stems; three options are true and you are hunting the one wrong claim.</p>
+
+  <!-- ================================================================= -->
+  <!-- 1. STORAGE                                                          -->
+  <!-- ================================================================= -->
+  <div class="topic-head" id="storage">
+    <span class="wk">Weeks 2-3</span>
+    <h2>Storage: pages, records, heap files</h2>
+  </div>
+
+  <div class="mcq" data-answer="2">
+    <p class="mcq-q">In a slotted page, how do the slot array and the tuple data grow?</p>
+    <button class="mcq-opt">Both grow downward from the page header toward the page end.</button>
+    <button class="mcq-opt">Both grow upward from the page end toward the header.</button>
+    <button class="mcq-opt">The slot array grows down from the header; tuple data grows up from the end.</button>
+    <button class="mcq-opt">They alternate direction on every insert to balance the page.</button>
+    <p class="mcq-explain">The slot (line-pointer) array grows down from the header while tuple data grows up from the page end; the page is full when the two pointers meet. In PostgreSQL these are pd_lower and pd_upper closing from both sides.</p>
+  </div>
+
+  <div class="mcq" data-answer="1">
+    <p class="mcq-q">A record id such as PostgreSQL's (page id, slot number) is best described as:</p>
+    <button class="mcq-opt">A raw byte offset on disk you can do pointer arithmetic on.</button>
+    <button class="mcq-opt">A stable external address whose slot indirects to the in-page offset.</button>
+    <button class="mcq-opt">The hash of the tuple's primary key.</button>
+    <button class="mcq-opt">A pointer that changes every time the page is read into the buffer pool.</button>
+    <p class="mcq-explain">The id is (page id, slot), and the slot/line pointer indirects to the actual in-page byte offset, which can move on compaction without changing the id. CMU stresses applications cannot treat the id as a meaningful physical address.</p>
+  </div>
+
+  <div class="mcq" data-answer="3">
+    <p class="mcq-q">Which statement about NULL storage and column layout is false?</p>
+    <button class="mcq-opt">PostgreSQL marks NULLs with a bitmap in the tuple header, not a sentinel value.</button>
+    <button class="mcq-opt">A NULL column occupies no bytes in the tuple's data area.</button>
+    <button class="mcq-opt">Column order affects row size because of alignment padding (MAXALIGN).</button>
+    <button class="mcq-opt">Reordering columns can never change the on-disk size of a row.</button>
+    <button class="mcq-opt">The NULL bitmap appears only when HEAP_HASNULL is set in t_infomask.</button>
+    <p class="mcq-explain">Reordering columns can change row size: putting an 8-byte bigint after a 1-byte bool wastes pad bytes that disappear if you reorder. A sentinel cannot mark NULL because any sentinel could be a legal value, so a bitmap is used.</p>
+  </div>
+
+  <div class="mcq" data-answer="0">
+    <p class="mcq-q">Why does PostgreSQL keep three distinct notions of "page" (hardware ~4 KB, OS ~4 KB, database 8 KB)?</p>
+    <button class="mcq-opt">Because the device only writes one hardware page atomically, so a larger DB page risks a torn write that WAL full-page writes must defend against.</button>
+    <button class="mcq-opt">Because each layer compresses the one below it by a fixed ratio.</button>
+    <button class="mcq-opt">Because the OS page must always be larger than the database page.</button>
+    <button class="mcq-opt">Because the buffer pool requires all three sizes to be equal.</button>
+    <p class="mcq-explain">Atomicity is guaranteed only at the hardware-page granularity. When the 8 KB DB page exceeds the 4 KB hardware page, a crash mid-write can leave a torn page (half old, half new), which PostgreSQL defends against with full-page writes to the WAL.</p>
+  </div>
+
+  <div class="mcq" data-answer="2">
+    <p class="mcq-q">What does a plain VACUUM in PostgreSQL do?</p>
+    <button class="mcq-opt">Physically erases dead rows immediately when the DELETE commits.</button>
+    <button class="mcq-opt">Always returns the freed space to the operating system.</button>
+    <button class="mcq-opt">Marks dead-tuple space reusable in place, updates stats and the visibility map, and freezes old XIDs.</button>
+    <button class="mcq-opt">Takes an ACCESS EXCLUSIVE lock that blocks all access to the table.</button>
+    <p class="mcq-explain">Plain VACUUM reclaims dead space in place (rarely returning it to the OS), refreshes planner statistics, maintains the visibility map, and freezes old XIDs to prevent wraparound. VACUUM FULL is the one that rewrites the table and takes ACCESS EXCLUSIVE.</p>
+  </div>
+
+  <div class="mcq" data-answer="3">
+    <p class="mcq-q">A 5 KB text value is inserted into a PostgreSQL row. What happens?</p>
+    <button class="mcq-opt">The tuple spans two heap pages to hold the value inline.</button>
+    <button class="mcq-opt">The insert is rejected because rows cannot exceed the page size.</button>
+    <button class="mcq-opt">The value is truncated to fit the 8 KB page.</button>
+    <button class="mcq-opt">TOAST compresses and/or moves it out of line into a TOAST table in ~2000-byte chunks.</button>
+    <p class="mcq-explain">A tuple cannot span pages. Values past roughly 2 KB trigger TOAST, which compresses and/or pushes the value out of line into a separate TOAST table chunked at about 2000 bytes, up to 1 GB per field.</p>
+  </div>
+
+  <div class="mcq" data-answer="1">
+    <p class="mcq-q">SQLite reclaims free space inside one B-tree page using:</p>
+    <button class="mcq-opt">A separate _fsm fork file like PostgreSQL.</button>
+    <button class="mcq-opt">Freeblocks: a chained free list of gaps of at least 4 bytes, with 1-3 byte gaps counted as fragmented bytes.</button>
+    <button class="mcq-opt">A background VACUUM process that runs every few seconds automatically.</button>
+    <button class="mcq-opt">Tombstone markers carrying the deleting transaction id.</button>
+    <p class="mcq-explain">SQLite chains in-page freeblocks (4+ byte gaps); smaller 1-3 byte gaps are tallied as fragmented free bytes. The _fsm fork and MVCC tombstones are PostgreSQL mechanisms, and they track free space across pages, not within one.</p>
+  </div>
+
+  <!-- ================================================================= -->
+  <!-- 2. BUFFER                                                          -->
+  <!-- ================================================================= -->
+  <div class="topic-head" id="buffer">
+    <span class="wk">Weeks 4-5</span>
+    <h2>Buffer pool and replacement policies</h2>
+  </div>
+
+  <div class="mcq" data-answer="2">
+    <p class="mcq-q">Pinning a page in the buffer pool guarantees that:</p>
+    <button class="mcq-opt">No other transaction can read the page concurrently.</button>
+    <button class="mcq-opt">The page is written to disk immediately.</button>
+    <button class="mcq-opt">The page cannot be evicted while the pin count is greater than zero.</button>
+    <button class="mcq-opt">The page is marked dirty.</button>
+    <p class="mcq-explain">A pin only blocks eviction, not concurrent access; concurrency control via locks/latches is a separate mechanism. The dirty flag and write-back are independent of pinning.</p>
+  </div>
+
+  <div class="mcq" data-answer="0">
+    <p class="mcq-q">Which statement about the buffer pool is false?</p>
+    <button class="mcq-opt">The buffer pool is a write-through cache: every modification hits disk immediately.</button>
+    <button class="mcq-opt">A cache hit costs no disk I/O; a miss costs a read, plus a write if it evicts a dirty page.</button>
+    <button class="mcq-opt">The page table maps page id to a frame and is not persisted across restarts.</button>
+    <button class="mcq-opt">A clean victim can be dropped with no I/O; a dirty victim must be written back first.</button>
+    <p class="mcq-explain">The buffer pool is write-back, not write-through: modifications are buffered in memory and only flushed on eviction or by a background writer. The dirty flag exists precisely so writes are deferred.</p>
+  </div>
+
+  <div class="mcq" data-answer="3">
+    <p class="mcq-q">A large one-pass sequential scan evicts the hot working set under LRU/CLOCK. This is:</p>
+    <button class="mcq-opt">A deadlock.</button>
+    <button class="mcq-opt">A torn page.</button>
+    <button class="mcq-opt">Write amplification.</button>
+    <button class="mcq-opt">Sequential flooding (cache swamping).</button>
+    <p class="mcq-explain">The scan pages get the most-recent timestamps and push out genuinely hot pages they will never revisit. MRU or a bounded ring buffer is scan-resistant; PostgreSQL uses ring buffers (BufferAccessStrategy) for bulk operations.</p>
+  </div>
+
+  <div class="mcq" data-answer="1">
+    <p class="mcq-q">What is the Backward K-distance that LRU-K uses as its eviction key?</p>
+    <button class="mcq-opt">The total number of times a page has ever been referenced.</button>
+    <button class="mcq-opt">The distance back to the K-th most recent reference to the page (infinity if seen fewer than K times).</button>
+    <button class="mcq-opt">The number of dirty bytes on the page.</button>
+    <button class="mcq-opt">The forward distance to the page's next reference.</button>
+    <p class="mcq-explain">The victim is the page whose K-th most recent reference is furthest in the past (largest Backward K-distance). LRU-2 already measures an actual interarrival time, which defeats sequential flooding. The forward distance is Belady's MIN, which needs the future.</p>
+  </div>
+
+  <div class="mcq" data-answer="2">
+    <p class="mcq-q">PostgreSQL's buffer replacement algorithm is:</p>
+    <button class="mcq-opt">Plain LRU with a per-page timestamp.</button>
+    <button class="mcq-opt">Belady's MIN (optimal).</button>
+    <button class="mcq-opt">Clock-sweep with a usage_count that saturates at BM_MAX_USAGE_COUNT (5).</button>
+    <button class="mcq-opt">LRU-K with K fixed at 2.</button>
+    <p class="mcq-explain">PostgreSQL uses a clock-sweep variant: each buffer has a usage_count bumped on pin (capped at 5) and the nextVictimBuffer hand decrements counts, taking a buffer with zero pin and zero usage_count. Belady's MIN is only a theoretical bound; it needs the future reference string.</p>
+  </div>
+
+  <div class="mcq" data-answer="0">
+    <p class="mcq-q">PostgreSQL's shared_buffers documentation recommends about 25 percent of RAM and warns above ~40 percent rarely helps. Why?</p>
+    <button class="mcq-opt">PostgreSQL also relies on the OS page cache, so a huge pool double-buffers and starves that cache.</button>
+    <button class="mcq-opt">The clock hand cannot address more than 40 percent of memory.</button>
+    <button class="mcq-opt">usage_count overflows past that size.</button>
+    <button class="mcq-opt">Ring buffers cap the pool at 40 percent automatically.</button>
+    <p class="mcq-explain">PostgreSQL does not use direct I/O for its main reads, so a page can live in both shared_buffers and the OS page cache. Oversizing the pool wastes memory on double-buffering and shrinks the OS cache.</p>
+  </div>
+
+  <div class="mcq" data-answer="3">
+    <p class="mcq-q"><span class="combo">Combines topics</span> The steal + no-force buffer policy used by ARIES requires:</p>
+    <button class="mcq-opt">Neither undo nor redo, because nothing reaches disk until commit.</button>
+    <button class="mcq-opt">Only redo, because uncommitted pages never reach disk.</button>
+    <button class="mcq-opt">Only undo, because committed pages are always flushed at commit.</button>
+    <button class="mcq-opt">Both undo (steal can flush uncommitted pages) and redo (no-force can leave committed pages in memory).</button>
+    <p class="mcq-explain">Steal lets a dirty uncommitted page reach disk, so recovery must be able to UNDO it. No-force lets committed changes stay in memory at crash time, so recovery must REDO them. WAL makes the combination safe by ordering log before data.</p>
+  </div>
+
+  <!-- ================================================================= -->
+  <!-- 3. INDEXING                                                        -->
+  <!-- ================================================================= -->
+  <div class="topic-head" id="indexing">
+    <span class="wk">Weeks 6-7</span>
+    <h2>B+trees and hash indexes</h2>
+  </div>
+
+  <div class="mcq" data-answer="2">
+    <p class="mcq-q">Why does a disk DBMS use a B+tree instead of a balanced binary search tree?</p>
+    <button class="mcq-opt">Binary trees cannot store more than a few thousand keys.</button>
+    <button class="mcq-opt">B+trees need no balancing, so inserts are free.</button>
+    <button class="mcq-opt">High fanout per page collapses the height, minimizing block reads (the dominant disk cost) rather than comparisons.</button>
+    <button class="mcq-opt">Binary trees cannot answer equality queries.</button>
+    <button class="mcq-opt">B+trees keep all keys in RAM at all times.</button>
+    <p class="mcq-explain">The dominant cost on disk is page reads, not comparisons. Widening each node to hold hundreds of keys gives O(log_m N) I/Os with large m, so three or four levels index hundreds of millions of rows. A binary tree wastes a page read per single-bit branch.</p>
+  </div>
+
+  <div class="mcq" data-answer="1">
+    <p class="mcq-q">Which statement about B+trees is false?</p>
+    <button class="mcq-opt">All data entries live in the leaves; internal nodes hold only separator keys.</button>
+    <button class="mcq-opt">A B+tree stores record payloads in its internal nodes to speed up navigation.</button>
+    <button class="mcq-opt">Leaves are linked in key order so a range scan walks them sequentially.</button>
+    <button class="mcq-opt">The root may hold as few as one key; only non-root nodes obey the half-full rule.</button>
+    <p class="mcq-explain">A B+tree keeps all data in linked leaves; internal nodes route only. Storing records in internal nodes describes a plain B-tree. PostgreSQL nbtree and SQLite table b-trees are B+tree-shaped even though called "B-tree".</p>
+  </div>
+
+  <div class="mcq" data-answer="0">
+    <p class="mcq-q">On a leaf split in a B+tree, the separator key is:</p>
+    <button class="mcq-opt">Copied up into the parent, because the data must remain in the leaf.</button>
+    <button class="mcq-opt">Pushed up (removed from the child) into the parent.</button>
+    <button class="mcq-opt">Deleted entirely once the split completes.</button>
+    <button class="mcq-opt">Written to every leaf in the chain.</button>
+    <p class="mcq-explain">A leaf split copies the separator up because all data must stay in the leaf. The middle key is pushed up (moved, not copied) only on an internal-node split, where internal nodes route and need not retain a copy.</p>
+  </div>
+
+  <div class="mcq" data-answer="3">
+    <p class="mcq-q">When does a B+tree grow in height?</p>
+    <button class="mcq-opt">On every insert.</button>
+    <button class="mcq-opt">Whenever any leaf splits.</button>
+    <button class="mcq-opt">Whenever a node falls below half full.</button>
+    <button class="mcq-opt">Only when the root itself splits, allocating a new root above the two halves.</button>
+    <p class="mcq-explain">Height increases only when the root splits, which is why all leaves stay at the same depth and the tree grows from the top. Most inserts touch one leaf and stop.</p>
+  </div>
+
+  <div class="mcq" data-answer="2">
+    <p class="mcq-q">In extendible hashing, when does the directory double?</p>
+    <button class="mcq-opt">Every time any bucket overflows.</button>
+    <button class="mcq-opt">When the load factor exceeds a fixed round-robin threshold.</button>
+    <button class="mcq-opt">When a bucket whose local depth equals the global depth overflows and splits.</button>
+    <button class="mcq-opt">Never; the directory is fixed at creation.</button>
+    <p class="mcq-explain">If the splitting bucket's local depth equals the global depth, the directory doubles and global depth increments. If its local depth is below the global depth, two slots already point at it, so only the bucket splits with no doubling. The round-robin threshold describes linear hashing.</p>
+  </div>
+
+  <div class="mcq" data-answer="1">
+    <p class="mcq-q">A composite index on (a, b) can efficiently serve which predicate?</p>
+    <button class="mcq-opt">b = 5 alone.</button>
+    <button class="mcq-opt">a = 5 AND b > 10.</button>
+    <button class="mcq-opt">b BETWEEN 3 AND 9 with no constraint on a.</button>
+    <button class="mcq-opt">Any predicate on b regardless of a.</button>
+    <p class="mcq-explain">Composite keys are ordered lexicographically, so only a contiguous left prefix is seekable: a = ?, or a = ? AND b &gt; ?. Rows for a given b value are scattered across the key space, so b alone cannot be seeked.</p>
+  </div>
+
+  <div class="mcq" data-answer="3">
+    <p class="mcq-q">Which statement about PostgreSQL hash indexes and index-only scans is false?</p>
+    <button class="mcq-opt">PostgreSQL hash indexes became crash-safe in version 10 by adding WAL logging.</button>
+    <button class="mcq-opt">PostgreSQL hash indexes are single-column, equality-only, and do not enforce uniqueness.</button>
+    <button class="mcq-opt">An index-only scan still checks the visibility map and falls back to a heap fetch if the page is not all-visible.</button>
+    <button class="mcq-opt">An index-only scan never touches the heap or the visibility map under any circumstance.</button>
+    <p class="mcq-explain">An index-only scan must consult the visibility map; only when the heap page is all-visible can it skip the heap fetch. The other three claims are all true of PostgreSQL.</p>
+  </div>
+
+  <div class="mcq" data-answer="0">
+    <p class="mcq-q">A query needs all rows BETWEEN x AND y. Compared with a B+tree, a hash index:</p>
+    <button class="mcq-opt">Cannot serve the range and must scan every bucket, since hashing destroys key order.</button>
+    <button class="mcq-opt">Serves the range faster because it is O(1).</button>
+    <button class="mcq-opt">Returns the rows already sorted by key.</button>
+    <button class="mcq-opt">Uses its leaf links to walk the range sequentially.</button>
+    <p class="mcq-explain">A hash index has no ordering, so it cannot do ranges, ORDER BY, or prefix matches; it wins only on full-key equality. The B+tree descends once and walks linked leaves for the range.</p>
+  </div>
+
+  <!-- ================================================================= -->
+  <!-- 4. PARSING                                                         -->
+  <!-- ================================================================= -->
+  <div class="topic-head" id="parsing">
+    <span class="wk">Week 8</span>
+    <h2>Parsing and logical plans</h2>
+  </div>
+
+  <div class="mcq" data-answer="2">
+    <p class="mcq-q">Which task does the pure parser NOT perform?</p>
+    <button class="mcq-opt">Building a tree from the token stream using the grammar.</button>
+    <button class="mcq-opt">Recognizing keywords, identifiers, literals, and operators.</button>
+    <button class="mcq-opt">Checking that referenced tables and columns actually exist in the catalog.</button>
+    <button class="mcq-opt">Producing a raw parse tree where names are still strings.</button>
+    <p class="mcq-explain">The parser applies only fixed syntactic rules and makes no catalog lookups; existence and name resolution happen in the later analysis/binding stage. PostgreSQL splits them because catalog lookups need a transaction and raw parsing does not.</p>
+  </div>
+
+  <div class="mcq" data-answer="3">
+    <p class="mcq-q">Which statement about parser strategies is false?</p>
+    <button class="mcq-opt">Recursive descent is top-down (LL) and is usually hand-written.</button>
+    <button class="mcq-opt">LALR/LR parsers are bottom-up shift-reduce and handle left recursion natively.</button>
+    <button class="mcq-opt">A left-recursive rule sends a recursive-descent function into infinite recursion.</button>
+    <button class="mcq-opt">LALR parsers are top-down and recursive descent is bottom-up.</button>
+    <p class="mcq-explain">The directions are reversed: recursive descent is top-down (LL); LALR/LR is bottom-up. The other three statements are correct, including that left recursion must be refactored out of an LL grammar.</p>
+  </div>
+
+  <div class="mcq" data-answer="1">
+    <p class="mcq-q">View expansion happens in which stage?</p>
+    <button class="mcq-opt">The cost-based optimizer, weighing it against alternatives.</button>
+    <button class="mcq-opt">The rewrite stage, driven by catalog view definitions, before cost-based optimization.</button>
+    <button class="mcq-opt">The lexer, while discarding whitespace.</button>
+    <button class="mcq-opt">The executor, lazily as rows are produced.</button>
+    <p class="mcq-explain">View expansion is the rewriter's core job: it splices a view's underlying tables and predicates in, using only the query and catalog, never data or cost. PostgreSQL's rewrite system exists chiefly to realize views.</p>
+  </div>
+
+  <div class="mcq" data-answer="0">
+    <p class="mcq-q">Which is a property of a logical plan, not a physical plan?</p>
+    <button class="mcq-opt">It says "join", not which join algorithm to use.</button>
+    <button class="mcq-opt">It binds a join to nested-loop, hash, or merge.</button>
+    <button class="mcq-opt">It selects sequential scan versus index scan.</button>
+    <button class="mcq-opt">It specifies sort order and partitioning of operator output.</button>
+    <p class="mcq-explain">A logical plan is relational algebra and says what to compute. Binding algorithms and access paths (hash vs merge join, seq vs index scan) and physical properties is the physical plan's job, and there is no one-to-one mapping between the two.</p>
+  </div>
+
+  <div class="mcq" data-answer="2">
+    <p class="mcq-q">SQLite's parser is generated by Lemon rather than yacc because:</p>
+    <button class="mcq-opt">Lemon produces faster bytecode at runtime.</button>
+    <button class="mcq-opt">Lemon can read the catalog during parsing.</button>
+    <button class="mcq-opt">In Lemon the tokenizer calls the parser, which is reentrant and threadsafe, unlike yacc's global-variable design.</button>
+    <button class="mcq-opt">Lemon is a top-down LL parser and yacc is bottom-up.</button>
+    <p class="mcq-explain">Both generate LALR(1) parsers, but Lemon inverts the call direction (tokenizer calls parser), making it reentrant and threadsafe. SQLite needs reentrancy because it parses recursively, for example re-invoking the parser to insert into sqlite_schema.</p>
+  </div>
+
+  <!-- ================================================================= -->
+  <!-- 5. EXECUTION                                                       -->
+  <!-- ================================================================= -->
+  <div class="topic-head" id="execution">
+    <span class="wk">Weeks 9-10</span>
+    <h2>Query execution and joins</h2>
+  </div>
+
+  <div class="mcq" data-answer="1">
+    <p class="mcq-q">In the Volcano iterator model, control and data flow as:</p>
+    <button class="mcq-opt">Producers push tuples up to their parents' processing functions.</button>
+    <button class="mcq-opt">The consumer pulls by calling next(); control flows down, tuples flow up, one tuple per call.</button>
+    <button class="mcq-opt">Every operator materializes its full output before the next runs.</button>
+    <button class="mcq-opt">Operators run in parallel with no defined order.</button>
+    <p class="mcq-explain">Volcano is pull/demand driven: open/next/close, with parents pulling from children one tuple at a time. Push (producer-driven) is the opposite model and the basis of query compilation.</p>
+  </div>
+
+  <div class="mcq" data-answer="3">
+    <p class="mcq-q">Which statement about hash join is false?</p>
+    <button class="mcq-opt">You build the hash table on the smaller input so it is more likely to fit in memory.</button>
+    <button class="mcq-opt">It works only for equi-joins on the full join key.</button>
+    <button class="mcq-opt">Grace hash join costs about 3 times (M + N): partition then probe.</button>
+    <button class="mcq-opt">Hash join can evaluate a range condition like R.a &lt; S.b by bucketing.</button>
+    <p class="mcq-explain">There is no hash that turns an inequality into bucket equality, so range/inequality joins fall back to nested loop or merge. The other three are correct, including building on the smaller side and the 3(M+N) grace cost.</p>
+  </div>
+
+  <div class="mcq" data-answer="0">
+    <p class="mcq-q">Block nested loop join rereads the inner table:</p>
+    <button class="mcq-opt">Once per outer block, so more buffer frames cut its cost.</button>
+    <button class="mcq-opt">Once per outer tuple, like the naive form.</button>
+    <button class="mcq-opt">Exactly once regardless of buffer count.</button>
+    <button class="mcq-opt">Never, because it uses an index on the inner.</button>
+    <p class="mcq-explain">Block nested loop reads S once per outer block (cost M + ceil(M/(B-2))*N), so giving the outer more buffer frames directly reduces the rereads. Once-per-outer-tuple is the naive form; once-per-tuple-with-an-index is index nested loop.</p>
+  </div>
+
+  <div class="mcq" data-answer="2">
+    <p class="mcq-q">External merge sort over N pages with B buffers takes how many passes?</p>
+    <button class="mcq-opt">Always exactly one pass.</button>
+    <button class="mcq-opt">N passes.</button>
+    <button class="mcq-opt">1 + ceil(log_{B-1}(ceil(N / B))) passes.</button>
+    <button class="mcq-opt">log_2(N) passes independent of B.</button>
+    <p class="mcq-explain">The "1 +" is run generation; the log term is the merge passes, with fan-in B-1. One pass happens only when the data fits in B pages; two passes is the common case. More buffers cut passes logarithmically.</p>
+  </div>
+
+  <div class="mcq" data-answer="3">
+    <p class="mcq-q">Which operator is a pipeline breaker (must consume all input before emitting any output)?</p>
+    <button class="mcq-opt">Filter (selection).</button>
+    <button class="mcq-opt">Projection.</button>
+    <button class="mcq-opt">The probe phase of a hash join.</button>
+    <button class="mcq-opt">Sort.</button>
+    <p class="mcq-explain">Sort cannot emit the first sorted tuple until it has seen the last input tuple, so it is a pipeline breaker, as is the build side of a hash join and aggregation. Filter, projection, and the probe phase are streaming with bounded state.</p>
+  </div>
+
+  <div class="mcq" data-answer="1">
+    <p class="mcq-q">Sort-merge join must sort both inputs:</p>
+    <button class="mcq-opt">Always, with no exception.</button>
+    <button class="mcq-opt">Not if an input already arrives sorted on the join key, in which case only the M + N merge remains.</button>
+    <button class="mcq-opt">Only when the join key is unique.</button>
+    <button class="mcq-opt">Only when both tables fit in memory.</button>
+    <p class="mcq-explain">If an input arrives sorted on the join key (clustered index scan, prior sort, or an upstream ORDER BY), that sort cost is zero and you keep only the merge. Merge join is also attractive when the output needs to be sorted on the join key anyway.</p>
+  </div>
+
+  <div class="mcq" data-answer="0">
+    <p class="mcq-q">SQLite implements joins as:</p>
+    <button class="mcq-opt">Nested loops only; an index on the inner table turns the inner loop into an index nested loop.</button>
+    <button class="mcq-opt">Hash joins for large tables and merge joins when sorted.</button>
+    <button class="mcq-opt">Grace hash join with partition spilling.</button>
+    <button class="mcq-opt">Sort-merge join exclusively.</button>
+    <p class="mcq-explain">SQLite only ever does nested-loop joins, executed by its VDBE bytecode. It makes them fast through indexes and a polynomial-time join-ordering algorithm. It has no hash or merge join.</p>
+  </div>
+
+  <div class="mcq" data-answer="2">
+    <p class="mcq-q"><span class="combo">Combines topics</span> Hash aggregation for GROUP BY, versus sort-based aggregation, produces output that is:</p>
+    <button class="mcq-opt">Always sorted by the group key.</button>
+    <button class="mcq-opt">Sorted only if the input was sorted.</button>
+    <button class="mcq-opt">In no particular order, whereas sort-based aggregation comes out sorted on the key.</button>
+    <button class="mcq-opt">Reverse-sorted by the aggregate value.</button>
+    <p class="mcq-explain">Hash aggregation builds a hash table keyed on the group, so output order is arbitrary; sort-based aggregation sorts first and emits groups in key order. Hash aggregation wins when distinct groups are few; PostgreSQL can spill it to disk since version 13.</p>
+  </div>
+
+  <!-- ================================================================= -->
+  <!-- 6. OPTIMIZATION                                                    -->
+  <!-- ================================================================= -->
+  <div class="topic-head" id="optimization">
+    <span class="wk">Week 11</span>
+    <h2>Query optimization</h2>
+  </div>
+
+  <div class="mcq" data-answer="3">
+    <p class="mcq-q">The optimizer's cost number is measured in:</p>
+    <button class="mcq-opt">Seconds of wall-clock time.</button>
+    <button class="mcq-opt">Bytes of memory.</button>
+    <button class="mcq-opt">Number of result rows.</button>
+    <button class="mcq-opt">Abstract units (a weighted blend of page fetches and CPU work); only relative ordering matters.</button>
+    <p class="mcq-explain">System R's COST = PAGE FETCHES + W * RSI CALLS is a unitless weighted sum, and PostgreSQL uses abstract cost units. The goal is correct relative ranking of plans, not an accurate absolute time.</p>
+  </div>
+
+  <div class="mcq" data-answer="0">
+    <p class="mcq-q">Under the independence assumption, the selectivity of pred1 AND pred2 is:</p>
+    <button class="mcq-opt">F(pred1) * F(pred2).</button>
+    <button class="mcq-opt">F(pred1) + F(pred2).</button>
+    <button class="mcq-opt">max(F(pred1), F(pred2)).</button>
+    <button class="mcq-opt">F(pred1) + F(pred2) - F(pred1)*F(pred2).</button>
+    <p class="mcq-explain">ANDed selectivities multiply under independence; the last option (the inclusion-exclusion form) is the OR rule. Multiplying is exactly what fails on correlated columns, causing large underestimates.</p>
+  </div>
+
+  <div class="mcq" data-answer="2">
+    <p class="mcq-q">Which statement about histograms is false?</p>
+    <button class="mcq-opt">Equi-width buckets have equal value ranges and unequal row counts.</button>
+    <button class="mcq-opt">Equi-depth buckets have equal row counts and unequal value ranges.</button>
+    <button class="mcq-opt">Equi-width histograms handle skew better, which is why PostgreSQL prefers them.</button>
+    <button class="mcq-opt">PostgreSQL keeps a separate most-common-values list for spikes plus an equi-depth histogram for the tail.</button>
+    <p class="mcq-explain">Equi-depth handles skew far better, which is why PostgreSQL uses it; equi-width dumps most rows into one bucket on skewed data. The MCV list captures the spikes and the histogram covers the smooth tail.</p>
+  </div>
+
+  <div class="mcq" data-answer="1">
+    <p class="mcq-q">The System R / Selinger join search restricts the plan space to:</p>
+    <button class="mcq-opt">Bushy trees, to expose the most plans.</button>
+    <button class="mcq-opt">Left-deep trees, so one pipelined composite stays in flight.</button>
+    <button class="mcq-opt">Right-deep trees only.</button>
+    <button class="mcq-opt">Star schemas only.</button>
+    <p class="mcq-explain">System R restricts to left-deep trees (each join's inner input is a base relation) and uses dynamic programming over subsets of relations, keeping the cheapest plan per subset plus per interesting order. Bushy plans exist in some modern systems but were excluded.</p>
+  </div>
+
+  <div class="mcq" data-answer="3">
+    <p class="mcq-q">In PostgreSQL, n_distinct = -1 for a column means:</p>
+    <button class="mcq-opt">The statistic is missing or unknown.</button>
+    <button class="mcq-opt">The column is entirely NULL.</button>
+    <button class="mcq-opt">There is exactly one distinct value in the column.</button>
+    <button class="mcq-opt">The column is fully distinct (one distinct value per row), encoded as a fraction so it survives table growth.</button>
+    <p class="mcq-explain">A negative n_distinct expresses the distinct count as a fraction of table size; -1 means every value is distinct. The negative encoding keeps the estimate valid as the table grows.</p>
+  </div>
+
+  <div class="mcq" data-answer="0">
+    <p class="mcq-q">When does PostgreSQL switch from exhaustive DP join search to the genetic optimizer (GEQO)?</p>
+    <button class="mcq-opt">When the FROM list reaches geqo_threshold (default 12) items.</button>
+    <button class="mcq-opt">Whenever any table has more than 12 columns.</button>
+    <button class="mcq-opt">Only when an index is missing.</button>
+    <button class="mcq-opt">Never; PostgreSQL always uses DP.</button>
+    <p class="mcq-explain">Below geqo_threshold (default 12) PostgreSQL runs near-exhaustive DP; at or above it the factorial growth of join orders forces the genetic, non-exhaustive heuristic search.</p>
+  </div>
+
+  <div class="mcq" data-answer="2">
+    <p class="mcq-q">Which is NOT a heuristic rewrite applied unconditionally (rather than costed)?</p>
+    <button class="mcq-opt">Predicate pushdown.</button>
+    <button class="mcq-opt">Projection pushdown.</button>
+    <button class="mcq-opt">Choosing hash join over merge join.</button>
+    <button class="mcq-opt">Join elimination.</button>
+    <p class="mcq-explain">Pushdowns and join elimination are semantics-preserving rewrites applied because they are essentially always beneficial. Choosing a join algorithm is a cost-based physical decision, not an unconditional rewrite.</p>
+  </div>
+
+  <!-- ================================================================= -->
+  <!-- 7. TRANSACTIONS                                                    -->
+  <!-- ================================================================= -->
+  <div class="topic-head" id="transactions">
+    <span class="wk">Week 12</span>
+    <h2>Transactions, ACID, and isolation</h2>
+  </div>
+
+  <div class="mcq" data-answer="1">
+    <p class="mcq-q">A schedule is conflict-serializable if and only if:</p>
+    <button class="mcq-opt">It contains no write-write conflicts.</button>
+    <button class="mcq-opt">Its precedence (conflict) graph is acyclic.</button>
+    <button class="mcq-opt">Every transaction commits before any other begins.</button>
+    <button class="mcq-opt">It uses two-phase locking.</button>
+    <p class="mcq-explain">Conflict serializability holds exactly when the precedence graph is acyclic; any topological sort is then an equivalent serial order. 2PL is a sufficient way to guarantee acyclicity, not the definition.</p>
+  </div>
+
+  <div class="mcq" data-answer="3">
+    <p class="mcq-q">The difference between a phantom and a non-repeatable read is:</p>
+    <button class="mcq-opt">They are the same anomaly.</button>
+    <button class="mcq-opt">A phantom is a dirty read of uncommitted data.</button>
+    <button class="mcq-opt">A non-repeatable read needs predicate locking to prevent.</button>
+    <button class="mcq-opt">A non-repeatable read is a changed value of an already-seen row; a phantom is a changed set of rows matching a predicate.</button>
+    <p class="mcq-explain">A phantom is an insert or delete that changes which rows match a predicate, so preventing it needs predicate or gap locking, not just row locks. That is why Repeatable Read (which forbids P2) can still allow P3 in the ANSI standard.</p>
+  </div>
+
+  <div class="mcq" data-answer="2">
+    <p class="mcq-q">Snapshot isolation permits which anomaly that makes it not serializable?</p>
+    <button class="mcq-opt">Dirty read.</button>
+    <button class="mcq-opt">Lost update.</button>
+    <button class="mcq-opt">Write skew.</button>
+    <button class="mcq-opt">Non-repeatable read.</button>
+    <p class="mcq-explain">First-Committer-Wins only catches write-write conflicts on the same item. Write skew is two transactions writing different items after reading an overlapping set, so there is no write-write conflict to catch, yet the precedence graph has a cycle.</p>
+  </div>
+
+  <div class="mcq" data-answer="0">
+    <p class="mcq-q">Which statement about the ANSI levels and snapshot isolation is false?</p>
+    <button class="mcq-opt">Snapshot isolation is simply a stronger Repeatable Read, sitting one rung above it.</button>
+    <button class="mcq-opt">SI is incomparable with Repeatable Read: it blocks phantoms RR allows but permits write skew.</button>
+    <button class="mcq-opt">ANSI levels are defined by which phenomena they forbid, not by which locking they use.</button>
+    <button class="mcq-opt">Dirty write (P0) must be forbidden at every level, otherwise rollback is ill-defined.</button>
+    <p class="mcq-explain">SI is incomparable with Repeatable Read, not strictly above it: it forbids phantoms that RR allows yet permits write skew that Serializable forbids. PostgreSQL labeling its SI level "Repeatable Read" fuels this confusion.</p>
+  </div>
+
+  <div class="mcq" data-answer="3">
+    <p class="mcq-q">In two-phase locking, the two phases are:</p>
+    <button class="mcq-opt">Read phase, then write phase.</button>
+    <button class="mcq-opt">Lock phase, then do-work phase.</button>
+    <button class="mcq-opt">Prepare phase, then commit phase.</button>
+    <button class="mcq-opt">Growing (acquire only), then shrinking (release only).</button>
+    <p class="mcq-explain">2PL means no lock may be acquired after the first release; work happens throughout. Prepare/commit is two-phase commit, a distributed protocol, not 2PL. Plain 2PL still allows cascading aborts; you need strict 2PL for cascadelessness.</p>
+  </div>
+
+  <div class="mcq" data-answer="1">
+    <p class="mcq-q">PostgreSQL's Read Uncommitted level:</p>
+    <button class="mcq-opt">Lets you read uncommitted (dirty) data.</button>
+    <button class="mcq-opt">Behaves identically to Read Committed, so dirty reads are impossible.</button>
+    <button class="mcq-opt">Is the default isolation level.</button>
+    <button class="mcq-opt">Is implemented as Serializable Snapshot Isolation.</button>
+    <p class="mcq-explain">PostgreSQL exposes four levels but implements three; Read Uncommitted maps to Read Committed, so dirty reads never occur at any level. Read Committed is the default; Serializable is SSI.</p>
+  </div>
+
+  <!-- ================================================================= -->
+  <!-- 8. CONCURRENCY                                                     -->
+  <!-- ================================================================= -->
+  <div class="topic-head" id="concurrency">
+    <span class="wk">Week 13</span>
+    <h2>Concurrency control: 2PL, deadlock, MVCC</h2>
+  </div>
+
+  <div class="mcq" data-answer="2">
+    <p class="mcq-q">Strict 2PL differs from rigorous 2PL in that:</p>
+    <button class="mcq-opt">Strict 2PL holds no locks until commit.</button>
+    <button class="mcq-opt">They are identical.</button>
+    <button class="mcq-opt">Strict holds only exclusive locks until commit; rigorous holds both shared and exclusive locks until commit.</button>
+    <button class="mcq-opt">Rigorous 2PL allows cascading aborts but strict does not.</button>
+    <p class="mcq-explain">Strict 2PL holds write (X) locks to commit, preventing dirty reads and cascading aborts. Rigorous additionally holds read (S) locks to commit, which makes the serialization order equal the commit order.</p>
+  </div>
+
+  <div class="mcq" data-answer="3">
+    <p class="mcq-q">In the wait-die deadlock-prevention scheme:</p>
+    <button class="mcq-opt">The older transaction aborts.</button>
+    <button class="mcq-opt">It builds a waits-for graph and aborts a cycle victim.</button>
+    <button class="mcq-opt">The older transaction preempts (wounds) the holder.</button>
+    <button class="mcq-opt">The older transaction waits; a younger requester dies (aborts and restarts with its original timestamp).</button>
+    <p class="mcq-explain">Wait-die is a prevention scheme: older waits, younger dies. No waits-for graph is built (that is detection). Reusing the original timestamp on restart guarantees liveness. Wound-wait is the preemptive variant.</p>
+  </div>
+
+  <div class="mcq" data-answer="0">
+    <p class="mcq-q">A latch differs from a lock in that:</p>
+    <button class="mcq-opt">A latch is a short-duration mutex protecting in-memory structures, not transaction-scoped and not tracked for deadlock.</button>
+    <button class="mcq-opt">A latch is held for the entire transaction.</button>
+    <button class="mcq-opt">A latch is logical and a lock is physical.</button>
+    <button class="mcq-opt">A latch is always exclusive and a lock is always shared.</button>
+    <p class="mcq-explain">Latches are short physical mutexes guarding shared structures like the lock table; locks are logical, transaction-duration, and deadlock-detectable. Confusing the two is a common exam point.</p>
+  </div>
+
+  <div class="mcq" data-answer="2">
+    <p class="mcq-q">Which statement about MVCC is false?</p>
+    <button class="mcq-opt">Under MVCC reading never blocks writing and writing never blocks reading.</button>
+    <button class="mcq-opt">Writers must still be serialized against each other by locks, timestamp ordering, or OCC.</button>
+    <button class="mcq-opt">A long-running reader blocks writers until it finishes.</button>
+    <button class="mcq-opt">A long reader holds back garbage collection by keeping an old snapshot alive.</button>
+    <p class="mcq-explain">The whole point of MVCC is that a long reader does not block writers; instead it holds back garbage collection, which is a space problem, not a blocking one. MVCC removes read-write blocking but writers still need serializing.</p>
+  </div>
+
+  <div class="mcq" data-answer="1">
+    <p class="mcq-q">An UPDATE in PostgreSQL:</p>
+    <button class="mcq-opt">Modifies the row in place and overwrites t_xmin.</button>
+    <button class="mcq-opt">Writes a new tuple version and stamps the old version's t_xmax with the updating XID.</button>
+    <button class="mcq-opt">Deletes the row and waits for VACUUM before inserting the new value.</button>
+    <button class="mcq-opt">Locks the entire table for the duration.</button>
+    <p class="mcq-explain">PostgreSQL does delete-plus-insert: a new version is written and the old version's t_xmax is set, with t_ctid forming the update chain. This append-only MVCC is why heavy updates bloat tables and why VACUUM is needed.</p>
+  </div>
+
+  <div class="mcq" data-answer="3">
+    <p class="mcq-q"><span class="combo">Combines topics</span> Transaction id wraparound in PostgreSQL is dangerous because:</p>
+    <button class="mcq-opt">The 64-bit XID counter overflows after a few minutes.</button>
+    <button class="mcq-opt">It corrupts the B+tree index structure.</button>
+    <button class="mcq-opt">It causes the buffer pool to double-buffer pages.</button>
+    <button class="mcq-opt">The 32-bit XID counter laps after ~4 billion transactions, making old committed rows appear to be in the future; VACUUM freezing prevents it.</button>
+    <p class="mcq-explain">XIDs are 32-bit and compared modulo 2^32, so old rows can suddenly look "newer" than live transactions, causing silent data loss. VACUUM marks old all-visible tuples as frozen (FrozenTransactionId is always older than any normal XID), and every table must be vacuumed within two billion transactions.</p>
+  </div>
+
+  <div class="mcq" data-answer="0">
+    <p class="mcq-q">PostgreSQL handles deadlocks by:</p>
+    <button class="mcq-opt">Detection: it automatically finds a deadlock and aborts one of the involved transactions.</button>
+    <button class="mcq-opt">Prevention with wound-wait timestamps.</button>
+    <button class="mcq-opt">Making deadlocks impossible via MVCC.</button>
+    <button class="mcq-opt">Letting both transactions wait forever.</button>
+    <p class="mcq-explain">PostgreSQL detects deadlocks via a waits-for cycle search and aborts a victim; it does not prevent them and does not let you predict the victim. MVCC removes read-write conflicts but writers can still deadlock.</p>
+  </div>
+
+  <!-- ================================================================= -->
+  <!-- 9. RECOVERY                                                        -->
+  <!-- ================================================================= -->
+  <div class="topic-head" id="recovery">
+    <span class="wk">Week 14</span>
+    <h2>Write-ahead logging and ARIES recovery</h2>
+  </div>
+
+  <div class="mcq" data-answer="2">
+    <p class="mcq-q">The write-ahead logging (WAL) rule states that:</p>
+    <button class="mcq-opt">Data pages are written to disk before their log records.</button>
+    <button class="mcq-opt">The log is written only at checkpoint time.</button>
+    <button class="mcq-opt">A change's log record must reach disk before the corresponding dirty data page is flushed.</button>
+    <button class="mcq-opt">Commit need not force any log record to disk.</button>
+    <p class="mcq-explain">WAL orders the log before the data: the log record describing a change must be durable before the dirty page it describes can be written. This is what makes the steal + no-force buffer policy safe to recover. PostgreSQL enforces it at the page level via pd_lsn.</p>
+  </div>
+
+  <div class="mcq" data-answer="1">
+    <p class="mcq-q">ARIES recovery runs its three phases in which order?</p>
+    <button class="mcq-opt">Undo, Redo, Analysis.</button>
+    <button class="mcq-opt">Analysis, Redo, Undo.</button>
+    <button class="mcq-opt">Redo, Analysis, Undo.</button>
+    <button class="mcq-opt">Analysis, Undo, Redo.</button>
+    <p class="mcq-explain">ARIES runs Analysis (rebuild the dirty page table and transaction table from the last checkpoint), then Redo (repeat history, replaying all logged changes), then Undo (roll back losers). Redo repeats history even for transactions that will be undone, which is the ARIES signature.</p>
+  </div>
+
+  <div class="mcq" data-answer="3">
+    <p class="mcq-q">Why does ARIES use a "repeat history" redo that replays even changes made by transactions that ultimately aborted?</p>
+    <button class="mcq-opt">To save disk space in the log.</button>
+    <button class="mcq-opt">Because undo is impossible otherwise.</button>
+    <button class="mcq-opt">To avoid writing any checkpoints.</button>
+    <button class="mcq-opt">To restore the exact pre-crash state so that undo (logged as compensation records) operates on a known, consistent starting point.</button>
+    <p class="mcq-explain">ARIES first redoes everything to reconstruct the precise state at crash time, then undoes losers. Undo actions are themselves logged as compensation log records (CLRs) so that a crash during recovery does not undo work twice; CLRs are redo-only and carry an UndoNextLSN to skip already-undone work.</p>
+  </div>
+
+  <div class="mcq" data-answer="0">
+    <p class="mcq-q">A log sequence number (LSN) stored in a page header (PostgreSQL's pd_lsn) lets the recovery manager:</p>
+    <button class="mcq-opt">Skip redo of a logged change when the page's LSN is already at or past that log record (the change is already on the page).</button>
+    <button class="mcq-opt">Compute the page's checksum.</button>
+    <button class="mcq-opt">Decide the buffer eviction order.</button>
+    <button class="mcq-opt">Find the tuple's primary key.</button>
+    <p class="mcq-explain">Comparing the page LSN against a log record's LSN tells redo whether the change is already reflected on the page, so it can be skipped. The same pd_lsn enforces WAL: the buffer manager will not flush a page until the WAL up to its LSN is durable.</p>
+  </div>
+
+  <div class="mcq" data-answer="2">
+    <p class="mcq-q">A fuzzy checkpoint in ARIES is preferred over a sharp (quiescent) checkpoint because:</p>
+    <button class="mcq-opt">It forces every dirty page to disk before continuing.</button>
+    <button class="mcq-opt">It requires no log records at all.</button>
+    <button class="mcq-opt">It records the dirty page table and active transactions without halting transactions or flushing all dirty pages.</button>
+    <button class="mcq-opt">It eliminates the need for an Analysis phase.</button>
+    <p class="mcq-explain">A fuzzy checkpoint snapshots the dirty page table and transaction table without stopping transactions or forcing all dirty pages, so it is cheap and non-blocking. The recoveryLSN of the oldest dirty page bounds where redo must begin.</p>
+  </div>
+
+  <div class="mcq" data-answer="1">
+    <p class="mcq-q"><span class="combo">Combines topics</span> SQLite's rollback-journal mode and its WAL mode differ in that:</p>
+    <button class="mcq-opt">Rollback-journal allows many concurrent writers; WAL allows only one.</button>
+    <button class="mcq-opt">Rollback-journal writes a before-image undo journal and overwrites the main file; WAL appends new pages and a commit record, giving readers a snapshot while one writer appends.</button>
+    <button class="mcq-opt">WAL writes undo information; rollback-journal writes redo information.</button>
+    <button class="mcq-opt">Both forbid readers while a writer is active.</button>
+    <p class="mcq-explain">Rollback-journal keeps a before-image so an abort or crash can restore the original file, which it modifies in place. WAL appends changes (commit = append a commit record), so readers see a consistent snapshot via end marks while a single writer appends; a checkpoint later moves pages back into the main file.</p>
+  </div>
+
+  <!-- ================================================================= -->
+  <!-- 10. MODERN                                                         -->
+  <!-- ================================================================= -->
+  <div class="topic-head" id="modern">
+    <span class="wk">Weeks 15-16</span>
+    <h2>Modern and distributed architectures</h2>
+  </div>
+
+  <div class="mcq" data-answer="3">
+    <p class="mcq-q">Which statement comparing LSM trees and B+trees is false?</p>
+    <button class="mcq-opt">An LSM tree turns small random writes into large sequential ones via the memtable and immutable SSTables.</button>
+    <button class="mcq-opt">An LSM read may probe multiple SSTables, which is read amplification.</button>
+    <button class="mcq-opt">A B+tree is better for read-heavy and point-lookup workloads.</button>
+    <button class="mcq-opt">LSM trees are strictly faster than B+trees on every workload.</button>
+    <button class="mcq-opt">Compaction in an LSM tree consumes background I/O and CPU.</button>
+    <p class="mcq-explain">LSM trees optimize writes at the cost of read and space amplification plus compaction overhead; the right choice is workload-dependent, not universal. The other claims are all true.</p>
+  </div>
+
+  <div class="mcq" data-answer="0">
+    <p class="mcq-q">Leveled compaction versus tiered (size-tiered) compaction:</p>
+    <button class="mcq-opt">Leveled minimizes space and read amplification at higher write amplification; tiered minimizes write amplification at higher read and space amplification.</button>
+    <button class="mcq-opt">Leveled minimizes write amplification; tiered minimizes read amplification.</button>
+    <button class="mcq-opt">Both minimize all three amplifications at once.</button>
+    <button class="mcq-opt">They are identical policies with different names.</button>
+    <p class="mcq-explain">You cannot minimize read, write, and space amplification all at once (the RUM conjecture). Leveled keeps one sorted run per level (low read/space, write amp often >10 in RocksDB); tiered keeps several runs per level (low write, higher read/space).</p>
+  </div>
+
+  <div class="mcq" data-answer="2">
+    <p class="mcq-q">Which statement about Bloom filters is false?</p>
+    <button class="mcq-opt">A Bloom filter never produces false negatives.</button>
+    <button class="mcq-opt">A "definitely not" answer lets an LSM read skip an SSTable with zero I/O.</button>
+    <button class="mcq-opt">You can delete a key from a standard Bloom filter by clearing its bits.</button>
+    <button class="mcq-opt">More bits per key lowers the false-positive rate.</button>
+    <p class="mcq-explain">Clearing a bit might clear one shared with another key, introducing false negatives, so standard Bloom filters are not deletable (you need a counting Bloom filter). The no-false-negative property is exactly what makes them safe for skipping SSTables.</p>
+  </div>
+
+  <div class="mcq" data-answer="1">
+    <p class="mcq-q">Columnar (DSM) storage wins over row (NSM) storage for:</p>
+    <button class="mcq-opt">Point insert/update/delete of a whole tuple.</button>
+    <button class="mcq-opt">OLAP scans that read a few columns of a wide table and aggregate, because only those column segments are read and they compress well.</button>
+    <button class="mcq-opt">Fetching one entire row by primary key.</button>
+    <button class="mcq-opt">Workloads with no analytic queries at all.</button>
+    <p class="mcq-explain">A column-store reads only the columns a scan touches, compresses each column far better (one type, often sorted), and feeds vectorized scans. Row-stores still win OLTP single-row access, which a column-store would scatter across many segments.</p>
+  </div>
+
+  <div class="mcq" data-answer="3">
+    <p class="mcq-q">Vectorized execution in DuckDB means:</p>
+    <button class="mcq-opt">Compiling the query to machine code via LLVM.</button>
+    <button class="mcq-opt">Running each operator on one tuple at a time.</button>
+    <button class="mcq-opt">Storing data as rows for fast OLTP.</button>
+    <button class="mcq-opt">Processing a batch (vector, default 2048 values) per operator call to amortize interpreter overhead.</button>
+    <p class="mcq-explain">DuckDB queries are still interpreted; vectorization processes a vector of values per call, which is distinct from query compilation. The default STANDARD_VECTOR_SIZE is 2048.</p>
+  </div>
+
+  <div class="mcq" data-answer="0">
+    <p class="mcq-q">Which statement about partitioning (sharding) is false?</p>
+    <button class="mcq-opt">Hash partitioning supports efficient range queries because it preserves key order.</button>
+    <button class="mcq-opt">Hash partitioning spreads load evenly but a range query must fan out to all shards.</button>
+    <button class="mcq-opt">Range partitioning supports ordered scans but can hotspot on monotonically increasing keys.</button>
+    <button class="mcq-opt">PostgreSQL declarative partitioning splits a table within one server, not across machines.</button>
+    <p class="mcq-explain">Hashing destroys key order, so a range query must scan every shard; hash partitioning does not support efficient ranges. The trade-off mirrors hash index versus B+tree at the cluster level.</p>
+  </div>
+
+  <div class="mcq" data-answer="2">
+    <p class="mcq-q">The "C" in the CAP theorem refers to:</p>
+    <button class="mcq-opt">The ACID consistency that preserves integrity constraints.</button>
+    <button class="mcq-opt">Compression of replicated data.</button>
+    <button class="mcq-opt">Linearizability: every read returns the most recent completed write.</button>
+    <button class="mcq-opt">Commit ordering across shards.</button>
+    <p class="mcq-explain">CAP consistency is linearizability, a property of distributed reads/writes, distinct from ACID consistency (integrity-constraint preservation). Conflating the two is a classic exam trap.</p>
+  </div>
+
+  <div class="mcq" data-answer="1">
+    <p class="mcq-q">The blocking problem of two-phase commit (2PC) is that:</p>
+    <button class="mcq-opt">Phase 1 never terminates.</button>
+    <button class="mcq-opt">If the coordinator crashes after participants prepare, prepared participants are stuck in-doubt holding locks until it recovers.</button>
+    <button class="mcq-opt">Participants can unilaterally commit once they vote yes.</button>
+    <button class="mcq-opt">It requires a synchronous network with bounded delay to be safe.</button>
+    <button class="mcq-opt">It can never guarantee atomicity across nodes.</button>
+    <p class="mcq-explain">A participant that voted yes cannot decide alone; if the coordinator dies before delivering the decision, it blocks in-doubt holding locks. 3PC reduces this only under synchronous-network assumptions; production systems replicate the coordinator's decision log with consensus instead.</p>
+  </div>
+
+  <div class="mcq" data-answer="3">
+    <p class="mcq-q"><span class="combo">Combines topics</span> A quorum system with N replicas guarantees a read sees the latest acknowledged write when:</p>
+    <button class="mcq-opt">W = 1 and R = 1 always.</button>
+    <button class="mcq-opt">W + R &lt; N.</button>
+    <button class="mcq-opt">Only with a strict majority on each side.</button>
+    <button class="mcq-opt">W + R &gt; N, so the read and write sets overlap in at least one node.</button>
+    <p class="mcq-explain">W + R > N forces the read quorum and write quorum to share a node, so a read sees the latest write. This need not be a strict majority on each side, for example N=3, W=3, R=1 also works. Synchronous vs asynchronous replication is the PACELC latency-vs-consistency knob.</p>
+  </div>
+
+  <div class="mcq" data-answer="0">
+    <p class="mcq-q">Raft and Multi-Paxos differ mainly in that:</p>
+    <button class="mcq-opt">Raft is designed for understandability but gives a result equivalent to Multi-Paxos.</button>
+    <button class="mcq-opt">Raft gives weaker consistency guarantees than Paxos.</button>
+    <button class="mcq-opt">Raft needs all nodes to agree, while Paxos needs only one.</button>
+    <button class="mcq-opt">Raft cannot tolerate any node failures.</button>
+    <p class="mcq-explain">Raft was designed to be more understandable (leader election, log replication, safety) but produces the same guarantee as Multi-Paxos: an entry commits once a majority stores it, and a 5-node cluster survives 2 failures. The difference is pedagogical and structural, not in the guarantee.</p>
+  </div>
+
+  <!-- ===== PRIMARY SOURCE ===== -->
+  <div class="source-box">
+    <div class="src-tag">How to use this bank</div>
+    <div class="src-title">Answer first, then read the explanation; print for the full key</div>
+    <p class="muted">Each explanation names the trap in the wrong options. When you miss one, jump back to the
+    lesson it came from using the footer links below, then come back and re-try the item. Printing this
+    page expands every explanation into a complete answer key.</p>
+  </div>
+
+  <!-- ===== ASK YOUR TEACHER ===== -->
+  <div class="ask-teacher">
+    <div class="at-tag">Ask your teacher</div>
+    <p>Want harder variants, more "which is false" items, or a timed mock on one subsystem? Ask me to
+    generate a fresh set targeting exactly the topics you keep missing.</p>
+  </div>
+
+  <!-- ===== FOOTER: BACK TO LESSONS ===== -->
+  <nav class="lesson-nav" aria-label="Back to lessons">
+    <a class="prev" href="../index.html">
+      <span class="nav-dir">Back to</span>
+      <span class="nav-title">Field Guide index</span>
+    </a>
+    <a class="next" href="../lessons/0014-logging-recovery-aries.html">
+      <span class="nav-dir">Related lessons</span>
+      <span class="nav-title">Weeks 2-16 lessons (storage through distributed)</span>
+    </a>
+  </nav>
+
+  <p class="muted" style="font-family:var(--sans);font-size:.78rem;margin-top:1rem">
+    Jump to a lesson:
+    <a href="../lessons/0002-storage-engine-disk-pages.html">storage</a> ·
+    <a href="../lessons/0004-buffer-pool-design.html">buffer pool</a> ·
+    <a href="../lessons/0006-btree-search-insert.html">B+trees</a> ·
+    <a href="../lessons/0008-query-parsing.html">parsing</a> ·
+    <a href="../lessons/0010-query-execution-joins.html">joins</a> ·
+    <a href="../lessons/0011-query-optimization.html">optimization</a> ·
+    <a href="../lessons/0012-transactions-isolation.html">transactions</a> ·
+    <a href="../lessons/0013-concurrency-mvcc.html">MVCC</a> ·
+    <a href="../lessons/0014-logging-recovery-aries.html">recovery</a> ·
+    <a href="../lessons/0015-modern-architectures-lsm.html">modern</a> ·
+    <a href="../lessons/0016-distributed-databases.html">distributed</a>
+  </p>
+
+  </div><!-- /.col -->
+</main>
+</body>
+</html>

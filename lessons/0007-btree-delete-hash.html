@@ -1,0 +1,737 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lesson 07 · B+tree deletion, bulk loading, composite keys, and hash indexes · Field Guide to the Database Engine</title>
+<link rel="stylesheet" href="../assets/course.css">
+<script defer src="../assets/components.js"></script>
+</head>
+<body class="layer-index">
+<main class="page">
+
+  <!-- ===== MASTHEAD ===== -->
+  <header class="masthead col">
+    <div class="crumbs">
+      <a href="../index.html">Field Guide</a> <span>/</span>
+      <span>Part IV · Index structures</span> <span>/</span>
+      <span>Week 07</span>
+    </div>
+    <span class="week-badge">Index structures</span>
+    <h1>B+tree deletion, bulk loading, composite keys, and hash indexes</h1>
+    <p class="lede">Last week the tree only grew. Now we let it shrink, build it in bulk, key it on several
+    columns, and ask the harder question: when is an ordered tree the wrong tool and a hash table the right one?</p>
+  </header>
+
+  <div class="col">
+
+  <!-- ===== OBJECTIVES ===== -->
+  <div class="objectives">
+    <h4>By the end you can</h4>
+    <ul>
+      <li>Delete from a B+tree and restore the half-full invariant by redistributing from a sibling or merging with one, and say when the tree shrinks in height.</li>
+      <li>Explain why bulk loading bottom up beats inserting one key at a time, and what fillfactor buys.</li>
+      <li>Apply the leftmost-prefix rule for a composite key and predict which predicates an index on (a, b) can seek.</li>
+      <li>Contrast static, extendible, and linear hashing, and decide between a hash index and a B+tree for a given workload.</li>
+      <li>Spot the standard exam traps: hash is always faster, composite indexes help any column, the directory always doubles.</li>
+    </ul>
+  </div>
+
+  <!-- ===== WHERE THIS SITS ===== -->
+  <p>This lesson sits in the index layer, the same place as
+  <a href="0006-btree-search-insert.html">week 6</a>. On journey 1, our running query
+  <code>SELECT name FROM emp WHERE salary &gt; 75000 ORDER BY name</code> reaches us from the executor
+  (<a href="0009-query-execution-volcano.html">week 9</a>): a scan operator asks the access method for the rows
+  matching <code>salary &gt; 75000</code>. The access method (a B+tree on <code>salary</code>) descends to a leaf and
+  walks linked leaves for the range, handing back row ids. Below us, every page we touch is fetched from the
+  buffer pool (<a href="0004-buffer-pool-design.html">week 4</a>), which reads it from the heap file
+  (<a href="0002-storage-engine-disk-pages.html">week 2</a>). Week 6 taught the read and insert paths. This week
+  closes the index layer: what happens on delete, how the index is first built, why column order matters, and the
+  hash alternative that the optimizer (<a href="0011-query-optimization.html">week 11</a>) will sometimes prefer.</p>
+
+  <p>There is a connection to journey 2 hiding here. When our
+  <code>UPDATE account SET balance = balance - 100 WHERE id = 42</code> runs under MVCC
+  (<a href="0013-concurrency-mvcc.html">week 13</a>), the old tuple version becomes dead and its index entries
+  must eventually disappear. That is index deletion. The mechanism below is the textbook baseline; the lazy,
+  two-stage version PostgreSQL actually runs is the realworld note.</p>
+
+  <div class="callout intuition">
+    <div class="callout-title">Intuition</div>
+    <p>Insert and delete are mirror images. Insert can overfill a node, so it splits and pushes work up. Delete can
+    underfill a node, so it borrows from a neighbor or fuses with one, and that fusion can underfill the parent, so the
+    fix walks up the same way a split does. The tree grows taller only when the root splits, and shorter only when the
+    root is left with a single child.</p>
+  </div>
+
+  <!-- ===== PART 1: DELETION ===== -->
+  <h2>Deletion: removing a key without breaking balance</h2>
+
+  <div class="callout why">
+    <div class="callout-title">Why underflow has to be repaired</div>
+    <p>The half-full rule is what bounds the height. Every non-root node of order <i>m</i> must hold at least
+    <code>ceil(m/2) - 1</code> keys. If a node could empty out to one or two keys, the tree could grow a long thin
+    branch and the O(log<sub>m</sub> N) I/O guarantee would collapse toward O(N). So a delete that drops a node below the
+    minimum is not allowed to stand. The naive alternatives both fail: ignore underflow and the tree degrades into a
+    list; rebuild the whole tree on every delete and you pay O(N) per delete and block every concurrent reader. The
+    real fix is local: pull the node back to minimum using exactly one sibling.</p>
+  </div>
+
+  <h3>The algorithm</h3>
+  <ol class="steps">
+    <li>Descend to the target leaf as in a search, and remove the entry.</li>
+    <li>If the leaf still has at least <code>ceil(m/2) - 1</code> keys, stop. Most deletes end here.</li>
+    <li>On underflow, look at an adjacent sibling. If the sibling has more than the minimum, <b>redistribute</b>: move
+    one entry across and update the separator in the parent. Tree shape is unchanged.</li>
+    <li>If no sibling can spare an entry (every neighbor is exactly at minimum), <b>merge</b>: fuse the underflowing node
+    with a sibling into one node and remove the now-unused separator from the parent.</li>
+    <li>A merge removes a key from the parent, which can make the parent underflow. So merge and redistribute
+    propagate upward, exactly like split propagation. If the root is left with a single child, that child becomes the
+    new root and the tree loses a level.</li>
+  </ol>
+
+  <div class="callout keyidea">
+    <div class="callout-title">Keep this one thing</div>
+    <p>Redistribute when a sibling is rich, merge when both are poor. A merge can cascade up; the tree shrinks in height
+    only when the root drops to one child, the mirror of growing only when the root splits.</p>
+  </div>
+
+  <!-- ===== DIAGRAM: redistribute vs merge ===== -->
+  <figure class="diagram">
+    <svg viewBox="0 0 640 230" role="img" aria-label="Underflow repaired two ways: redistribute from a richer sibling, or merge with a poor one">
+      <defs>
+        <marker id="bd7-arrow" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto">
+          <path d="M0,0 L7,3 L0,6 Z" fill="var(--ink-soft)"/>
+        </marker>
+      </defs>
+      <text x="320" y="18" text-anchor="middle" class="svg-label">leaf holding only [9] underflows (min is 2 keys for m=4)</text>
+
+      <!-- left branch: redistribute -->
+      <text x="160" y="44" text-anchor="middle" class="svg-label sm">Redistribute: sibling [3 5 7] is rich</text>
+      <rect x="110" y="56" width="100" height="26" rx="4" fill="#fffdf8" stroke="var(--ink-soft)"/>
+      <text x="160" y="74" text-anchor="middle" class="svg-mono">parent: |7|</text>
+      <rect x="60" y="110" width="84" height="26" rx="4" fill="var(--index-bg)" stroke="var(--index)"/>
+      <text x="102" y="128" text-anchor="middle" class="svg-mono">3 5</text>
+      <rect x="176" y="110" width="84" height="26" rx="4" fill="var(--index-bg)" stroke="var(--index)"/>
+      <text x="218" y="128" text-anchor="middle" class="svg-mono">7 9</text>
+      <text x="160" y="166" text-anchor="middle" class="svg-label sm">one key moves across,</text>
+      <text x="160" y="182" text-anchor="middle" class="svg-label sm">separator updated to 7</text>
+
+      <!-- right branch: merge -->
+      <text x="480" y="44" text-anchor="middle" class="svg-label sm">Merge: sibling [5] is also at minimum</text>
+      <rect x="430" y="56" width="100" height="26" rx="4" fill="#fffdf8" stroke="var(--ink-soft)"/>
+      <text x="480" y="74" text-anchor="middle" class="svg-mono">parent: ||</text>
+      <rect x="438" y="110" width="84" height="26" rx="4" fill="var(--index-bg)" stroke="var(--index)"/>
+      <text x="480" y="128" text-anchor="middle" class="svg-mono">5 9</text>
+      <text x="480" y="166" text-anchor="middle" class="svg-label sm">two nodes fuse into one,</text>
+      <text x="480" y="182" text-anchor="middle" class="svg-label sm">separator removed from parent</text>
+      <text x="480" y="202" text-anchor="middle" class="svg-label sm">(parent may now underflow)</text>
+
+      <line x1="320" y1="26" x2="160" y2="52" stroke="var(--ink-soft)" marker-end="url(#bd7-arrow)"/>
+      <line x1="320" y1="26" x2="480" y2="52" stroke="var(--ink-soft)" marker-end="url(#bd7-arrow)"/>
+    </svg>
+    <figcaption><b>Figure 1.</b> The two repairs branch on one question: can any adjacent sibling spare a key? If yes,
+    redistribute and stop. If no, merge, and check the parent. Notice that merge is the only repair that can cascade.</figcaption>
+  </figure>
+
+  <!-- ===== SIMULATOR 1: B+tree delete vs extendible hash ===== -->
+  <h2>Simulator: a B+tree that shrinks, and a hash that grows</h2>
+  <p>Two structures, one screen. On the left, delete keys from a B+tree (order 4, so minimum 2 keys per leaf) and
+  watch underflow resolve as redistribute or merge, with the tree height counter ticking down on a root collapse.
+  On the right, insert keys into an extendible hash table and watch global and local depth climb and the directory
+  double. The button that matters most is the range query: press it and the hash side lights up every bucket it must
+  scan, while the B+tree descends once and walks its linked leaves. That contrast is the whole point of the lesson.</p>
+
+  <figure class="sim" id="bd7-sim">
+    <div class="sim-head">
+      <span class="sim-title">B+tree delete vs extendible-hash grower</span>
+      <span class="sim-sub">delete on the left, insert on the right, then run a range query on both</span>
+    </div>
+    <div class="sim-body">
+      <div class="sim-stage" style="display:grid;grid-template-columns:1fr 1fr;gap:0;">
+        <svg id="bd7-tree" viewBox="0 0 360 220" width="100%" style="border-right:1px solid var(--rule);"></svg>
+        <svg id="bd7-hash" viewBox="0 0 360 220" width="100%"></svg>
+      </div>
+      <div class="sim-controls" id="bd7-controls"></div>
+      <div class="sim-readout" id="bd7-readout"></div>
+    </div>
+  </figure>
+  <figcaption class="muted" style="margin-top:-1rem">Experiment: delete keys from the B+tree until a leaf underflows.
+  When the sibling is rich you will see a borrow; when both are minimal you will see a merge that can drop the height.
+  Then press "range query" and compare the I/O counters: the hash pays for every bucket, the tree pays for one descent
+  plus a short leaf walk.</figcaption>
+
+  <script>
+  (function () {
+    // ---------- shared ----------
+    var tree = document.getElementById("bd7-tree");
+    var hash = document.getElementById("bd7-hash");
+    var readout = document.getElementById("bd7-readout");
+    var controls = document.getElementById("bd7-controls");
+    var ORDER = 4, MINKEYS = Math.ceil(ORDER/2) - 1; // = 1 for order 4 internal; leaves use min 2 here for clarity
+    var LEAF_MIN = 2;                                 // keys a leaf must keep
+
+    // ---------- B+tree state (a tiny purpose-built model) ----------
+    // We model leaves as an ordered array of leaf-arrays, plus one routing level.
+    // This is enough to demonstrate redistribute / merge / height drop without a general B-tree.
+    var leaves, lastMsg, treeIO, hashIO;
+
+    function resetTree() {
+      // seed with a rich second leaf so the first underflow can redistribute, not just merge
+      leaves = [[1,3],[5,7,8],[10,11],[13,15]];
+      lastMsg = "B+tree seeded across 4 leaves (height 2). Leaf 1 is rich, so the first underflow can borrow.";
+    }
+
+    function separators() {
+      // first key of each leaf except the first acts as a routing separator
+      return leaves.slice(1).map(function (lf) { return lf[0]; });
+    }
+
+    function treeHeight() { return leaves.length <= 1 ? 1 : 2; }
+
+    function deleteSmallest() {
+      // delete the smallest key still present, to make underflow easy to trigger deterministically
+      var li = -1;
+      for (var i = 0; i < leaves.length; i++) { if (leaves[i].length) { li = i; break; } }
+      if (li < 0) { lastMsg = "Tree is empty. Reset to refill."; return; }
+      var key = leaves[li].shift();
+      lastMsg = "Deleted " + key + " from leaf " + li + ". ";
+      if (leaves[li].length >= LEAF_MIN) { lastMsg += "Leaf still has " + leaves[li].length + " keys, no repair."; return; }
+      // underflow: look at right sibling first, then left
+      var right = li + 1, left = li - 1;
+      if (right < leaves.length && leaves[right].length > LEAF_MIN) {
+        var borrowed = leaves[right].shift();
+        leaves[li].push(borrowed); leaves[li].sort(function(a,b){return a-b;});
+        lastMsg += "Underflow. Borrowed " + borrowed + " from the right sibling (redistribute); separator updated.";
+        return;
+      }
+      if (left >= 0 && leaves[left].length > LEAF_MIN) {
+        var borrowedL = leaves[left].pop();
+        leaves[li].unshift(borrowedL);
+        lastMsg += "Underflow. Borrowed " + borrowedL + " from the left sibling (redistribute); separator updated.";
+        return;
+      }
+      // no rich sibling: merge with a neighbor
+      if (right < leaves.length) {
+        leaves[li] = leaves[li].concat(leaves[right]);
+        leaves.splice(right, 1);
+        lastMsg += "Underflow, both siblings minimal. Merged with right sibling; one separator dropped from parent.";
+      } else if (left >= 0) {
+        leaves[left] = leaves[left].concat(leaves[li]);
+        leaves.splice(li, 1);
+        lastMsg += "Underflow, both siblings minimal. Merged into left sibling; one separator dropped from parent.";
+      }
+      if (leaves.length === 1) lastMsg += " Root now has a single child: tree shrinks to height 1.";
+    }
+
+    function drawTree() {
+      tree.innerHTML = "";
+      var seps = separators();
+      var H = treeHeight();
+      // root box
+      if (H === 2) {
+        var rootW = Math.max(60, seps.length * 28 + 16);
+        var rx = 180 - rootW/2;
+        tree.appendChild(mk("rect", { x: rx, y: 16, width: rootW, height: 26, rx: 4, fill: "#fffdf8", stroke: "var(--ink-soft)" }));
+        tree.appendChild(mk("text", { x: 180, y: 34, "text-anchor": "middle", class: "svg-mono" }, seps.join(" ")));
+      }
+      // leaves laid out across the bottom
+      var n = leaves.length;
+      var gap = 8, total = 340, w = (total - gap * (n - 1)) / Math.max(n, 1);
+      var x = 10, y = 150;
+      for (var i = 0; i < n; i++) {
+        var lf = leaves[i];
+        var under = lf.length < LEAF_MIN;
+        tree.appendChild(mk("rect", { x: x, y: y, width: w, height: 30, rx: 4,
+          fill: under ? "#fbe6e0" : "var(--index-bg)", stroke: under ? "#b0472a" : "var(--index)" }));
+        tree.appendChild(mk("text", { x: x + w/2, y: y + 19, "text-anchor": "middle", class: "svg-mono" }, lf.join(" ") || "·"));
+        if (H === 2) tree.appendChild(mk("line", { x1: 180, y1: 42, x2: x + w/2, y2: y, stroke: "var(--rule)" }));
+        // leaf chain link
+        if (i < n - 1) tree.appendChild(mk("line", { x1: x + w, y1: y + 15, x2: x + w + gap, y2: y + 15, stroke: "var(--index)", "stroke-dasharray": "2 2" }));
+        x += w + gap;
+      }
+      tree.appendChild(mk("text", { x: 10, y: 205, class: "svg-label sm" }, "height " + treeHeight() + " · leaves " + n + " · half-full line at " + LEAF_MIN + " keys"));
+    }
+
+    // ---------- extendible hash state ----------
+    var globalDepth, buckets; // buckets: array of {ld: localDepth, keys: []}; directory derived from globalDepth
+    var BUCKET_CAP = 2;
+
+    function resetHash() {
+      globalDepth = 1;
+      buckets = [ { ld: 1, keys: [] }, { ld: 1, keys: [] } ];
+    }
+
+    function hashOf(k) { return k; } // identity; we read low bits as the hash
+    function dirIndex(k, depth) { return hashOf(k) & ((1 << depth) - 1); }
+    var dirMap; // directory slot -> bucket array index
+
+    function rebuildDirOnReset() { dirMap = [0, 1]; }
+
+    function hashInsert(k) {
+      var slot = dirIndex(k, globalDepth);
+      var bi = dirMap[slot];
+      var b = buckets[bi];
+      if (b.keys.indexOf(k) >= 0) { lastMsg = "Key " + k + " already in bucket " + bi + "."; return; }
+      if (b.keys.length < BUCKET_CAP) {
+        b.keys.push(k); b.keys.sort(function(a,b){return a-b;});
+        lastMsg = "Inserted " + k + " into bucket " + bi + " (local depth " + b.ld + "). No split.";
+        return;
+      }
+      // overflow: split bucket bi
+      if (b.ld === globalDepth) {
+        // double the directory
+        globalDepth++;
+        var newSize = 1 << globalDepth, nd = new Array(newSize);
+        for (var s = 0; s < newSize; s++) nd[s] = dirMap[s & ((1 << (globalDepth - 1)) - 1)];
+        dirMap = nd;
+        lastMsg = "Bucket " + bi + " full and local depth == global depth: directory DOUBLES to " + newSize + " slots, then ";
+      } else {
+        lastMsg = "Bucket " + bi + " full but local depth < global depth: split bucket only, NO directory doubling, then ";
+      }
+      // split bucket bi into bi and a new bucket
+      var oldKeys = b.keys.concat([k]);
+      b.ld++; b.keys = [];
+      var nb = { ld: b.ld, keys: [] };
+      var nbi = buckets.push(nb) - 1;
+      // repoint directory slots whose (ld) bit distinguishes the two
+      var bit = 1 << (b.ld - 1);
+      for (var s2 = 0; s2 < dirMap.length; s2++) {
+        if (dirMap[s2] === bi && (s2 & bit)) dirMap[s2] = nbi;
+      }
+      // redistribute keys
+      oldKeys.forEach(function (kk) {
+        var target = (dirIndex(kk, b.ld) & bit) ? nbi : bi;
+        buckets[target].keys.push(kk);
+      });
+      buckets[bi].keys.sort(function(a,b){return a-b;});
+      buckets[nbi].keys.sort(function(a,b){return a-b;});
+      lastMsg += "split into buckets " + bi + " and " + nbi + " (local depth " + b.ld + ").";
+    }
+
+    function drawHash() {
+      hash.innerHTML = "";
+      hash.appendChild(mk("text", { x: 10, y: 18, class: "svg-label sm" }, "directory: global depth " + globalDepth + " (" + (1 << globalDepth) + " slots)"));
+      // directory column
+      var size = 1 << globalDepth;
+      var dy = 30, dh = Math.min(24, (180) / size);
+      for (var s = 0; s < size; s++) {
+        var bits = s.toString(2).padStart(globalDepth, "0");
+        hash.appendChild(mk("rect", { x: 10, y: dy + s * dh, width: 64, height: dh - 2, rx: 2, fill: "#fffdf8", stroke: "var(--rule)" }));
+        hash.appendChild(mk("text", { x: 42, y: dy + s * dh + dh/2 + 3, "text-anchor": "middle", class: "svg-mono" }, bits));
+        // pointer line to its bucket
+        var bi = dirMap[s];
+        var byTop = 30 + bi * 40;
+        hash.appendChild(mk("line", { x1: 74, y1: dy + s * dh + dh/2, x2: 150, y2: byTop + 16, stroke: "var(--rule)" }));
+      }
+      // buckets column
+      for (var i = 0; i < buckets.length; i++) {
+        var b = buckets[i];
+        hash.appendChild(mk("rect", { x: 150, y: 30 + i * 40, width: 200, height: 32, rx: 4,
+          fill: window.bd7HashHL && window.bd7HashHL.indexOf(i) >= 0 ? "#fdeccb" : "var(--index-bg)",
+          stroke: window.bd7HashHL && window.bd7HashHL.indexOf(i) >= 0 ? "#b07d10" : "var(--index)" }));
+        hash.appendChild(mk("text", { x: 158, y: 30 + i * 40 + 20, class: "svg-mono" }, "b" + i + " ld=" + b.ld + " [" + b.keys.join(" ") + "]"));
+      }
+    }
+
+    // ---------- range query: forces hash to scan all, tree descends once ----------
+    function rangeQuery() {
+      var lo = 5, hi = 11;
+      // tree: one descent + walk leaves overlapping [lo,hi]
+      var touched = 0;
+      for (var i = 0; i < leaves.length; i++) {
+        if (leaves[i].some(function (k) { return k >= lo && k <= hi; })) touched++;
+        else if (touched > 0) break; // leaves are ordered; stop after the run
+      }
+      treeIO = treeHeight() + Math.max(touched, 1); // descent + leaf reads
+      // hash: must scan every bucket because order is destroyed
+      hashIO = buckets.length;
+      window.bd7HashHL = buckets.map(function (_, i) { return i; });
+      lastMsg = "Range query BETWEEN " + lo + " AND " + hi + ": B+tree did 1 descent + " + Math.max(touched,1) +
+        " leaf read(s) = " + treeIO + " I/O. Hash had to scan ALL " + buckets.length + " buckets = " + hashIO + " I/O.";
+    }
+    function clearHL() { window.bd7HashHL = null; }
+
+    // ---------- helpers ----------
+    function mk(tag, attrs, kids) { return DBMS.svg(tag, attrs, kids); }
+    function render() {
+      drawTree(); drawHash();
+      var io = "";
+      if (treeIO != null) io = "   [last range: tree " + treeIO + " I/O vs hash " + hashIO + " I/O]";
+      readout.textContent = lastMsg + io;
+    }
+
+    // ---------- controls ----------
+    function btn(label, fn, cls) {
+      return DBMS.el("button", { text: label, class: cls || "", onclick: function () { fn(); render(); } });
+    }
+    function reset() {
+      resetTree(); resetHash(); rebuildDirOnReset();
+      treeIO = null; hashIO = null; clearHL();
+      lastMsg = "Reset. Keys seeded in the tree, an empty 2-bucket hash directory.";
+    }
+    var hashSeq = [2,6,4,0,1,5,3,7,9,11]; var hashPtr = 0;
+    reset();
+    controls.append(
+      btn("Delete smallest", function () { clearHL(); deleteSmallest(); }),
+      btn("Hash insert", function () { clearHL(); hashInsert(hashSeq[hashPtr % hashSeq.length]); hashPtr++; }),
+      btn("Range query (both)", function () { rangeQuery(); }),
+      DBMS.el("button", { text: "Reset", class: "ghost", onclick: function () { hashPtr = 0; reset(); render(); } })
+    );
+    render();
+  })();
+  </script>
+
+  <!-- ===== PART 2: BULK LOADING ===== -->
+  <h2>Bulk loading: build it bottom up, not one key at a time</h2>
+
+  <div class="callout why">
+    <div class="callout-title">Why one-at-a-time is wrong for a fresh index</div>
+    <p>Suppose you run <code>CREATE INDEX</code> on a table that already has 10 million rows. Inserting those keys one
+    at a time means 10 million root-to-leaf descents, each touching the buffer pool, and a stream of random splits that
+    leave leaves around half full and scatter the pages. The result is a tree that is taller, sparser, and physically
+    fragmented than it needs to be. The keys are not arriving online; you have all of them at once. So sort them first,
+    then pack.</p>
+  </div>
+
+  <h3>The algorithm</h3>
+  <ol class="steps">
+    <li>Sort all the entries by key (an external merge sort if they do not fit in memory, the same one from
+    <a href="0010-query-execution-joins.html">week 10</a>).</li>
+    <li>Pack the sorted entries left to right into leaves up to a target density, the <b>fillfactor</b>, linking each
+    leaf to the next. Stop short of full so later inserts have room before they split.</li>
+    <li>Build the parent level by taking the first key of each leaf as a separator. Repeat upward until one node remains:
+    that is the root.</li>
+  </ol>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 620 200" role="img" aria-label="Bulk loading from sorted entries up to a fillfactor">
+      <text x="310" y="16" text-anchor="middle" class="svg-label">sorted entries, packed to a fillfactor, parents built from first keys</text>
+      <!-- root -->
+      <rect x="260" y="34" width="100" height="24" rx="4" fill="#fffdf8" stroke="var(--ink-soft)"/>
+      <text x="310" y="51" text-anchor="middle" class="svg-mono">11 | 21</text>
+      <!-- leaves -->
+      <g>
+        <rect x="40" y="120" width="150" height="30" rx="4" fill="var(--index-bg)" stroke="var(--index)"/>
+        <text x="115" y="139" text-anchor="middle" class="svg-mono">2 5 8</text>
+        <rect x="235" y="120" width="150" height="30" rx="4" fill="var(--index-bg)" stroke="var(--index)"/>
+        <text x="310" y="139" text-anchor="middle" class="svg-mono">11 14 17</text>
+        <rect x="430" y="120" width="150" height="30" rx="4" fill="var(--index-bg)" stroke="var(--index)"/>
+        <text x="505" y="139" text-anchor="middle" class="svg-mono">21 24 27</text>
+      </g>
+      <line x1="190" y1="135" x2="235" y2="135" stroke="var(--index)" stroke-dasharray="2 2"/>
+      <line x1="385" y1="135" x2="430" y2="135" stroke="var(--index)" stroke-dasharray="2 2"/>
+      <line x1="285" y1="58" x2="115" y2="120" stroke="var(--rule)"/>
+      <line x1="310" y1="58" x2="310" y2="120" stroke="var(--rule)"/>
+      <line x1="335" y1="58" x2="505" y2="120" stroke="var(--rule)"/>
+      <text x="115" y="172" text-anchor="middle" class="svg-label sm">each leaf left ~10% empty</text>
+      <text x="505" y="172" text-anchor="middle" class="svg-label sm">sequential page writes, no splits</text>
+    </svg>
+    <figcaption><b>Figure 2.</b> The leaves are filled in one sequential left-to-right pass to the fillfactor, then the
+    level above is read off their first keys. No descents, no random splits. PostgreSQL's B-tree fillfactor defaults to
+    90, leaving a tenth of each leaf free for later in-place inserts
+    [<a href="https://www.postgresql.org/docs/16/btree-implementation.html">PG B-Tree Implementation</a>].</figcaption>
+  </figure>
+
+  <div class="callout realworld">
+    <div class="callout-title">In real systems</div>
+    <p>PostgreSQL builds B-tree indexes bottom up from a sort, packing leaves to <code>fillfactor</code> (default 90,
+    range 10 to 100). A read-heavy index that never gets new rows can be packed to 100 for density; a hot index that
+    takes inserts should stay near 90 so a leaf has slack before it splits
+    [<a href="https://www.postgresql.org/docs/16/btree-implementation.html">PG docs</a>].</p>
+  </div>
+
+  <!-- ===== PART 3: COMPOSITE KEYS ===== -->
+  <h2>Composite keys: lexicographic order and the leftmost prefix</h2>
+
+  <p>An index on <code>(a, b)</code> is keyed on the pair, sorted the way a dictionary sorts: compare <code>a</code>
+  first, and only when two rows tie on <code>a</code> does <code>b</code> break the tie. That single fact decides every
+  query the index can and cannot accelerate.</p>
+
+  <div class="callout intuition">
+    <div class="callout-title">Intuition</div>
+    <p>Think of names in a phone book sorted by (last name, first name). Finding everyone named "Smith" is one seek and a
+    short walk, because all Smiths are contiguous. Finding everyone whose first name is "John" is hopeless: the Johns are
+    scattered through every last-name section. A composite index seeks a contiguous left prefix and nothing else.</p>
+  </div>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 620 150" role="img" aria-label="Composite index on (a,b) showing rows ordered by a then b">
+      <text x="310" y="16" text-anchor="middle" class="svg-label">leaf order for an index on (a, b): sorted by a, then by b</text>
+      <g class="svg-mono" font-size="12">
+        <rect x="20" y="40" width="86" height="60" rx="4" fill="var(--index-bg)" stroke="var(--index)"/>
+        <text x="63" y="62" text-anchor="middle">a=1,b=2</text>
+        <text x="63" y="80" text-anchor="middle">a=1,b=9</text>
+        <rect x="116" y="40" width="86" height="60" rx="4" fill="var(--index-bg)" stroke="var(--index)"/>
+        <text x="159" y="62" text-anchor="middle">a=2,b=1</text>
+        <text x="159" y="80" text-anchor="middle">a=2,b=4</text>
+        <rect x="212" y="40" width="86" height="60" rx="4" fill="var(--index-bg)" stroke="var(--index)"/>
+        <text x="255" y="62" text-anchor="middle">a=2,b=8</text>
+        <text x="255" y="80" text-anchor="middle">a=3,b=1</text>
+        <rect x="308" y="40" width="86" height="60" rx="4" fill="var(--index-bg)" stroke="var(--index)"/>
+        <text x="351" y="62" text-anchor="middle">a=3,b=5</text>
+        <text x="351" y="80" text-anchor="middle">a=4,b=2</text>
+      </g>
+      <text x="63" y="124" text-anchor="middle" class="svg-label sm" fill="#0f7a6c">a=1 contiguous: seekable</text>
+      <text x="430" y="62" class="svg-label sm" fill="#b0472a">b=1 appears in two</text>
+      <text x="430" y="80" class="svg-label sm" fill="#b0472a">different places: not</text>
+      <text x="430" y="98" class="svg-label sm" fill="#b0472a">seekable on b alone</text>
+    </svg>
+    <figcaption><b>Figure 3.</b> Rows with <code>a=1</code> sit together, so <code>WHERE a=1</code> is one seek plus a
+    walk. Rows with <code>b=1</code> are split across the <code>a=2</code> and <code>a=3</code> regions, so
+    <code>WHERE b=1</code> cannot be served by a seek on this index.</figcaption>
+  </figure>
+
+  <table>
+    <caption>Which predicates an index on (a, b, c) can seek.</caption>
+    <thead><tr><th>Query predicate</th><th>Usable prefix</th><th>Verdict</th></tr></thead>
+    <tbody>
+      <tr><td><code>a = 5</code></td><td>a</td><td>seek, then walk</td></tr>
+      <tr><td><code>a = 5 AND b = 2</code></td><td>a, b</td><td>tighter seek</td></tr>
+      <tr><td><code>a = 5 AND b &gt; 2</code></td><td>a, then range on b</td><td>seek plus a range</td></tr>
+      <tr><td><code>b = 2</code> (no a)</td><td>none</td><td>full index scan or skip the index</td></tr>
+      <tr><td><code>a = 5 AND c = 9</code></td><td>a only (b is skipped)</td><td>seek on a, filter c</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout gotcha">
+    <div class="callout-title">Exam trap</div>
+    <p>"A composite index on (a, b) helps a query that filters only on b." False. Lexicographic ordering puts a given
+    <code>b</code> value all over the key space, so there is no contiguous run to seek. Only a left prefix is seekable.
+    Reordering the index to <code>(b, a)</code> is a different index with different abilities; column order is not
+    symmetric.</p>
+  </div>
+
+  <p>One more axis pairs with composite keys: clustering. A <b>clustered</b> index defines the physical row order of the
+  table, so there is at most one per table, and a range scan on it reads the heap in mostly sequential order. An
+  <b>unclustered</b> (secondary) index has its own order; its leaves hold the key plus a row pointer, so a range scan
+  reads index leaves in order but then jumps to scattered heap pages, close to one random read per matching row. How
+  well the index order matches the heap order is the clustering factor, and it is what makes a secondary range scan
+  cheap or ruinous [<a href="https://www.postgresql.org/docs/16/btree-implementation.html">PG docs</a>].</p>
+
+  <!-- ===== PART 4: HASH INDEXES ===== -->
+  <h2>The hash alternative: O(1) points, but no order</h2>
+
+  <div class="callout why">
+    <div class="callout-title">Why a second index family exists at all</div>
+    <p>A B+tree answers a point lookup in O(log<sub>m</sub> N) page reads. A hash table answers it in expected O(1): hash
+    the key, go straight to the bucket. For a workload that is pure equality on a full key (cache lookups, join keys with
+    no range), that constant beats a logarithm. The price is total: a hash destroys order, so it cannot do ranges,
+    cannot serve <code>ORDER BY</code> without sorting, and cannot use a key prefix. The design question for a hash index
+    is not "how do I look up" but "how does the bucket array grow when the table outgrows it?"</p>
+  </div>
+
+  <h3>Three ways to grow a hash table</h3>
+  <table>
+    <caption>Static, extendible, and linear hashing differ only in how they handle growth.</caption>
+    <thead><tr><th>Scheme</th><th>How it grows</th><th>Cost of growth</th></tr></thead>
+    <tbody>
+      <tr><td>Static hashing</td><td>It does not. Overflow chains lengthen.</td><td>lookups degrade toward O(chain), only a full rebuild fixes it</td></tr>
+      <tr><td>Extendible hashing</td><td>Split one bucket; double the directory only when local depth equals global depth</td><td>directory can double, but lookups stay O(1)</td></tr>
+      <tr><td>Linear hashing</td><td>Split buckets in round-robin order at a load threshold, no directory</td><td>one bucket split at a time, overflow chains absorb temporary skew</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout keyidea">
+    <div class="callout-title">Keep this one thing</div>
+    <p>In extendible hashing, the global depth is how many hash bits the directory reads; a bucket's local depth is how
+    many bits it actually distinguishes. The directory doubles only when a full bucket has <b>local depth equal to global
+    depth</b>. If the bucket's local depth is smaller, two directory slots already point at it, so splitting it needs no
+    new directory.</p>
+  </div>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 620 220" role="img" aria-label="Extendible hash split: one case doubles the directory, one does not">
+      <text x="310" y="16" text-anchor="middle" class="svg-label">global depth 2: a full bucket with local depth 2 doubles the directory; local depth 1 does not</text>
+      <!-- directory -->
+      <text x="70" y="44" text-anchor="middle" class="svg-label sm">directory (gd=2)</text>
+      <g class="svg-mono" font-size="11">
+        <rect x="40" y="52" width="60" height="26" rx="2" fill="#fffdf8" stroke="var(--rule)"/><text x="70" y="69" text-anchor="middle">00</text>
+        <rect x="40" y="80" width="60" height="26" rx="2" fill="#fffdf8" stroke="var(--rule)"/><text x="70" y="97" text-anchor="middle">01</text>
+        <rect x="40" y="108" width="60" height="26" rx="2" fill="#fffdf8" stroke="var(--rule)"/><text x="70" y="125" text-anchor="middle">10</text>
+        <rect x="40" y="136" width="60" height="26" rx="2" fill="#fffdf8" stroke="var(--rule)"/><text x="70" y="153" text-anchor="middle">11</text>
+      </g>
+      <!-- buckets -->
+      <rect x="190" y="52" width="170" height="26" rx="4" fill="#fbe6e0" stroke="#b0472a"/>
+      <text x="198" y="69" class="svg-mono">B full, ld=2  (00 only)</text>
+      <rect x="190" y="94" width="170" height="26" rx="4" fill="var(--index-bg)" stroke="var(--index)"/>
+      <text x="198" y="111" class="svg-mono">C, ld=1  (10 and 11)</text>
+      <line x1="100" y1="65" x2="190" y2="65" stroke="var(--rule)"/>
+      <line x1="100" y1="93" x2="190" y2="80" stroke="var(--rule)"/>
+      <line x1="100" y1="121" x2="190" y2="107" stroke="var(--rule)"/>
+      <line x1="100" y1="149" x2="190" y2="107" stroke="var(--rule)"/>
+      <!-- annotations -->
+      <text x="490" y="62" text-anchor="middle" class="svg-label sm" fill="#b0472a">B splitting: ld(2) = gd(2),</text>
+      <text x="490" y="80" text-anchor="middle" class="svg-label sm" fill="#b0472a">so gd -&gt; 3, directory doubles</text>
+      <text x="490" y="112" text-anchor="middle" class="svg-label sm" fill="#0f7a6c">C splitting: ld(1) &lt; gd(2),</text>
+      <text x="490" y="130" text-anchor="middle" class="svg-label sm" fill="#0f7a6c">split bucket only, no doubling</text>
+    </svg>
+    <figcaption><b>Figure 4.</b> Two directory slots (10 and 11) already point at bucket C, so C can split into two
+    without a bigger directory. Bucket B owns a single slot, so its split needs one more directory bit, which doubles the
+    table.</figcaption>
+  </figure>
+
+  <pre><code><span class="tok-com"># extendible hash insert, the case that matters</span>
+<span class="tok-kw">def</span> <span class="tok-fn">insert</span>(key):
+    b = bucket_for(directory, low_bits(hash(key), global_depth))
+    <span class="tok-kw">if</span> b.has_room():
+        b.add(key); <span class="tok-kw">return</span>
+    <span class="tok-kw">if</span> b.local_depth == global_depth:
+        global_depth += <span class="tok-num">1</span>          <span class="tok-com"># the directory doubles</span>
+        directory = double(directory)
+    split(b)                       <span class="tok-com"># b.local_depth += 1, redistribute by the new bit</span>
+    insert(key)                    <span class="tok-com"># retry</span></code></pre>
+
+  <!-- ===== REALWORLD: PG hash ===== -->
+  <div class="callout realworld">
+    <div class="callout-title">In real systems</div>
+    <p>PostgreSQL ships a real on-disk hash index, made crash-safe in version 10 by adding WAL logging
+    [<a href="https://www.postgresql.org/docs/release/10.0/">PG 10 notes</a>]. It is deliberately narrow: it supports
+    only the <code>=</code> operator, only single-column indexes, no uniqueness checking, and its scans are lossy because
+    only the hash value is stored, so the heap tuple must be rechecked
+    [<a href="https://www.postgresql.org/docs/current/hash-index.html">PG Hash Indexes</a>]. In practice nbtree wins
+    almost everything; the hash index is a niche pick for large equality-only workloads with a good key distribution.
+    SQLite has no hash access method at all: every equality lookup goes through a B-tree
+    [<a href="https://www.sqlite.org/fileformat2.html">SQLite file format</a>].</p>
+  </div>
+
+  <h3>The trade-off in one table</h3>
+  <table>
+    <caption>The single most exam-worthy comparison in the index layer.</caption>
+    <thead><tr><th>Property</th><th>B+tree</th><th>Hash index</th></tr></thead>
+    <tbody>
+      <tr><td>Point lookup (=)</td><td>O(log<sub>m</sub> N) I/O</td><td>expected O(1) I/O</td></tr>
+      <tr><td>Range or inequality</td><td>yes, ordered linked leaves</td><td>no, must scan every bucket</td></tr>
+      <tr><td>ORDER BY served without a sort</td><td>yes</td><td>no</td></tr>
+      <tr><td>Prefix of a composite key</td><td>yes, leftmost prefix</td><td>no, needs the full key</td></tr>
+      <tr><td>Worst case under skew or growth</td><td>bounded by height</td><td>long overflow chains</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout gotcha">
+    <div class="callout-title">Exam trap</div>
+    <p>"A hash index is always faster than a B+tree because it is O(1)." False in context. The O(1) holds only for
+    full-key equality. A hash cannot do a range, an <code>ORDER BY</code>, or a prefix match, and under skew its overflow
+    chains can make even a point lookup slower than a tree. Most real workloads need order somewhere, which is why the
+    default index everywhere is a B+tree.</p>
+  </div>
+
+  <details class="deepdive">
+    <summary>Deeper: why PostgreSQL does not eagerly merge underflowing B-tree pages</summary>
+    <div>
+      <p>The textbook delete restores the half-full invariant on every underflow with a merge or redistribute. PostgreSQL
+      does not. Its nbtree deletion is lazy and two-stage: a leaf is first marked half-dead with its downlink removed
+      from the parent, then later unlinked from its siblings and fully deleted, and the rightmost page on a level is never
+      deleted to keep traversal simple [<a href="https://github.com/postgres/postgres/blob/master/src/backend/access/nbtree/README">nbtree README</a>].
+      Pages are allowed to drift below half full and space is reclaimed lazily, because eager merging on every delete is
+      expensive and fights the Lehman-Yao concurrent-access scheme from week 6. Before a page would split, nbtree also
+      deduplicates equal keys into a posting list of heap TIDs as a last defense against bloat
+      [<a href="https://www.postgresql.org/docs/16/btree-implementation.html">PG B-Tree Implementation</a>]. The
+      half-full rule is the correctness baseline these systems optimize around, not always the literal runtime behavior.</p>
+    </div>
+  </details>
+
+  <!-- ===== MCQs ===== -->
+  <h2>Check yourself</h2>
+
+  <div class="mcq" data-answer="2">
+    <p class="mcq-q">A leaf in an order-4 B+tree drops below the minimum after a delete and its only adjacent sibling is also at the minimum. What happens?</p>
+    <button class="mcq-opt">The leaf borrows one entry from the sibling and updates the parent separator.</button>
+    <button class="mcq-opt">The delete is rejected so the tree never violates its occupancy rule.</button>
+    <button class="mcq-opt">The two leaves merge into one and a separator is dropped from the parent.</button>
+    <button class="mcq-opt">The whole tree is rebuilt from scratch to restore perfect balance.</button>
+    <p class="mcq-explain">Redistribute needs a sibling with a spare entry. When both neighbors are at the minimum, the only repair is a merge, which fuses the nodes and removes the separator above. That removal can underflow the parent, so the repair can cascade up exactly like a split.</p>
+  </div>
+
+  <div class="mcq" data-answer="1">
+    <p class="mcq-q">When does a B+tree lose a level in height?</p>
+    <button class="mcq-opt">Whenever any leaf underflows and has to merge with its sibling.</button>
+    <button class="mcq-opt">Only when a merge cascades up far enough to leave the root with one child.</button>
+    <button class="mcq-opt">Every time a delete removes the largest key currently in the tree.</button>
+    <button class="mcq-opt">As soon as the total number of keys falls below the fanout m.</button>
+    <p class="mcq-explain">Height shrinks only when the root ends up with a single child, which then becomes the new root. That is the mirror of insertion: the tree grows taller only when the root splits. A leaf merge that stops below the root changes node count but not height.</p>
+  </div>
+
+  <div class="mcq" data-answer="3">
+    <p class="mcq-q">Which query can an index on (region, dept, salary) seek efficiently?</p>
+    <button class="mcq-opt"><code>WHERE dept = 'sales'</code> with no predicate on region.</button>
+    <button class="mcq-opt"><code>WHERE salary &gt; 75000</code> with no predicate on region or dept.</button>
+    <button class="mcq-opt"><code>WHERE dept = 'sales' AND salary &gt; 75000</code> with no region.</button>
+    <button class="mcq-opt"><code>WHERE region = 'west' AND dept = 'sales' AND salary &gt; 75000</code>.</button>
+    <button class="mcq-opt">None of these, because composite indexes only help single-column queries.</button>
+    <p class="mcq-explain">Only a contiguous left prefix is seekable. The fourth query constrains region, then dept, then ranges on salary: a full prefix match ending in a range. The others skip region, the leading column, so the matching rows are scattered across the whole key space and there is no run to seek.</p>
+  </div>
+
+  <div class="mcq" data-answer="0">
+    <p class="mcq-q">In extendible hashing, when does inserting into a full bucket double the directory?</p>
+    <button class="mcq-opt">When the full bucket's local depth equals the current global depth.</button>
+    <button class="mcq-opt">Every time any bucket overflows, regardless of the depths.</button>
+    <button class="mcq-opt">When the full bucket's local depth is strictly less than the global depth.</button>
+    <button class="mcq-opt">Only after every bucket in the table has overflowed at least once.</button>
+    <p class="mcq-explain">A bucket whose local depth is below the global depth is pointed at by two or more directory slots, so it can split without a new directory bit. The directory must double only when the splitting bucket owns a single slot, which is exactly the local-depth-equals-global-depth case.</p>
+  </div>
+
+  <div class="mcq" data-answer="2">
+    <p class="mcq-q">Which statement about PostgreSQL hash indexes is false?</p>
+    <button class="mcq-opt">They support only the equality operator, not ranges or ordering.</button>
+    <button class="mcq-opt">They became crash-safe in version 10 when WAL logging was added.</button>
+    <button class="mcq-opt">They can span multiple columns and enforce a uniqueness constraint.</button>
+    <button class="mcq-opt">Their scans are lossy, so the matching heap tuple must be rechecked.</button>
+    <p class="mcq-explain">PostgreSQL hash indexes are single-column and do not support uniqueness, so the third statement is false. The others are true: equality-only, crash-safe since v10, and lossy because only the hash value is stored, forcing a heap recheck.</p>
+  </div>
+
+  <div class="mcq" data-answer="3">
+    <p class="mcq-q">Why does bulk loading produce a better tree than inserting the same keys one at a time?</p>
+    <button class="mcq-opt">Because it skips the half-full invariant and packs leaves completely full.</button>
+    <button class="mcq-opt">Because it stores records in internal nodes, raising the fanout.</button>
+    <button class="mcq-opt">Because it avoids sorting the keys, which the insert path cannot skip.</button>
+    <button class="mcq-opt">Because sorted entries pack into leaves with sequential I/O and no random splits.</button>
+    <p class="mcq-explain">Bulk loading sorts first, then fills leaves left to right to the fillfactor with sequential writes, building parents from first keys. There are no per-key descents and no random splits, so the tree is denser and shallower. It still respects occupancy (it targets a fillfactor below 100 on purpose), and it sorts rather than avoiding sorting.</p>
+  </div>
+
+  <!-- ===== FLASHCARDS ===== -->
+  <div class="flashcard">
+    <div class="fc-front">State the two repairs for B+tree underflow and the one condition that chooses between them.</div>
+    <div class="fc-back">Redistribute (borrow one entry from an adjacent sibling, update the parent separator) when a sibling has more than the minimum; merge (fuse with a sibling, drop the separator from the parent) when every adjacent sibling is at the minimum. Merge can cascade up and can shrink the tree's height.</div>
+  </div>
+
+  <div class="flashcard">
+    <div class="fc-front">An index on (a, b). Which of these can it seek: a=5; b=7; a=5 AND b&gt;7; b=7 AND a=5?</div>
+    <div class="fc-back">a=5 yes (prefix). b=7 no (b alone is scattered). a=5 AND b&gt;7 yes (full prefix then a range). b=7 AND a=5 yes, same as a=5 AND b=7 (predicate order in SQL does not matter, only the index column order does).</div>
+  </div>
+
+  <!-- ===== PRIMARY SOURCE ===== -->
+  <div class="source-box">
+    <div class="src-tag">Primary source</div>
+    <div class="src-title">Read this next: CMU 15-445 Lecture 07, Hash Tables (Fall 2023)</div>
+    <p class="muted">The clearest treatment of static, extendible (global and local depth, directory doubling), and linear
+    hashing, and of why a hash loses to a B+tree on range and prefix access. Focus on the extendible-hashing worked
+    example and the depth bookkeeping.
+    <a href="https://15445.courses.cs.cmu.edu/fall2023/notes/07-hashtables.pdf">15445.courses.cs.cmu.edu/fall2023/notes/07-hashtables.pdf</a>.
+    Pair it with <a href="https://15445.courses.cs.cmu.edu/fall2023/notes/08-trees.pdf">Lecture 08, Tree Indexes</a> for
+    the deletion, bulk-loading, and leftmost-prefix material.</p>
+  </div>
+
+  <!-- ===== ASK YOUR TEACHER ===== -->
+  <div class="ask-teacher">
+    <div class="at-tag">Ask your teacher</div>
+    <p>Want me to trace a full delete cascade up to a root collapse, walk a linear-hashing split round, or work out the
+    exact crossover where a hash index beats the B+tree for your workload? Ask me to go deeper, redraw a figure, or quiz
+    you harder. I am your teacher for this course, not just a document.</p>
+  </div>
+
+  <!-- ===== NAV ===== -->
+  <nav class="lesson-nav">
+    <a class="prev" href="0006-btree-search-insert.html">
+      <span class="nav-dir">Previous</span>
+      <span class="nav-title">Week 06 · B+tree invariants, search, insertion, and splits</span>
+    </a>
+    <a class="next" href="0008-query-parsing.html">
+      <span class="nav-dir">Next</span>
+      <span class="nav-title">Week 08 · Query parsing: lexing, parsing, binding, and logical plans</span>
+    </a>
+  </nav>
+
+  </div><!-- /.col -->
+</main>
+</body>
+</html>

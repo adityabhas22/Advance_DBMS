@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>B+tree operations cheat sheet · Field Guide to the Database Engine</title>
+<link rel="stylesheet" href="../assets/course.css">
+<style>
+  /* Scoped tightening for the print cheat sheet. */
+  .sheet h2 { margin: 1.5rem 0 .5rem; }
+  .sheet h3 { margin: 1rem 0 .35rem; }
+  .sheet table { font-size: .82rem; }
+  .sheet table td, .sheet table th { padding: .3rem .5rem; vertical-align: top; }
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; align-items: start; }
+  .grid2 > * { margin: 0; }
+  @media (max-width: 640px) { .grid2 { grid-template-columns: 1fr; } }
+  .sheet ol.steps, .sheet ul { margin: .3rem 0 .3rem 1.1rem; padding: 0; }
+  .sheet ol.steps li, .sheet ul li { margin: .18rem 0; }
+  .kbd { font-family: var(--mono); background: #f4f1ea; border: 1px solid var(--rule); border-radius: 3px; padding: 0 .25rem; font-size: .85em; }
+  .sheet-foot { margin-top: 2rem; border-top: 2px solid var(--ink); padding-top: .8rem; font-family: var(--sans); font-size: .82rem; color: var(--ink-soft); }
+  .sheet-foot a { font-weight: 600; }
+</style>
+</head>
+<body class="layer-index">
+<main class="page">
+
+  <!-- ===== MASTHEAD ===== -->
+  <header class="masthead col">
+    <div class="crumbs">
+      <a href="../index.html">Field Guide</a> <span>/</span>
+      <span>Reference</span> <span>/</span>
+      <span>B+tree operations</span>
+    </div>
+    <h1>B+tree operations cheat sheet</h1>
+    <p class="lede">Order m. Search, insert with splits, delete with merge or redistribute,
+    bulk loading, and the rules that decide each. Everything is keyed to the half-full invariant.</p>
+  </header>
+
+  <div class="col sheet">
+
+  <!-- ===== INVARIANTS ===== -->
+  <h2>Invariants (order m)</h2>
+  <table>
+    <caption>What a B+tree always guarantees between operations.</caption>
+    <thead><tr><th>Invariant</th><th>Statement</th></tr></thead>
+    <tbody>
+      <tr><td>Data in leaves</td><td>All record entries live in leaves. Internal nodes hold only separator keys and child pointers; they route, never store payload. This is the line between a B+tree and a plain B-tree.</td></tr>
+      <tr><td>Linked leaves</td><td>Leaves form a (doubly) linked list in key order, so a range scan walks leaf to leaf without going back up. PostgreSQL keeps a doubly linked leaf chain.</td></tr>
+      <tr><td>Height balanced</td><td>Every root-to-leaf path has the same length. Balance is structural, not a periodic rebuild. Tree grows or shrinks only at the root.</td></tr>
+      <tr><td>Half full (non-root)</td><td>Every non-root node holds between <span class="kbd">ceil(m/2) - 1</span> and <span class="kbd">m - 1</span> keys (internal: between ceil(m/2) and m children).</td></tr>
+      <tr><td>Root exemption</td><td>The root may hold as few as 1 key (2 children), or 0 keys when the tree is a single leaf. The half-full rule does not apply to the root.</td></tr>
+      <tr><td>Separator order</td><td>Between adjacent separators, a search key v follows <span class="kbd">Ki &lt; v &lt;= Ki+1</span> (the exact nbtree inequality).</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout why">
+    <div class="callout-title">Why half full</div>
+    <p>Forcing at least 50 percent occupancy on non-root nodes bounds the height at about
+    log_(m/2) N, so the logarithmic I/O cost holds in the worst case, not just on average.
+    Without it the tree could degenerate.</p>
+  </div>
+
+  <!-- ===== SEARCH ===== -->
+  <h2>Search</h2>
+  <ol class="steps">
+    <li>Start at the root. Binary-search the separators to pick the child whose range contains v, using Ki &lt; v &lt;= Ki+1.</li>
+    <li>Descend one page read per level until a leaf, then binary-search the leaf.</li>
+    <li>Range scan: descend once to the lower bound, then follow leaf links rightward to the upper bound.</li>
+  </ol>
+  <p class="muted">Cost: one page read per level, O(log_m N) I/Os. Upper levels usually stay cached in the
+  buffer pool, so marginal cost is closer to one or two leaf reads.</p>
+
+  <!-- ===== INSERT + DELETE side by side ===== -->
+  <div class="grid2">
+    <div>
+      <h2>Insert (split rule)</h2>
+      <ol class="steps">
+        <li>Descend to the target leaf as in search.</li>
+        <li>If the leaf has room, insert in sorted position. Done, no structural change.</li>
+        <li>If the leaf is full, split: allocate a new leaf, move the upper half of entries into it, link it into the leaf chain.</li>
+        <li><b>Leaf split = copy up.</b> The first key of the new right leaf is <i>copied</i> up as the parent separator; the key still exists in the leaf, because all data stays in leaves.</li>
+        <li><b>Internal split = push up.</b> If inserting the separator overflows an internal node, split it and <i>move</i> (push) the middle key up to the grandparent; internal nodes only route, so no copy is kept.</li>
+        <li>Splits propagate upward only while overflow continues. If the root splits, allocate a new root over the two halves. This is the only way height grows, and it grows from the top, keeping all leaves at equal depth.</li>
+      </ol>
+    </div>
+    <div>
+      <h2>Delete (underflow)</h2>
+      <ol class="steps">
+        <li>Descend to the leaf and remove the entry.</li>
+        <li>If the node still has &gt;= ceil(m/2) - 1 keys, done.</li>
+        <li>If it underflows (&lt; ceil(m/2) - 1 keys), restore the invariant using an adjacent sibling.</li>
+        <li><b>Redistribute (borrow / rotate):</b> if a sibling has more than the minimum, move one entry across and update the parent separator. Tree shape unchanged.</li>
+        <li><b>Merge (coalesce):</b> if no sibling can spare an entry, combine the node with a sibling and remove the now-unused separator from the parent.</li>
+        <li>A merge removes a parent key, which can underflow the parent, so merge or redistribute propagates upward like splits. If the root ends with one child, that child becomes the new root and the tree shrinks in height.</li>
+      </ol>
+    </div>
+  </div>
+
+  <table>
+    <caption>Underflow decision: redistribute versus merge.</caption>
+    <thead><tr><th>Condition after delete</th><th>Action</th><th>Effect on tree</th></tr></thead>
+    <tbody>
+      <tr><td>Node has &gt;= ceil(m/2) - 1 keys</td><td>Nothing</td><td>No change</td></tr>
+      <tr><td>Underflow, adjacent sibling has &gt; minimum keys</td><td>Redistribute / borrow one entry, update parent separator</td><td>Shape unchanged, no propagation</td></tr>
+      <tr><td>Underflow, no sibling above minimum</td><td>Merge with sibling, drop separator from parent</td><td>May cascade upward; root may collapse and shrink height</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout gotcha">
+    <div class="callout-title">Exam traps</div>
+    <p>Leaf split copies up, internal split pushes up; do not swap them. The root is exempt from
+    half-full, so "every node is at least half full" is false. Height changes only on a root split
+    (taller) or a root collapse after merge (shorter), never on an ordinary insert.</p>
+  </div>
+
+  <!-- ===== SPLIT SVG ===== -->
+  <h2>Leaf split, before and after</h2>
+  <figure class="diagram">
+    <svg viewBox="0 0 640 250" role="img" aria-label="A full leaf splitting on insert, with the separator copied up to the parent">
+      <defs>
+        <marker id="arr" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto">
+          <path d="M0,0 L7,3 L0,6 Z" fill="var(--ink-soft)"/>
+        </marker>
+      </defs>
+
+      <!-- BEFORE -->
+      <text x="20" y="22" class="svg-label" font-weight="700">Before: insert 19 into a full leaf (m = 4)</text>
+      <rect x="240" y="34" width="160" height="30" rx="5" fill="var(--index-bg)" stroke="var(--index)"/>
+      <line x1="280" y1="34" x2="280" y2="64" stroke="var(--index)"/>
+      <line x1="360" y1="34" x2="360" y2="64" stroke="var(--index)"/>
+      <text x="320" y="54" text-anchor="middle" class="svg-mono">23 . 41</text>
+      <line x1="260" y1="64" x2="150" y2="96" stroke="var(--ink-soft)" marker-end="url(#arr)"/>
+      <rect x="60" y="98" width="180" height="30" rx="5" fill="#fffefb" stroke="#c0392b"/>
+      <text x="150" y="118" text-anchor="middle" class="svg-mono">11 . 14 . 17 . 19?</text>
+      <text x="150" y="146" text-anchor="middle" class="svg-label sm">full, no room for 19</text>
+
+      <!-- divider -->
+      <line x1="20" y1="166" x2="620" y2="166" stroke="var(--rule)" stroke-dasharray="4 4"/>
+
+      <!-- AFTER -->
+      <text x="20" y="188" class="svg-label" font-weight="700">After: split, copy 17 up as the new separator</text>
+      <rect x="240" y="196" width="200" height="28" rx="5" fill="var(--index-bg)" stroke="var(--index)"/>
+      <line x1="280" y1="196" x2="280" y2="224" stroke="var(--index)"/>
+      <line x1="340" y1="196" x2="340" y2="224" stroke="var(--index)"/>
+      <line x1="400" y1="196" x2="400" y2="224" stroke="var(--index)"/>
+      <text x="260" y="214" text-anchor="middle" class="svg-mono">17</text>
+      <text x="320" y="214" text-anchor="middle" class="svg-mono">23</text>
+      <text x="370" y="214" text-anchor="middle" class="svg-mono">41</text>
+      <line x1="270" y1="224" x2="160" y2="232" stroke="var(--ink-soft)"/>
+      <line x1="300" y1="224" x2="430" y2="232" stroke="var(--ink-soft)"/>
+      <text x="120" y="245" text-anchor="middle" class="svg-mono">11 . 14</text>
+      <text x="430" y="245" text-anchor="middle" class="svg-mono">17 . 19   (-&gt; next leaf)</text>
+    </svg>
+    <figcaption><b>Figure 1.</b> The leaf overflows, the upper half moves to a new right leaf, and its first
+    key (17) is <i>copied</i> up into the parent. The data 17 still lives in the leaf. An internal split would
+    instead <i>push</i> the middle key up and not keep it below.</figcaption>
+  </figure>
+
+  <!-- ===== BULK LOADING ===== -->
+  <h2>Bulk loading (bottom up)</h2>
+  <p>One-at-a-time insertion of N keys costs N descents and many random splits. If keys are sorted (or
+  can be sorted first), build the tree bottom up instead.</p>
+  <ol class="steps">
+    <li>Sort the entries.</li>
+    <li>Pack them into leaves left to right up to a target fill (the fillfactor, leaving slack for later inserts).</li>
+    <li>Link the leaves into the chain.</li>
+    <li>Build the parent level from the first key of each leaf; repeat upward until one root remains.</li>
+  </ol>
+  <p class="muted">Result: sequential I/O, controlled page density, and a denser, shallower tree than
+  repeated insertion. PostgreSQL B-tree fillfactor defaults to 90 (range 10 to 100).</p>
+
+  <!-- ===== COMPLEXITY ===== -->
+  <h2>Complexity</h2>
+  <table>
+    <caption>Page-read (I/O) cost in a B+tree of order m over N keys.</caption>
+    <thead><tr><th>Operation</th><th>I/O cost</th><th>Note</th></tr></thead>
+    <tbody>
+      <tr><td>Point search (=)</td><td>O(log_m N)</td><td>One read per level; upper levels usually cached</td></tr>
+      <tr><td>Range scan (k matches)</td><td>O(log_m N + k/leaf)</td><td>One descent, then sequential leaf links</td></tr>
+      <tr><td>Insert</td><td>O(log_m N)</td><td>Dominated by descent; splits rare amortized (halves stay half full)</td></tr>
+      <tr><td>Delete</td><td>O(log_m N)</td><td>Dominated by descent; merge or redistribute may cascade up</td></tr>
+      <tr><td>Bulk load N sorted keys</td><td>O(N) sequential</td><td>Plus the sort if not already ordered</td></tr>
+      <tr><td>Height</td><td>about log_m N</td><td>Fanout 100: 3 levels reach ~1M leaf entries, 4 levels ~100M</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout keyidea">
+    <div class="callout-title">Keep this one thing</div>
+    <p>The log base is the fanout m, not 2. Wide nodes make a single page read a high-fanout decision,
+    so the tree is 3 to 4 levels deep for hundreds of millions of rows. "O(log2 N) lookups" is the trap.</p>
+  </div>
+
+  <!-- ===== B-tree vs B+tree vs hash ===== -->
+  <h2>B-tree vs B+tree vs hash</h2>
+  <table>
+    <caption>When each access method wins. B+tree is PostgreSQL nbtree and SQLite table/index b-trees.</caption>
+    <thead><tr><th>Property</th><th>Plain B-tree</th><th>B+tree</th><th>Hash index</th></tr></thead>
+    <tbody>
+      <tr><td>Where data / pointers live</td><td>Internal nodes and leaves</td><td>Leaves only; internals route</td><td>Buckets keyed by hash</td></tr>
+      <tr><td>Point lookup (=)</td><td>O(log_m N) I/O</td><td>O(log_m N) I/O</td><td>expected O(1) I/O</td></tr>
+      <tr><td>Range / inequality (&lt;, &gt;, BETWEEN)</td><td>possible but no linked leaves</td><td>yes, ordered linked leaves</td><td>no</td></tr>
+      <tr><td>ORDER BY without a sort</td><td>in-order traversal, not leaf-linked</td><td>yes, walk the leaf chain</td><td>no</td></tr>
+      <tr><td>Prefix of composite key</td><td>yes</td><td>yes (leftmost prefix)</td><td>no, needs the full key</td></tr>
+      <tr><td>Worst case under skew / growth</td><td>bounded by height</td><td>bounded by height</td><td>long overflow chains</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout realworld">
+    <div class="callout-title">In real systems</div>
+    <p>PostgreSQL nbtree is a B+tree on the Lehman-Yao design (right-links and high keys for lock-light
+    search), with lazy two-stage deletion rather than eager textbook merge on every underflow. SQLite stores
+    tables and indexes as b-trees with data only in leaves. PostgreSQL hash indexes are single column,
+    equality only, no uniqueness, and crash-safe since v10
+    [<a href="https://www.postgresql.org/docs/current/hash-index.html">PG hash docs</a>].</p>
+  </div>
+
+  <!-- ===== FOOTER ===== -->
+  <footer class="sheet-foot col">
+    <p>Lessons this sheet distills:
+    <a href="../lessons/0006-btree-search-insert.html">Lesson 06 · B+tree invariants, search, insertion, and splits</a>
+    and <a href="../lessons/0007-btree-delete-hash.html">Lesson 07 · B+tree deletion, bulk loading, composite keys, and hash indexes</a>.
+    Back to the <a href="../index.html">Field Guide index</a>.</p>
+  </footer>
+
+  </div><!-- /.col -->
+</main>
+</body>
+</html>
