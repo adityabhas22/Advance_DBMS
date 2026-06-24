@@ -16,12 +16,13 @@
    ============================================================ */
 
 :root {
+  color-scheme: light;
   /* Paper + ink */
   --paper:      #fbf7ef;
   --paper-2:    #f3ecdf;
   --ink:        #1f1b16;
   --ink-soft:   #534a3e;
-  --ink-faint:  #857a68;
+  --ink-faint:  #6d6353;
   --rule:       #ddd2bf;
   --rule-soft:  #e8e0d1;
 
@@ -341,16 +342,14 @@ input[type=text], input[type=number], select {
 .steps > li::before { content: counter(step); position: absolute; left: 0; top: 0; width: 1.7rem; height: 1.7rem; background: var(--accent); color: #fff; border-radius: 50%; font-family: var(--sans); font-size: .8rem; font-weight: 700; display: flex; align-items: center; justify-content: center; }
 
 /* ----------------------------------------------------------
-   Dark mode (paper-first, this is a gentle night variant)
+   Theme: light only, on purpose.
+   The whole course is designed as warm-paper figures with dark
+   ink. The diagrams, simulators, and callouts use light surfaces,
+   so a dark OS theme must not repaint them or the SVG labels and
+   boxed text turn light-on-light and become unreadable. The page
+   declares a light color scheme so form controls and scrollbars
+   also stay light. The print block below is the only variant.
    ---------------------------------------------------------- */
-@media (prefers-color-scheme: dark) {
-  :root {
-    --paper: #1a1713; --paper-2: #232019; --ink: #ece4d6; --ink-soft: #c5bba8; --ink-faint: #968b78;
-    --rule: #3a342a; --rule-soft: #2e2920; --shadow: 0 1px 2px rgba(0,0,0,.3), 0 6px 22px rgba(0,0,0,.35);
-  }
-  .diagram, pre, .sim, .sim-stage, .mcq .mcq-opt, input[type=text], input[type=number], select { background: #211d17; }
-  .sim-body .sim-stage { background: #1d1a14; }
-}
 
 /* ----------------------------------------------------------
    Print (reference cheat sheets)
